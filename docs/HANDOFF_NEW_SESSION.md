@@ -49,10 +49,11 @@ MoE-двигун** (GGUF-first), MIT, під GSV-хабом. Рішення owne
 - `PH-105` `src/tokenizer.rs` — `TokenizerMeta::from_file` (model/tokens/token_type/scores/merges/bos/eos/pre + accessors); BPE-алгоритм → **B3**.
 - `PH-106` disk round-trip (`parse_file` read synth `.gguf` з диска); `PH-107` `rusty inspect` CLI.
 
-**B4 — MoE-ядро (частково):** `[~]` — **PH-401/402/403 done** (`src/moe.rs`, pure-f32): роутер
+**B4 — MoE-ядро (частково):** `[~]` — **PH-401/402/403/406a done** (`src/moe.rs`, pure-f32): роутер
 `route` (softmax-renorm) + `top_k_sigmoid` (Qwen3/DeepSeek renorm) + `route_group` (noaux_tc-lite:
 group-score + top_k_group restrict); `expert_ffn` = `down(swiglu(gate,up))` (`silu`/`matvec`);
-`combine` shared-expert merge (shape-validated, shared=Some/None). **44 тести**, clippy `-D` 0.
+`combine` shared-expert merge; **`moe_layer_forward` = повний цикл шару** (router→top-k experts
+weighted-sum→+shared) з детермінованим інтеграційним тестом. **63 тести**, clippy `-D` 0.
 Фактаж — `docs/research/moe-router.md`.
 
 **B3 — Dense forward (частково):** `[~]` — **PH-301/302/303/304 done** (`src/infer.rs`, pure-f32):

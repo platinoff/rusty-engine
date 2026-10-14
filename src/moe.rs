@@ -256,6 +256,49 @@ pub fn combine(routed: &[Vec<f32>], weights: &[f32], shared: Option<&[f32]>) -> 
     Ok(out)
 }
 
+/// Per-expert FFN weights, row-major: `gate`/`up` are `inter×hidden`, `down` is `hidden×inter`.
+#[derive(Debug, Clone)]
+pub struct ExpertWeights {
+    pub gate: Vec<f32>,
+    pub up: Vec<f32>,
+    pub down: Vec<f32>,
+}
+
+/// One MoE FFN layer forward on an `hidden`-dim activation:
+/// router logits → top-k routed experts (SwiGLU FFN each, weighted-summed) → + shared expert.
+///
+/// This is the differentiator's real compute loop (llama.cpp's `qwen3moe`/`mixtral` FFN), in
+/// native Rust on synthetic weights; binding it to real dequantized GGUF tensors is `PH-406`.
+pub fn moe_layer_forward(
+    hidden: &[f32],
+    router_w: &[f32],
+    n_experts: usize,
+    experts: &[ExpertWeights],
+    shared: Option<&ExpertWeights>,
+    inter: usize,
+    cfg: RouterConfig,
+) -> Vec<f32> {
+    let dmodel = hidden.len();
+    let logits = matvec(router_w, n_experts, dmodel, hidden);
+    let chosen = route(&logits, cfg);
+    let mut out = vec![0.0f32; dmodel];
+    for e in &chosen {
+        if let Some(w) = experts.get(e.id) {
+            let eo = expert_ffn(hidden, &w.gate, &w.up, &w.down, dmodel, inter);
+            for (o, v) in out.iter_mut().zip(eo) {
+                *o += e.weight * v;
+            }
+        }
+    }
+    if let Some(s) = shared {
+        let so = expert_ffn(hidden, &s.gate, &s.up, &s.down, dmodel, inter);
+        for (o, v) in out.iter_mut().zip(so) {
+            *o += v;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +413,42 @@ mod tests {
     fn combine_rejects_shape_mismatch() {
         assert!(combine(&[vec![1.0, 2.0]], &[0.5, 0.5], None).is_err());
         assert!(combine(&[vec![1.0], vec![2.0, 3.0]], &[0.5, 0.5], None).is_err());
+    }
+
+    fn id_expert(scale: f32) -> ExpertWeights {
+        ExpertWeights {
+            gate: vec![1.0, 0.0, 0.0, 1.0],
+            up: vec![1.0, 0.0, 0.0, 1.0],
+            down: vec![scale, 0.0, 0.0, scale],
+        }
+    }
+
+    #[test]
+    fn moe_layer_routes_to_best_expert() {
+        // expert1 (down*2) must win; hidden=[1,0] -> routed out = [2*silu(1), 0].
+        let experts = vec![id_expert(1.0), id_expert(2.0)];
+        let router_w = vec![0.0, 0.0, 10.0, 0.0];
+        let cfg = RouterConfig {
+            gate: Gate::Softmax,
+            top_k: 1,
+        };
+        let out = moe_layer_forward(&[1.0, 0.0], &router_w, 2, &experts, None, 2, cfg);
+        assert!((out[0] - 2.0 * silu(1.0)).abs() < EPS);
+        assert!(out[1].abs() < EPS);
+    }
+
+    #[test]
+    fn moe_layer_adds_shared_expert() {
+        // expert0 wins (weight 1) -> [silu1,0]; shared (identity) adds -> [2*silu1, 0].
+        let id = id_expert(1.0);
+        let experts = vec![id.clone(), id.clone()];
+        let router_w = vec![10.0, 0.0, 0.0, 0.0];
+        let cfg = RouterConfig {
+            gate: Gate::Sigmoid,
+            top_k: 1,
+        };
+        let out = moe_layer_forward(&[1.0, 0.0], &router_w, 2, &experts, Some(&id), 2, cfg);
+        assert!((out[0] - 2.0 * silu(1.0)).abs() < EPS);
+        assert!(out[1].abs() < EPS);
     }
 }
