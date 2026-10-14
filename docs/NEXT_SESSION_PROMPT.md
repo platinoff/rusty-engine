@@ -18,13 +18,14 @@ Done цього сеансу: **B1 `PH-101..107` + `PH-105b`** (контейне
 encode/decode**), баг `ggml_dtype` знайдено/виправлено + регресійний тест; **B4-core `PH-401/402/403`
 + `PH-406a`** (router/SwiGLU/shared + **`moe_layer_forward` шар**); **B3-primitives `PH-301..304`**
 (RMSNorm+attention+paged-KV+sampler) + **`PH-305a`** (mmap→byte-range→**real Q6_K dequant 4.36M finite**);
-**B2 `PH-201`+`PH-201+`** (fused dot/gemv Q4_0/Q8_0 + скалярний reference-dequant Q4_K/Q5_K/Q6_K) —
-**70 тести**, clippy `-D` 0. Модель у `data/models/` (gitignored); offset-семантика + BPE — у `docs/research/`.
+**B2 `PH-201`+`PH-201+`+`PH-201c`** (fused dot/gemv Q4_0/Q8_0 + скалярний reference-dequant Q4_K/Q5_K/Q6_K **+ Q5_0** —
+real `token_embd` dequantize 136M finite → **embedding розблоковано**) —
+**71 тести**, clippy `-D` 0. Модель у `data/models/` (gitignored); offset-семантика + BPE — у `docs/research/`.
 
 Наступна `agi` обирає:
-1. **`PH-305` dense forward** (⭐ вага матеріалізується, BPE-core є): лишилось **multi-layer loop**
-   (rmsnorm→attn q/k/v/o GQA+RoPE→FFN ×24 + residual → `output`→logits) + **HF-exact Qwen parity**
-   (`PH-305b`: `pre`-regex, byte-fallback, specials) → golden-токен на цій Qwen2.5.
+1. **`PH-305` dense forward** (⭐ embedding тепер деquantizeʼться — Q5_0 готовий): лишилось
+   **multi-layer loop** (embed→rmsnorm→attn q/k/v/o GQA+RoPE→FFN ×24 + residual → `output`→logits)
+   + **HF-exact Qwen parity** (`PH-305b`: `pre`-regex, byte-fallback, specials) → golden-токен.
 2. **B2 залізо** `PH-202/203/204` — repack + SSE/AVX/NEON dispatch, `cargo bench` проти oracle.
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
@@ -39,7 +40,7 @@ subagent-ах. Не тягну весь llama.cpp/vLLM у вікно за раз
 - `rusty-engine-gguf` (B1) — банда **завершена**: `PH-101..107` + **`PH-105b`** (BPE) **done** (2026-10-14).
 - `rusty-engine-moe-core` (B4) — `PH-401/402/403` **done** (router+SwiGLU+shared) + **`PH-406a` `moe_layer_forward`** (повний цикл шару, детермін.), `PH-404/405/406/407` **open** (потребують реальної GGUF-моделі).
 - B3 primitives (standalone `PH-301..304`) + **`PH-305a`** (real-tensor mmap→byte-range→dequant) — **done**; `PH-305` (BPE+24-layer loop)/`PH-306` **open**.
-- B2 — `PH-201` + `PH-201+` **done** (fused dot Q4_0/Q8_0 + K-quant scalar reference-dequant); `PH-202..204` **open** (repack/SIMD/fused-gemv).
+- B2 — `PH-201` + `PH-201+` + **`PH-201c` (Q5_0)** **done** (fused dot Q4_0/Q8_0 + K-quant + Q5_0 scalar reference); `PH-202..204` **open** (repack/SIMD/fused-gemv).
 
 ## Reminder (session law)
 

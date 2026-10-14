@@ -161,6 +161,7 @@ pub fn ggml_dtype(code: u32) -> Option<DType> {
         0 => DType::F32,
         1 => DType::F16,
         2 => DType::Q4_0,
+        6 => DType::Q5_0,
         8 => DType::Q8_0,
         12 => DType::Q4_K,
         13 => DType::Q5_K,
@@ -466,7 +467,7 @@ mod tests {
         assert_eq!(ggml_dtype(0), Some(DType::F32));
         assert_eq!(ggml_dtype(1), Some(DType::F16));
         assert_eq!(ggml_dtype(8), Some(DType::Q8_0));
-        assert_eq!(ggml_dtype(6), None); // Q5_0 not a DType (raw ggml_type kept)
+        assert_eq!(ggml_dtype(6), Some(DType::Q5_0)); // Q5_0 now mapped
         assert_eq!(ggml_dtype(16), None); // IQ2_XXS, later band
     }
 

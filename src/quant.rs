@@ -41,6 +41,7 @@ pub fn block_info(ggml_type: u32) -> Option<BlockInfo> {
         0 => (1, 4),      // F32
         1 | 24 => (1, 2), // F16 / BF16
         2 => (32, 18),    // Q4_0
+        6 => (32, 22),    // Q5_0
         8 => (32, 34),    // Q8_0
         12 => (256, 144), // Q4_K
         13 => (256, 176), // Q5_K
@@ -75,6 +76,31 @@ pub fn dequant_q4_0(data: &[u8]) -> Vec<f32> {
             let q = blk[2 + j];
             vals[j] = ((q & 0x0F) as i32 - 8) as f32 * d;
             vals[j + 16] = ((q >> 4) as i32 - 8) as f32 * d;
+        }
+        out.extend_from_slice(&vals);
+    }
+    out
+}
+
+/// Scalar dequant of a whole Q5_0 buffer (length must be a multiple of 22).
+///
+/// Current-master `block_q5_0` layout: `d`@0 (f16), `qh`@2 (u32 LE, 5th bits), `qs`@6 (16 bytes).
+/// Element value = `d * ((nibble | (qh_bit << 4)) - 16)` — bias is −16 (range −16..15); the 5th
+/// bit index equals the element index (low nibble → element `j`, high nibble → element `j+16`).
+pub fn dequant_q5_0(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 22 * 32);
+    for blk in data.chunks_exact(22) {
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+        let qs = &blk[6..22];
+        let mut vals = [0f32; 32];
+        for j in 0..16 {
+            let bit0 = ((qh >> j) & 1) << 4;
+            let bit1 = ((qh >> (j + 16)) & 1) << 4;
+            let x0 = ((qs[j] & 0x0F) as u32 | bit0) as i32 - 16;
+            let x1 = ((qs[j] >> 4) as u32 | bit1) as i32 - 16;
+            vals[j] = x0 as f32 * d;
+            vals[j + 16] = x1 as f32 * d;
         }
         out.extend_from_slice(&vals);
     }
@@ -218,6 +244,14 @@ pub fn dequant(ggml_type: u32, data: &[u8]) -> Result<Vec<f32>> {
             }
             Ok(dequant_q4_0(data))
         }
+        6 => {
+            if data.len() % 22 != 0 {
+                return Err(EngineError {
+                    message: format!("Q5_0 data len {} not a multiple of 22", data.len()),
+                });
+            }
+            Ok(dequant_q5_0(data))
+        }
         8 => {
             if data.len() % 34 != 0 {
                 return Err(EngineError {
@@ -287,6 +321,13 @@ mod tests {
             }
         );
         assert_eq!(
+            block_info(6).unwrap(),
+            BlockInfo {
+                elements: 32,
+                bytes: 22
+            }
+        );
+        assert_eq!(
             block_info(12).unwrap(),
             BlockInfo {
                 elements: 256,
@@ -353,8 +394,38 @@ mod tests {
     }
 
     #[test]
+    fn q5_0_values_and_5th_bit() {
+        let mut blk = vec![0u8; 22];
+        blk[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d=1
+                                                             // layout [d@0, qh@2..6, qs@6..22]. qs all 0x11 -> low=1, high=1, no 5th bits => 1-16=-15.
+        blk[6..22].fill(0x11);
+        let out = dequant_q5_0(&blk);
+        assert_eq!(out.len(), 32);
+        assert!(out.iter().all(|&v| v == -15.0));
+
+        // 5th bit (qh bit0 set): low element0 = (0 | 0x10) - 16 = 0 ; high elem16 = 0 - 16 = -16.
+        let mut b2 = vec![0u8; 22];
+        b2[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d=1
+        b2[2..6].copy_from_slice(&1u32.to_le_bytes()); // qh=1 (bit0)
+                                                       // qs zero -> low nibble 0, high 0
+        let out2 = dequant_q5_0(&b2);
+        assert_eq!(out2[0], 0.0); // ((0 | (1<<4)) - 16) = 0
+        assert_eq!(out2[16], -16.0); // (0 | 0) - 16
+
+        // high nibble 15 (0xF0): low elem0 = 0-16=-16 ; high elem16 = 15-16=-1
+        let mut b3 = vec![0u8; 22];
+        b3[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        b3[6] = 0xF0;
+        let out3 = dequant_q5_0(&b3);
+        assert_eq!(out3[0], -16.0);
+        assert_eq!(out3[16], -1.0);
+    }
+
+    #[test]
     fn dequant_dispatch_lengths() {
         assert!(dequant(2, &[0u8; 17]).is_err()); // ragged Q4_0
+        assert!(dequant(6, &[0u8; 21]).is_err()); // ragged Q5_0
+        assert_eq!(dequant(6, &[0u8; 22]).unwrap().len(), 32);
         assert!(dequant(12, &[0u8; 143]).is_err()); // ragged Q4_K
         assert!(dequant(99, &[0u8; 8]).is_err()); // unsupported type
         let mut ok = vec![0u8; 18];

@@ -11,6 +11,7 @@ pub enum DType {
     F16,
     BF16,
     Q4_0,
+    Q5_0,
     Q4_K,
     Q5_K,
     Q6_K,
@@ -25,7 +26,13 @@ impl DType {
         match self {
             DType::F32 => Some(4),
             DType::F16 | DType::BF16 => Some(2),
-            DType::I8 | DType::Q4_0 | DType::Q4_K | DType::Q5_K | DType::Q6_K | DType::Q8_0 => None,
+            DType::I8
+            | DType::Q4_0
+            | DType::Q5_0
+            | DType::Q4_K
+            | DType::Q5_K
+            | DType::Q6_K
+            | DType::Q8_0 => None,
         }
     }
 }

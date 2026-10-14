@@ -82,5 +82,7 @@ faithful з C: Q5_K ділить 6-bit layout, Q6_K signed `int8 scales` без 
 Повний **`PH-305` dense forward** лишив: **multi-layer loop** (rmsnorm→attn(q/k/v/o+GQA+RoPE)→FFN
 ×24 + residual → `output`→logits) + **HF-exact Qwen parity** токена (`PH-305b`: `pre`-regex,
 byte-fallback, specials). Plan loop — `docs/research/gguf-tensor-offsets.md`. Паралельно B2 залізо
-(`PH-202..204` SIMD). **70 тести** загалом, clippy `-D` 0, усі локальні (без push). Канон:
+**70 тести** загалом → **+`PH-201c` Q5_0**: `dequant_q5_0` (22B `{d,qh,qs}`, bias −16) + `DType::Q5_0` +
+`ggml_dtype(6)` → **real `token_embd` (Q5_0) dequantize 136 134 656 finite → embedding розблоковано**,
+offset самозгоджений з наступним тензором. **71 тести**, clippy `-D` 0.
 `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.

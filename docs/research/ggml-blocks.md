@@ -36,6 +36,15 @@ struct block_q8_0 { ggml_half d; int8_t qs[32]; }     // 2 + 32 = 34
 // y[j] = qs[j] * d   (qs signed int8)
 ```
 
+## Q5_0 (PH-201c, `src/quant.rs dequant_q5_0`)
+
+`block_q5_0` = **22 B** / 32 elem, current-master order **`[d@0(f16), qh@2(u32 LE 5th-bits), qs@6(16)]`**.
+`value = d * ( (nibble | (qh_bit << 4)) - 16 )` — bias **−16** (range −16..15), **не −8**.
+qh bit index == element index (low nibble qs[j]→elem j uses qh bit j; high→elem j+16 uses qh bit j+16).
+> CAVEAT: pre-refactor GGUFs = `[d, qs, qh]`. Реальна Qwen2.5 деquantиться до малих finite
+> embeddings + self-consistent offsets → master `{d,qh,qs}` вірна для неї; при garbage у файлі —
+> спробувати старий порядок.
+
 ## K-кванти — розміри відомі, dequant → B2 (`src/core/kernel/*`)
 
 - Q4_K: {half d @0, half dmin @2, u8 scales[12] @4, u8 qs[128] @16} = 144. 8 sub-blocks×32,
