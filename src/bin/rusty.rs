@@ -1,5 +1,6 @@
 //! `rusty` — single-binary entry point (produces rusty.exe / rusty / rusty.apk
-//! per band B6). B0 identity + `inspect` (PH-107); `serve`/`node`/`hub` land in B5/B8.
+//! per band B6). B0 identity + `inspect` (PH-107) + `tensor` (PH-305a real-tensor
+//! load/dequant); `run`/`serve`/`node`/`hub` land in B3/B5/B7/B8.
 
 use std::env;
 use std::path::Path;
@@ -15,16 +16,24 @@ fn main() {
             println!();
             println!("  --version, -V   print crate version");
             println!("  --help, -h      print this banner");
-            println!("  inspect <file>  GGUF metadata summary     (PH-107)");
-            println!("  run -m <model>  generate text            (band B3)");
-            println!("  serve           OpenAI-compat server     (band B5)");
-            println!("  node            Wi-Fi slave runtime      (band B7)");
-            println!("  hub             GSV master supervisor    (band B8)");
+            println!("  inspect <file>            GGUF metadata summary      (PH-107)");
+            println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
+            println!("  run -m <model>            generate text              (band B3)");
+            println!("  serve                     OpenAI-compat server       (band B5)");
+            println!("  node                      Wi-Fi slave runtime        (band B7)");
+            println!("  hub                       GSV master supervisor      (band B8)");
         }
         Some("inspect") => match args.next() {
             Some(path) => inspect(&path),
             None => {
                 eprintln!("usage: rusty inspect <model.gguf>");
+                std::process::exit(2);
+            }
+        },
+        Some("tensor") => match (args.next(), args.next()) {
+            (Some(path), Some(name)) => tensor(&path, &name),
+            _ => {
+                eprintln!("usage: rusty tensor <model.gguf> <tensor.name>");
                 std::process::exit(2);
             }
         },
@@ -63,6 +72,71 @@ fn inspect(path: &str) {
         Err(e) => {
             eprintln!("rusty inspect {path}: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// mmap a real GGUF and materialize one tensor: byte-range bounds check + scalar dequant.
+/// The first step of the forward path (`PH-305`) — reads real quantized weights, not synth.
+fn tensor(path: &str, name: &str) {
+    let model = match unsafe { rusty_engine::loader::MmapModel::open(Path::new(path)) } {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("rusty tensor {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let entry = match model.header().tensors.iter().find(|t| t.name == name) {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "rusty tensor: tensor '{name}' not found in {} tensors",
+                model.header().tensors.len()
+            );
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "'{name}'  dims={:?}  ggml={}  dtype={:?}  numel={}  nbytes={:?}  offset={}",
+        entry.dims,
+        entry.ggml_type,
+        entry.dtype,
+        entry.numel(),
+        entry.nbytes(),
+        entry.offset
+    );
+    match model.tensor_bytes(name) {
+        Some(b) => println!(
+            "  bounds-ok: {} bytes within file (data_start {})",
+            b.len(),
+            model.data_start()
+        ),
+        None => {
+            eprintln!("  out-of-bounds or unsized type");
+            std::process::exit(1);
+        }
+    }
+    // Materialize floats: quantized via the oracle, F32 read directly.
+    if entry.ggml_type == 0 {
+        if let Some(b) = model.tensor_bytes(name) {
+            let floats: Vec<f32> = b
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let head = &floats[..floats.len().min(6)];
+            println!("  F32 {} values, first {head:?}", floats.len());
+        }
+    } else {
+        match model.dequant(name) {
+            Ok(v) => {
+                let finite = v.iter().filter(|x| x.is_finite()).count();
+                let head = &v[..v.len().min(6)];
+                println!(
+                    "  dequant {} values ({finite} finite), first {head:?}",
+                    v.len()
+                );
+            }
+            Err(e) => eprintln!("  dequant: {e}"),
         }
     }
 }

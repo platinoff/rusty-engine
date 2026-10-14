@@ -88,8 +88,21 @@ pub struct TensorEntry {
     pub ggml_type: u32,
     /// Best-effort mapped element type (`None` for unsupported/unknown codes).
     pub dtype: Option<DType>,
-    /// Offset, in tensor-data units, from the aligned data start.
+    /// Byte offset from the aligned tensor-data start (a multiple of `general.alignment`).
     pub offset: u64,
+}
+
+impl TensorEntry {
+    /// Total element count = product of `dims` (1 for an empty dim list).
+    pub fn numel(&self) -> usize {
+        self.dims.iter().product()
+    }
+
+    /// Byte length of this tensor's data block (== `ggml_nbytes`), or `None` if its
+    /// type/element-count isn't sized.
+    pub fn nbytes(&self) -> Option<usize> {
+        crate::quant::bytes_for_numel(self.ggml_type, self.numel())
+    }
 }
 
 /// A parsed GGUF header: everything before the tensor data blob.
@@ -455,6 +468,45 @@ mod tests {
         assert_eq!(ggml_dtype(8), Some(DType::Q8_0));
         assert_eq!(ggml_dtype(6), None); // Q5_0 not a DType (raw ggml_type kept)
         assert_eq!(ggml_dtype(16), None); // IQ2_XXS, later band
+    }
+
+    #[test]
+    fn tensor_entry_numel_and_nbytes_math() {
+        // TensorEntry::nbytes == ggml_nbytes == numel/QK * block_bytes (bytes_for_numel).
+        let f32 = TensorEntry {
+            name: "n".into(),
+            dims: vec![128],
+            ggml_type: 0,
+            dtype: Some(DType::F32),
+            offset: 0,
+        };
+        assert_eq!(f32.numel(), 128);
+        assert_eq!(f32.nbytes(), Some(512)); // 128*4
+        let q40 = TensorEntry {
+            name: "w".into(),
+            dims: vec![256],
+            ggml_type: 2,
+            dtype: Some(DType::Q4_0),
+            offset: 0,
+        };
+        assert_eq!(q40.nbytes(), Some(144)); // 256/32*18
+        let q4k = TensorEntry {
+            name: "e".into(),
+            dims: vec![256],
+            ggml_type: 12,
+            dtype: Some(DType::Q4_K),
+            offset: 0,
+        };
+        assert_eq!(q4k.nbytes(), Some(144)); // 256/256*144
+        let mat = TensorEntry {
+            name: "m".into(),
+            dims: vec![896, 4864],
+            ggml_type: 14,
+            dtype: Some(DType::Q6_K),
+            offset: 0,
+        };
+        assert_eq!(mat.numel(), 896 * 4864);
+        assert_eq!(mat.nbytes(), Some((896 * 4864) / 256 * 210));
     }
 
     #[test]

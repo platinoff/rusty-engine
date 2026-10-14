@@ -8,7 +8,7 @@
 //!
 //! Tensor *data* dequant is `PH-104`; these loaders only surface the bytes + header.
 
-use crate::gguf::{parse, GgufFile};
+use crate::gguf::{parse, GgufFile, TensorEntry};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -90,6 +90,43 @@ impl MmapModel {
 
     pub fn is_empty(&self) -> bool {
         self.mmap.is_empty()
+    }
+
+    /// Byte range `[data_start + tensor.offset, +nbytes)` of a named tensor, bounds-checked
+    /// (the loader's exact guard). `offset` is a byte delta; never divide it by type size.
+    pub fn tensor_bytes(&self, name: &str) -> Option<&[u8]> {
+        let e = self.header.tensors.iter().find(|t| t.name == name)?;
+        let len = e.nbytes()?;
+        let start = self.data_start.checked_add(e.offset as usize)?;
+        self.mmap.get(start..start.checked_add(len)?)
+    }
+
+    /// Element count of a named tensor.
+    pub fn tensor_numel(&self, name: &str) -> Option<usize> {
+        self.header
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .map(TensorEntry::numel)
+    }
+
+    /// Dequantize a named tensor through the scalar oracle
+    /// (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K; other types return `Err`).
+    pub fn dequant(&self, name: &str) -> crate::core::Result<Vec<f32>> {
+        let e = self
+            .header
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| crate::core::EngineError {
+                message: format!("tensor '{name}' not found"),
+            })?;
+        let bytes = self
+            .tensor_bytes(name)
+            .ok_or_else(|| crate::core::EngineError {
+                message: format!("tensor '{name}' bytes out of bounds or type unsized"),
+            })?;
+        crate::quant::dequant(e.ggml_type, bytes)
     }
 }
 
@@ -206,6 +243,68 @@ mod tests {
         .unwrap();
         assert_eq!(got.len(), bytes.len());
         assert_eq!(last.0, last.1); // final report reached total
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// GGUF `offset` is a **byte** delta from `data_start` (llama.cpp semantics). This
+    /// lays out two real-format tensors and checks `tensor_bytes`/`dequant` apply it.
+    #[test]
+    fn tensor_bytes_applies_byte_offset_on_real_layout() {
+        fn u32le(b: &mut Vec<u8>, x: u32) {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        fn u64le(b: &mut Vec<u8>, x: u64) {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        fn tn(b: &mut Vec<u8>, s: &str) {
+            u64le(b, s.len() as u64);
+            b.extend_from_slice(s.as_bytes());
+        }
+
+        let mut h = Vec::new();
+        h.extend_from_slice(crate::gguf::GGUF_MAGIC);
+        u32le(&mut h, 3);
+        u64le(&mut h, 2); // n_tensors
+        u64le(&mut h, 0); // n_kv
+        tn(&mut h, "norm");
+        u32le(&mut h, 1);
+        u64le(&mut h, 8); // dims [8]
+        u32le(&mut h, 0); // F32
+        u64le(&mut h, 0); // offset
+        tn(&mut h, "w");
+        u32le(&mut h, 1);
+        u64le(&mut h, 32); // dims [32]
+        u32le(&mut h, 2); // Q4_0
+        u64le(&mut h, 32); // offset = PAD(32,32)
+
+        let data_start = aligned_start(h.len(), 32);
+        let mut file = h;
+        file.resize(data_start, 0);
+        for i in 0..8u32 {
+            u32le(&mut file, ((i + 1) as f32).to_bits());
+        }
+        file.extend_from_slice(&[0x00, 0x3C]); // Q4_0 scale 1.0
+        file.extend_from_slice(&[0u8; 16]); // qs zero -> -8 each
+
+        std::fs::create_dir_all("target").unwrap();
+        let path = std::path::Path::new("target/rusty_multitensor.gguf");
+        std::fs::write(path, &file).unwrap();
+        let m = unsafe { MmapModel::open(path) }.expect("open");
+        assert_eq!(m.data_start(), data_start);
+        assert_eq!(m.tensor_numel("norm"), Some(8));
+
+        let nb = m.tensor_bytes("norm").unwrap();
+        assert_eq!(nb.len(), 32);
+        assert_eq!(f32::from_le_bytes([nb[0], nb[1], nb[2], nb[3]]), 1.0);
+
+        let wb = m.tensor_bytes("w").unwrap();
+        assert_eq!(wb.len(), 18);
+        let dq = m.dequant("w").unwrap();
+        assert_eq!(dq.len(), 32);
+        assert!(dq.iter().all(|&v| v == -8.0));
+        assert!(m.tensor_bytes("missing").is_none());
+
+        drop(m);
         let _ = std::fs::remove_file(path);
     }
 }

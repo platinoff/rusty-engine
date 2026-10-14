@@ -33,9 +33,22 @@ were already correct). Real file showed `ffn_down` as `ggml=14`; before the fix 
 `Q4_K` (should be `Q6_K`). Fix: map 12/13/14; added regression test
 `ggml_dtype_maps_canonical_ggml_codes`. Tests 64, clippy `-D` 0.
 
-## Still deferred (honest scope)
-
-Header/KV/tensor-info/dtype parsing = **validated on real bytes**. Full **token generation**
-(`PH-305`) additionally needs: BPE decode (PH-105→algorithm), multi-layer loop
+## Full token generation (`PH-305`) additionally needs: BPE decode (PH-105→algorithm), multi-layer loop
 (attn + MoE/dense FFN stacked over all 24 blocks + RoPE-cache), vocab-sized logit projection,
 and the **dequant of real tensors** via the loader `slice()` — a larger, separate slice.
+
+## PH-305a — first real WEIGHT materialization (2026-10-14)
+
+Byte-offset semantics (`docs/research/gguf-tensor-offsets.md`) applied via
+`MmapModel::tensor_bytes`/`dequant`, validated live on the SAME file:
+
+```
+data_start = 5 947 744
+blk.0.attn_norm.weight  F32    numel=896       -> 896 floats, first [-0.0829, 0.0795, ...]
+blk.0.ffn_down.weight   Q6_K   numel=4 358 144 nbytes=3 575 040 -> 4 358 144 values, ALL finite,
+                                            first [-0.00611, 0.00611, 0.02794, ...]   (real trained weights)
+token_embd.weight       Q5_0(ggml=6, unsized) -> safe "out-of-bounds/unsized" (no panic)
+```
+
+Real Q6_K tensor dequantized in pure Rust from production bytes — forward path is now real.
+Remaining: BPE-decode + 24-layer stack loop (`PH-305`).

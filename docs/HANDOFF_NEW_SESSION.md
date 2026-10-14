@@ -65,6 +65,10 @@ weighted-sum→+shared) з детермінованим інтеграційни
 `rmsnorm`; attention primitives `rope`/`apply_causal_mask`/`attention_causal`/`gqa_repeat_kv`;
 `PagedKvCache` (append/get across pages); sampler chain `sample`/`apply_temperature`/`mask_top_k`/
 `mask_top_p`/`apply_repetition_penalty`/`argmax` (детермінований `r`).
+**PH-305a** — `MmapModel::tensor_bytes`/`dequant` + `TensorEntry::nbytes` (GGUF byte-offset =
+`data_start + stored byte delta`; `nbytes`==`ggml_nbytes`==`bytes_for_numel`), CLI `rusty tensor`.
+**Живе читання реальної Qwen2.5:** `ffn_down` Q6_K → **4 358 144 finite** ваг, `attn_norm` F32 → 896.
+Offset-семантика кеш — `docs/research/gguf-tensor-offsets.md`.
 
 **B2 — Quantized kernels (частково):** `[~]` — **PH-201 + PH-201+ done**:
 fused scalar dot/gemv Q4_0/Q8_0 (`src/kernel.rs`, `== dequant-then-dot`) **і** скалярний
@@ -72,7 +76,9 @@ reference-dequant Q4_K/Q5_K/Q6_K (`src/quant.rs` — `dequant_q{4,5,6}_k` + `get
 faithful з C: Q5_K ділить 6-bit layout, Q6_K signed `int8 scales` без таблиці, −32 bias).
 **61 тести**, clippy `-D` 0. C-ref кеш — `docs/research/ggml-blocks.md`.
 
-**Наступний крок:** усередині B2 лишилось **залізо** — repack (`PH-202`), SSE/AVX/NEON
-runtime-dispatch (`PH-203`), fused K-quant dequant+dot (`PH-204`) — кожен з `cargo bench`
-проти скалярного oracle. Або **реальна GGUF-модель** → `PH-305/406/405` golden+parity.
-Обидва великі; наступна `agi` обирає (`simd` чи `model`). Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
+**Наступний крок:** тепер реальна вага матеріалізується → повний **`PH-305` dense forward**
+потребує: **BPE-decode** (алгоритм з `tokenizer.ggml.*`) + **multi-layer loop** (rmsnorm→attn
+(q/k/v/o + GQA + RoPE)→FFN ×24 + residual → `output` → logits) → golden-токен на тій самій
+Qwen2.5. Plan loop у `docs/research/gguf-tensor-offsets.md`. Паралельно — B2 залізо
+(`PH-202..204` SIMD). **66 тести** загалом, clippy `-D` 0, усі локальні (без push). Канон:
+`docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.

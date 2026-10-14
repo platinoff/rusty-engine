@@ -84,10 +84,12 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B3 — Dense forward (control path)  **`[~]` (PH-301..304 done, 2026-10-14)**
+## Band B3 — Dense forward (control path)  **`[~]` (PH-301..304 + PH-305a done, 2026-10-14)**
 
 > Мета: згенерувати текст на DENSE-моделі як контроль перед MoE. Примітиви готові;
-> решта (`PH-305/306`) потребує реальної GGUF-моделі.
+> **реальна вага вже матеріалізується** (`PH-305a`: mmap→byte-range→Q6_K dequant на
+> справжній Qwen2.5, 4.36M finite-значень). Лишилось для `PH-305/306`: **BPE-decode**
+> (алгоритм) + **multi-layer loop** (attn+FFN ×24, RoPE-cache) → golden-токени.
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
@@ -95,6 +97,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-302 | causal attention GQA/MQA + RoPE (primitives) | `[x]` | `src/infer.rs` — `rope`/`apply_causal_mask`/`attention_causal`/`gqa_repeat_kv` (multi-head loop → PH-305) |
 | PH-303 | paged KV-cache (page alloc, vLLM-ідея) | `[x]` | `src/infer.rs` — `PagedKvCache::append/get` round-trip across pages |
 | PH-304 | sampler chain (temp/top-k/top-p/repetition/argmax) | `[x]` | `src/infer.rs` — `sample`/`mask_top_k`/`mask_top_p`/`apply_repetition_penalty`/`argmax` (grammar →later) |
+| PH-305a | real-tensor **mmap→byte-range→dequant** (single weight) | `[x]` | `src/loader.rs` — `tensor_bytes`/`dequant` + `gguf` `TensorEntry::nbytes`; CLI `rusty tensor`; real Q6_K 4.36M finite; synthetic layout test |
 | PH-305 | end-to-end dense-генерація (TinyLlama/Qwen2 GGUF), golden tokens | `[ ]` | `tests/dense_gen.rs` |
 | PH-306 | CLI `rusty run -m model.gguf -p "..."` | `[ ]` | `src/bin/rusty.rs` |
 
