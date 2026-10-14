@@ -68,7 +68,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B2 — Quantized kernels + SIMD  **`[~]` (PH-201 / PH-201+ / PH-201c / PH-204 done, 2026-10-14)**
+## Band B2 — Quantized kernels + SIMD  **`[~]` (PH-201 / PH-201+ / PH-201c / PH-204 / PH-202 done, 2026-10-14)**
 
 > Мета: швидкі ядра для квантів, x86 + arm64, feature-gated dispatch.
 > Скалярний **reference-оракул** для Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K + fused dot/gemv
@@ -81,7 +81,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-201+ | scalar reference dequant Q4_K/Q5_K/Q6_K (all-block oracle) | `[x]` | `src/quant.rs` — `dequant_q{4,5,6}_k`+`get_scale_min_k4`; 4 parity; C-ref кеш |
 | PH-201c | scalar reference dequant **Q5_0** (unblocks real embeddings) | `[x]` | `src/quant.rs` — `dequant_q5_0`(22B, bias −16) + `DType::Q5_0`/`ggml_dtype(6)`; real token_embd 136M finite; 71 unit |
 | PH-204 | **fused dequant+dot** K-quant (Q4_K/Q5_K/Q6_K, stack `[f32;256]`, no Vec) | `[x]` | `src/kernel.rs` — `dot_q{4,5,6}_k` + `matvec_q{4,5,6}_k` macro (relative-parity vs `dot(dequant_qX_k, b)`, 4 unit) |
-| PH-202 | repack у compute-friendly layout | `[ ]` | `src/core/kernel/repack.rs` |
+| PH-202 | **repack** у compute-friendly layout (contiguous scales + de-interleaved nibble planes) | `[x]` | `src/repack.rs` — `RepackedQ4_0 {d,lo,hi}` + `RepackedQ8_0 {d,v}` + `repack_q{4,5}_*` + `dot_repacked_q{4,5}_*` + `matvec_repacked_q4_0`; **exact** vs `dot_q4_0` / `dot_q8_0` / `matvec(dequant, x)` (5 unit) |
 | PH-203 | SSE/AVX/AVX2 (x86) + NEON (arm64), runtime dispatch | `[ ]` | `src/core/kernel/simd.rs` |
 | PH-205 | bench vs scalar (+ vs llama-rs підлога) | `[ ]` | `benches/quant.rs` |
 

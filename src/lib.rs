@@ -11,6 +11,9 @@
 //! - [`loader`] — mmap + staged disk→RAM loaders with progress (PH-103, first non-std dep)
 //! - [`moe`]   — top-k router + expert FFN (the differentiator, B4)
 //! - [`cache`] — byte-budgeted LRU expert cache + prefetch (B4 `PH-404`)
+//! - [`quant`] — block sizes + scalar dequant oracle (B1/B2)
+//! - [`kernel`] — fused scalar dot/gemv oracle for Q4_0/Q8_0/K-quants (B2 `PH-201/204`)
+//! - [`repack`] — compute-friendly Q4_0/Q8_0 layout, exact vs kernel (B2 `PH-202`)
 //! - [`infer`] — transformer forward, paged KV-cache, sampler (B3)
 //! - [`forward`] — single-block transformer composition (PH-305d) + seq prefill (PH-305)
 //! - [`model`] — GGUF model-config + tensor-geometry validation (PH-305c/e)
@@ -34,6 +37,7 @@ pub mod model;
 pub mod moe;
 pub mod node;
 pub mod quant;
+pub mod repack;
 pub mod runner;
 pub mod serve;
 pub mod tokenizer;

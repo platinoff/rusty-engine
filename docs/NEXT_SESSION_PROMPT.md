@@ -27,7 +27,9 @@ final rmsnorm → `output` → logits. `quant::dequant` додав **F32/F16** �
 `dot_q{4,5,6}_k`+`matvec_q{4,5,6}_k` per-block stack `[f32;256]`, relative-parity vs
 `dot(dequant_qX_k, b)`. **+ B4 `PH-404` expert-cache LRU** (`src/cache.rs` — budgeted
 LRU + pin + prefetch, longest-first → atomic ids); **`src/gpt2.rs`** std-only GPT-2/Qwen2 pre-tokenizer
-(`gpt2_pre_split`, wired into `Bpe::encode`). **103 тести** (97 lib + 2 dense + 4
+(`gpt2_pre_split`, wired into `Bpe::encode`). **+ B2 `PH-202` repack** (`src/repack.rs`,
+`RepackedQ4_0`/`Q8_0` — contiguous scales + de-interleaved nibbles, **exact** vs the
+fused kernels). **108 тести** (102 lib + 2 dense + 4
 scaffold), clippy `-D` 0, ratio Rust ~96%. Модель у `data/models/` (gitignored).
 **Checkpoint:** зріз стану — `docs/STATUS.md`; порівняння рушіїв —
 `docs/research/engine-landscape-2026.md`; offset-семантика — `docs/research/`.
@@ -36,8 +38,8 @@ scaffold), clippy `-D` 0, ratio Rust ~96%. Модель у `data/models/` (gitig
 1. **`PH-405` llama/HF greedy-parity** (⭐ gate): perplexity-smoke + greedy token match на
    коротких промптах проти llama-rs (підлога вже живе) + byte-exact `tokenizer.json`
    (qwen2 vocab/merges/pre) vs `Bpe` — чисельна + токенайзаційна довіра до `PH-305/305b`.
-3. **B2 залізо** `PH-202/203/205` — repack + SSE/AVX/NEON dispatch, `cargo bench` проти oracle
-   (std-testable, без референсу). `PH-204` fused K-quant dot **вже done**.
+3. **B2 залізо** `PH-203/205` — SSE/AVX/NEON dispatch поверх `repack` (std-testable,
+   без референсу) + `cargo bench` проти oracle. `PH-202` repack **вже done**.
 4. **B4 `PH-406`** run Qwen3-30B-A3B / Mixtral GGUF (реальна MoE-модель + expert-цикл на
    деquant-тензорах + `PH-404` cache). `PH-405` llama/HF greedy-parity (оракул) — gate.
 
