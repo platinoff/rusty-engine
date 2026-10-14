@@ -18,6 +18,7 @@ fn main() {
             println!("  --help, -h      print this banner");
             println!("  inspect <file>            GGUF metadata summary      (PH-107)");
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
+            println!("  config <file>             read model hyperparameters (PH-305c)");
             println!("  run -m <model>            generate text              (band B3)");
             println!("  serve                     OpenAI-compat server       (band B5)");
             println!("  node                      Wi-Fi slave runtime        (band B7)");
@@ -34,6 +35,13 @@ fn main() {
             (Some(path), Some(name)) => tensor(&path, &name),
             _ => {
                 eprintln!("usage: rusty tensor <model.gguf> <tensor.name>");
+                std::process::exit(2);
+            }
+        },
+        Some("config") => match args.next() {
+            Some(path) => config(&path),
+            None => {
+                eprintln!("usage: rusty config <model.gguf>");
                 std::process::exit(2);
             }
         },
@@ -137,6 +145,43 @@ fn tensor(path: &str, name: &str) {
                 );
             }
             Err(e) => eprintln!("  dequant: {e}"),
+        }
+    }
+}
+
+/// Read model hyperparameters (PH-305c) from a GGUF header.
+fn config(path: &str) {
+    match rusty_engine::gguf::parse_file(Path::new(path), rusty_engine::gguf::INSPECT_WINDOW) {
+        Ok(f) => match rusty_engine::model::ModelConfig::from_file(&f) {
+            Ok(c) => {
+                println!(
+                    "{path}  [{}]  {} layers  d_model={}  head_dim={}",
+                    c.arch,
+                    c.n_layers,
+                    c.d_model,
+                    c.head_dim()
+                );
+                println!(
+                    "  heads={} kv_heads={} d_ff={} vocab={} moe={}",
+                    c.n_heads,
+                    c.n_kv_heads,
+                    c.d_ff,
+                    c.n_vocab,
+                    c.is_moe()
+                );
+                println!(
+                    "  rope_base={} rms_eps={:?} experts={}(used {})",
+                    c.rope_freq_base, c.rms_eps, c.n_experts, c.n_experts_used
+                );
+            }
+            Err(e) => {
+                eprintln!("rusty config {path}: {e}");
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("rusty config {path}: {e}");
+            std::process::exit(1);
         }
     }
 }

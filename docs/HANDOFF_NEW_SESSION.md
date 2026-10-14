@@ -84,5 +84,7 @@ faithful з C: Q5_K ділить 6-bit layout, Q6_K signed `int8 scales` без 
 byte-fallback, specials). Plan loop — `docs/research/gguf-tensor-offsets.md`. Паралельно B2 залізо
 **70 тести** загалом → **+`PH-201c` Q5_0**: `dequant_q5_0` (22B `{d,qh,qs}`, bias −16) + `DType::Q5_0` +
 `ggml_dtype(6)` → **real `token_embd` (Q5_0) dequantize 136 134 656 finite → embedding розблоковано**,
-offset самозгоджений з наступним тензором. **71 тести**, clippy `-D` 0.
+offset самозгоджений з наступним тензором. **+`PH-305c`**: `src/model.rs` `ModelConfig::from_file`
+(arch + `<arch>.*/general.*` → n_layers/d_model/heads/kv_heads/d_ff/vocab/rope_base/rms_eps/experts)
++ CLI `rusty config`; **real Qwen2.5 → qwen2 24·896·14·GQA-2·4864·151936**. **73 тести**, clippy `-D` 0.
 `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.

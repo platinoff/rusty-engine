@@ -86,12 +86,13 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B3 — Dense forward (control path)  **`[~]` (PH-301..304 + PH-305a done, 2026-10-14)**
+## Band B3 — Dense forward (control path)  **`[~]` (PH-301..304 + PH-305a/305c done, 2026-10-14)**
 
 > Мета: згенерувати текст на DENSE-моделі як контроль перед MoE. Примітиви готові;
-> **реальна вага вже матеріалізується** (`PH-305a`: mmap→byte-range→Q6_K dequant на
-> справжній Qwen2.5, 4.36M finite-значень). Лишилось для `PH-305/306`: **BPE-decode**
-> (алгоритм) + **multi-layer loop** (attn+FFN ×24, RoPE-cache) → golden-токени.
+> **реальна вага матеріалізується** (`PH-305a`: mmap→byte-range→Q6_K dequant, 4.36M finite)
+> **і конфіг зчитано** (`PH-305c`: qwen2 24·896·14·GQA-2·4864, CLI `rusty config`).
+> Лишилось для `PH-305/306`: **single-block real forward** + **multi-layer loop** +
+> **HF-exact Qwen parity** (`PH-305b`: BPE pre-regex/byte-fallback/specials).
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
@@ -100,6 +101,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-303 | paged KV-cache (page alloc, vLLM-ідея) | `[x]` | `src/infer.rs` — `PagedKvCache::append/get` round-trip across pages |
 | PH-304 | sampler chain (temp/top-k/top-p/repetition/argmax) | `[x]` | `src/infer.rs` — `sample`/`mask_top_k`/`mask_top_p`/`apply_repetition_penalty`/`argmax` (grammar →later) |
 | PH-305a | real-tensor **mmap→byte-range→dequant** (single weight) | `[x]` | `src/loader.rs` — `tensor_bytes`/`dequant` + `gguf` `TensorEntry::nbytes`; CLI `rusty tensor`; real Q6_K 4.36M finite; synthetic layout test |
+| PH-305c | GGUF **model config reader** (forward-loop geometry) | `[x]` | `src/model.rs` — `ModelConfig::from_file`/`head_dim`/`is_moe`; CLI `rusty config`; real qwen2 24/896/14/2/4864; synth+missing-arch tests |
 | PH-305 | end-to-end dense-генерація (TinyLlama/Qwen2 GGUF), golden tokens | `[ ]` | `tests/dense_gen.rs` |
 | PH-306 | CLI `rusty run -m model.gguf -p "..."` | `[ ]` | `src/bin/rusty.rs` |
 

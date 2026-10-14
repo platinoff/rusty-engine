@@ -21,6 +21,7 @@ pub mod hub;
 pub mod infer;
 pub mod kernel;
 pub mod loader;
+pub mod model;
 pub mod moe;
 pub mod node;
 pub mod quant;
