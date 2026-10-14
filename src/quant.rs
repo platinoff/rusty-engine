@@ -123,7 +123,7 @@ pub fn dequant_q8_0(data: &[u8]) -> Vec<f32> {
 
 /// 6-bit scale/min extraction shared by Q4_K and Q5_K (llama.cpp `get_scale_min_k4`).
 /// `q` is the 12-byte super-block scale array; returns `(scale, min)` for sub-block `j`.
-fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+pub(crate) fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {

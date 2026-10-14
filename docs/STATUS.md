@@ -8,7 +8,7 @@
 |---------|----------|
 | `git status` | **clean** (0 drift) |
 | Локальні коміти | **19** |
-| Тести | **84** (78 lib unit + 2 dense-gen + 4 integration `scaffold_contracts`), 0 failed |
+| Тести | **88** (82 lib unit + 2 dense-gen + 4 integration `scaffold_contracts`), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
 | Rust LOC | **3909** (`src`+`tests`+`xtask`) |
@@ -26,7 +26,7 @@
 | **B0** scaffold | ✅ | workspace + bin `rusty` + `xtask`; MoE `top_k`; 7 модулів |
 | **B1** GGUF-чанкер | ✅ **complete** | header+KV+tensor-info, mmap/staged, sizes+Q4_0/Q8_0/Q4_K/Q5_K/Q6_K dequant, tokenizer-meta, `rusty inspect` |
 | B1-real parity | ✅ | реальний Qwen2.5: парсер+`ggml_dtype` (баг off-by-K знайдено/виправлено) |
-| **B2** kernels | 🟡 | `PH-201/201+/201c`: fused dot Q4_0/Q8_0 + скалярний oracle Q5_0+K-кванти; repack/SIMD (202..204) open |
+| **B2** kernels | 🟡 | `PH-201/201+/201c`: fused dot Q4_0/Q8_0 + скалярний oracle Q5_0+K-кванти; **`PH-204` fused K-quant dot/gemv** (Q4_K/Q5_K/Q6_K, stack `[f32;256]`, relative-parity); repack/SIMD (202..203) open |
 | **B3** forward | ✅ **complete** | `PH-301..304` (RMSNorm/RoPE/causal-SDPA/GQA/paged-KV/sampler) + `PH-305a/c/d/e` (real dequant, `ModelConfig`, `block_forward`, `validate`) + **`PH-305`/`PH-306`** (multi-layer dense runner + CLI `rusty run`, real Qwen2.5 24-layer prefill); llama-parity `PH-405` + HF-BPE `PH-305b` open |
 | **B4** MoE-core | 🟡 | `PH-401..403` (router softmax/sigmoid/group, SwiGLU, shared) + `PH-406a` `moe_layer_forward`; expert-cache/parity/run/bench (404..407) open |
 | B5 serve / B6 build-matrix(exe/bin/apk) / B7 docker / B8 supervisor / B9 dist-MoE / B10 UI / B11 distribs | ☐ | заплановано (бенди в роадмепі) |

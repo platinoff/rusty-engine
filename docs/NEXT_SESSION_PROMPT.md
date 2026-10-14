@@ -23,8 +23,10 @@ paged-KV/sampler + real mmap→Q6_K dequant + `ModelConfig` + `block_forward` + 
 final rmsnorm → `output` → logits. `quant::dequant` додав **F32/F16** гілки (норми реальних
 моделей). `tests/dense_gen.rs`: synth 2-layer greedy→token 4 + `#[ignore]` real-Qwen prefill
 → **151 936 finite logits** (усі 24 шари, pure-Rust). CLI `rusty run -m <model> -t "ids"
-[--max-tokens N]` (PH-306, numeric tokens). **84 тести** (78 lib + 2 dense + 4 scaffold),
-clippy `-D` 0, ratio Rust ~96%. Модель у `data/models/` (gitignored).
+[--max-tokens N]` (PH-306, numeric tokens). **+ B2 `PH-204` fused K-quant dot/gemv** —
+`dot_q{4,5,6}_k`+`matvec_q{4,5,6}_k` per-block stack `[f32;256]`, relative-parity vs
+`dot(dequant_qX_k, b)`. **88 тести** (82 lib + 2 dense + 4 scaffold), clippy `-D` 0, ratio
+Rust ~96%. Модель у `data/models/` (gitignored).
 **Checkpoint:** зріз стану — `docs/STATUS.md`; порівняння рушіїв —
 `docs/research/engine-landscape-2026.md`; offset-семантика — `docs/research/`.
 
@@ -33,8 +35,8 @@ clippy `-D` 0, ratio Rust ~96%. Модель у `data/models/` (gitignored).
    specials → `rusty run` друкує слова, не id.
 2. **`PH-405` llama/HF greedy-parity** (⭐ gate): perplexity-smoke + greedy token match на
    коротких промптах проти llama-rs (підлога вже живе) — чисельна довіра до `PH-305`.
-3. **B2 залізо** `PH-202/203/204` — repack + SSE/AVX/NEON dispatch, `cargo bench` проти oracle
-   (std-testable, без референсу).
+3. **B2 залізо** `PH-202/203/205` — repack + SSE/AVX/NEON dispatch, `cargo bench` проти oracle
+   (std-testable, без референсу). `PH-204` fused K-quant dot **вже done**.
 4. **B4 `PH-406`** run Qwen3-30B-A3B / Mixtral GGUF (реальна MoE-модель + expert-цикл на
    деquant-тензорах; потребує `PH-305`-подібного runner для MoE-шарів).
 

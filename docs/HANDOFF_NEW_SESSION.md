@@ -79,11 +79,14 @@ weighted-sum→+shared) з детермінованим інтеграційни
 **Живе читання реальної Qwen2.5:** `ffn_down` Q6_K → **4 358 144 finite** ваг, `attn_norm` F32 → 896.
 Offset-семантика кеш — `docs/research/gguf-tensor-offsets.md`.
 
-**B2 — Quantized kernels (частково):** `[~]` — **PH-201 + PH-201+ done**:
+**B2 — Quantized kernels (частково):** `[~]` — **PH-201 + PH-201+ + PH-201c + PH-204 done**:
 fused scalar dot/gemv Q4_0/Q8_0 (`src/kernel.rs`, `== dequant-then-dot`) **і** скалярний
-reference-dequant Q4_K/Q5_K/Q6_K (`src/quant.rs` — `dequant_q{4,5,6}_k` + `get_scale_min_k4`,
-faithful з C: Q5_K ділить 6-bit layout, Q6_K signed `int8 scales` без таблиці, −32 bias).
-**61 тести**, clippy `-D` 0. C-ref кеш — `docs/research/ggml-blocks.md`.
+reference-dequant Q4_K/Q5_K/Q6_K (`src/quant.rs`) **+ PH-204 fused K-quant dot/gemv**
+(`dot_q{4,5,6}_k` + `matvec_q{4,5,6}_k` macro — per-block dequantize into a stack `[f32;256]`
+and fold into the dot without materializing the full f32 row; parity vs `dot(dequant_qX_k, b)`
+relative tol). Реальна Qwen2.5 вага — Q4_K_M мікс: attn/ffn Q4_K + ffn_down Q6_K — саме ці
+ядра дадуть ~10× менше памʼяті під forward (B4 expert-cache). Лишилось repack (`PH-202`)
++ SIMD dispatch (`PH-203`) + bench (`PH-205`).
 
 **B3 — Dense forward (control path):** `[x]` — **PH-301/302/303/304 + PH-305a/c/d/e + PH-305 + PH-306 done** (2026-10-14):
 повний **multi-layer dense forward** на справжній Qwen2.5-0.5B (`src/runner.rs` `DenseRunner::
