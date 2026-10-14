@@ -23,6 +23,7 @@ path = "src/bin/rusty.rs"
 # No external deps in B0 (std-only scaffold). Runtime deps (tokio/axum/memmap2/
 # bollard/half) are introduced band-by-band in B1..B9 so `cargo build` stays offline-green.
 [dependencies]
+memmap2 = "0.9.11"
 
 [profile.release]
 opt-level = 3

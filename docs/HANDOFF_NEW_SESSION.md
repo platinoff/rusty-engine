@@ -39,13 +39,13 @@ MoE-двигун** (GGUF-first), MIT, під GSV-хабом. Рішення owne
 
 ## Наступний крок
 
-**B1 — GGUF-чанкер (частково):** `[~]` — dep-free зріз **закрито**: `PH-101` header+KV
-(усі `GGUF_TYPE_*`, вкладені arrays), `PH-102` tensor-info (`TensorEntry`+`ggml_dtype`),
-`PH-106` disk round-trip (`parse_file`: synth `.gguf` write→read), `PH-107` `rusty inspect`
-(`src/gguf.rs`/`src/bin/rusty.rs`; **23 тести**, clippy `-D` 0). Локальний фактаж формату —
-`docs/research/gguf-format.md`.
+**B1 — GGUF-чанкер (частково):** `[~]` — **закрито** `PH-101` header+KV (усі `GGUF_TYPE_*`,
+вкладені arrays), `PH-102` tensor-info (`TensorEntry`+`ggml_dtype`), `PH-103` mmap/staged
+loader (`src/loader.rs`: `MmapModel`/`lock_pages`(unix)/`staged_read`+progress — **перша
+не-std залежність `memmap2`**, регістр перевірено на старті), `PH-106` disk round-trip,
+`PH-107` `rusty inspect`. **26 тестів**, clippy `-D` 0. Фактаж формату — `docs/research/gguf-format.md`.
 
-Решта B1 — **open**, це **мережеві/важкі** зрізи (свідомо лишаємо на окремі сесії, з
-перевіркою cargo-регістру на старті): `PH-103` mmap/mlock staged loader (`memmap2`) →
-`PH-104` dequant-блоки (`ggml-common.h` block sizes) → `PH-105` BPE-токенізатор
-(`tokenizer.ggml.*`). Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
+Решта B1 — **open**, **важкі/research** зрізи (лишаємо на окремі сесії): `PH-104` dequant-блоки
+(точні block-sizes з `ggml-common.h` → explore-subagent у `docs/research/`) → `PH-105`
+BPE-токенізатор (`tokenizer.ggml.tokens/scores/token_type/merges`). Канон: `docs/roadmap.md`,
+`NEXT_SESSION_PROMPT.md`.

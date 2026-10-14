@@ -7,7 +7,8 @@
 //!
 //! Module map (see `docs/ARCHITECTURE.md`):
 //! - [`core`]  — dtypes, tensor descriptors, error/result types
-//! - [`gguf`]  — GGUF v3 header + tensor-info parsing (mmap staged loader in B1)
+//! - [`gguf`]  — GGUF v3 header + tensor-info parsing (B1)
+//! - [`loader`] — mmap + staged disk→RAM loaders with progress (PH-103, first non-std dep)
 //! - [`moe`]   — top-k router + expert FFN (the differentiator, B4)
 //! - [`infer`] — transformer forward, paged KV-cache, sampler (B3)
 //! - [`serve`] — OpenAI-compat HTTP server (B5)
@@ -18,6 +19,7 @@ pub mod core;
 pub mod gguf;
 pub mod hub;
 pub mod infer;
+pub mod loader;
 pub mod moe;
 pub mod node;
 pub mod serve;
