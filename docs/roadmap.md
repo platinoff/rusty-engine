@@ -80,6 +80,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-201 | scalar reference (dot, gemv) — Q4_0/Q8_0 fused | `[x]` | `src/kernel.rs` — `dot_q4_0`/`dot_q8_0`/`matvec_q4_0`/`matvec_q8_0` (== dequant-then-dot, 4 unit) |
 | PH-201+ | scalar reference dequant Q4_K/Q5_K/Q6_K (all-block oracle) | `[x]` | `src/quant.rs` — `dequant_q{4,5,6}_k`+`get_scale_min_k4`; 4 parity; C-ref кеш |
 | PH-201c | scalar reference dequant **Q5_0** (unblocks real embeddings) | `[x]` | `src/quant.rs` — `dequant_q5_0`(22B, bias −16) + `DType::Q5_0`/`ggml_dtype(6)`; real token_embd 136M finite; 71 unit |
+| PH-201d | **fused Q5_0 dot/gemv** (closes the quant matrix) | `[x]` | `src/kernel.rs` — `dot_q5_0`(d@0/qh@2/qs@6, −16 bias, 5th-bit `qh>>j`) + `matvec_q5_0`; == `dot(dequant_q5_0, b)` / `matvec(dequant_q5_0)`; 2 unit |
 | PH-204 | **fused dequant+dot** K-quant (Q4_K/Q5_K/Q6_K, stack `[f32;256]`, no Vec) | `[x]` | `src/kernel.rs` — `dot_q{4,5,6}_k` + `matvec_q{4,5,6}_k` macro (relative-parity vs `dot(dequant_qX_k, b)`, 4 unit) |
 | PH-202 | **repack** у compute-friendly layout (contiguous scales + de-interleaved nibble planes) | `[x]` | `src/repack.rs` — `RepackedQ4_0 {d,lo,hi}` + `RepackedQ8_0 {d,v}` + `repack_q{4,5}_*` + `dot_repacked_q{4,5}_*` + `matvec_repacked_q4_0`; **exact** vs `dot_q4_0` / `dot_q8_0` / `matvec(dequant, x)` (5 unit) |
 | PH-203 | SSE/AVX/AVX2 (x86) + NEON (arm64), runtime dispatch | `[ ]` | `src/core/kernel/simd.rs` |

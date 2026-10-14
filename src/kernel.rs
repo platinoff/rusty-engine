@@ -67,6 +67,42 @@ pub fn matvec_q8_0(w: &[u8], m: usize, n: usize, x: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// `dot(dequant_q5_0(a), b)` fused. `a` is a whole number of 22-byte Q5_0 blocks
+/// (`d`@0, `qh`@2, `qs`@6); `b` is `a.len()/22*32` floats. Mirrors `quant::dequant_q5_0`
+/// exactly (bias −16, 5th bit from `qh`), so it equals the `dequant → dot` oracle.
+pub fn dot_q5_0(a: &[u8], b: &[f32]) -> f32 {
+    let nb = a.len() / 22;
+    debug_assert_eq!(a.len(), nb * 22, "dot_q5_0: partial block");
+    debug_assert_eq!(b.len(), nb * 32, "dot_q5_0: vector length mismatch");
+    let mut s = 0.0f32;
+    for (blk, bchunk) in a.chunks_exact(22).zip(b.chunks(32)) {
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+        let qs = &blk[6..22];
+        let (lo, hi) = bchunk.split_at(16);
+        for j in 0..16 {
+            let bit0 = (((qh >> j) & 1) << 4) as i32;
+            let bit1 = (((qh >> (j + 16)) & 1) << 4) as i32;
+            let x0 = ((qs[j] & 0x0F) as i32 | bit0) - 16;
+            let x1 = ((qs[j] >> 4) as i32 | bit1) - 16;
+            s += x0 as f32 * d * lo[j];
+            s += x1 as f32 * d * hi[j];
+        }
+    }
+    s
+}
+
+/// Row-major `W[m×n]` stored as Q5_0 blocks, times `x[n]` → `out[m]`, fused per row.
+pub fn matvec_q5_0(w: &[u8], m: usize, n: usize, x: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matvec_q5_0: n must be a multiple of 32");
+    let row_bytes = n / 32 * 22;
+    debug_assert_eq!(w.len(), m * row_bytes, "matvec_q5_0: weight size mismatch");
+    debug_assert_eq!(x.len(), n, "matvec_q5_0: input width mismatch");
+    (0..m)
+        .map(|r| dot_q5_0(&w[r * row_bytes..(r + 1) * row_bytes], x))
+        .collect()
+}
+
 /// Dequantize one 144-byte Q4_K super-block into `out` (256 f32), mirroring
 /// `quant::dequant_q4_k` exactly.
 fn dq_q4_k_block(b: &[u8], out: &mut [f32; 256]) {
@@ -230,7 +266,7 @@ mod tests {
     use super::*;
     use crate::infer::dot;
     use crate::moe::matvec;
-    use crate::quant::{dequant_q4_0, dequant_q8_0};
+    use crate::quant::{dequant_q4_0, dequant_q5_0, dequant_q8_0};
 
     const SCALE_1: [u8; 2] = [0x00, 0x3C]; // f16 1.0 (LE)
 
@@ -257,6 +293,48 @@ mod tests {
             }
         }
         a
+    }
+
+    /// `nb` Q5_0 blocks: d=f16 1.0, a varied `qh` 5th-bit word + varied `qs` nibbles.
+    fn q5_blocks(nb: usize) -> Vec<u8> {
+        let mut a = vec![0u8; nb * 22];
+        for (bi, blk) in a.chunks_mut(22).enumerate() {
+            blk[0] = SCALE_1[0];
+            blk[1] = SCALE_1[1];
+            let qh = ((bi as u32).wrapping_mul(2654435761) ^ 0x3C0A5E7F).to_le_bytes();
+            blk[2..6].copy_from_slice(&qh);
+            for j in 0..16 {
+                blk[6 + j] = ((bi * 41 + j * 17) % 256) as u8;
+            }
+        }
+        a
+    }
+
+    #[test]
+    fn dot_q5_0_fused_matches_reference() {
+        let a = q5_blocks(4);
+        let b: Vec<f32> = (0..a.len() / 22 * 32)
+            .map(|i| (i as f32) * 0.07 - 20.0)
+            .collect();
+        let fused = dot_q5_0(&a, &b);
+        let reference = dot(&dequant_q5_0(&a), &b);
+        assert!(
+            (fused - reference).abs() < 1e-2,
+            "fused={fused} ref={reference}"
+        );
+    }
+
+    #[test]
+    fn matvec_q5_0_matches_f32_matvec() {
+        let (m, n) = (3usize, 64usize);
+        let w = q5_blocks(m * n / 32);
+        let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.15 - 3.0).collect();
+        let fused = matvec_q5_0(&w, m, n, &x);
+        let reference = matvec(&dequant_q5_0(&w), m, n, &x);
+        assert_eq!(fused.len(), m);
+        for (f, r) in fused.iter().zip(&reference) {
+            assert!((f - r).abs() < 1e-2, "fused={f} ref={r}");
+        }
     }
 
     #[test]
