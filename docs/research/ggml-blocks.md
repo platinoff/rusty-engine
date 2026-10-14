@@ -64,3 +64,37 @@ exp==0 subnormal `frac/1024*2^-14`, exp==31 → inf/nan, інакше `(1+frac/1
 
 > `byte_fallback`/`byte_to_char`/`utf8_min_byte` — НЕ ключі GGUF; llama.cpp виводить з
 > vocab (token_type==BYTE). PH-105 = **ingest метаданих** у `TokenizerMeta`, не сам BPE-алгоритм.
+
+## K-quant scalar dequant (референс `dequantize_row_q{4,5,6}_K`, ggml-quants.c)
+
+Підтверджено (subagent, llama.cpp-мастер): **Q5_K спільний** 6-bit layout з Q4_K
+(`get_scale_min_k4`) — НЕМАЄ `get_scale_min_k5`; **Q6_K БЕЗ lookup-таблиці**
+(помиłka про `{32,32,32,32,...}` — її нема); `scales` Q6_K = signed `int8[16]`.
+
+```c
+// 6-bit scale/min extraction (Q4_K + Q5_K shared). q = scales[12]. j = 0..7.
+get_scale_min_k4(j, q, &d, &m):
+  if j<4: d = q[j]&63;        m = q[j+4]&63;
+  else:   d = (q[j+4]&0xF)|((q[j-4]>>6)<<4);  m = (q[j+4]>>4)|((q[j]>>6)<<4);
+
+// Q4_K (144B): d@0,dmin@2,scales@4(12),qs@16(128). 4 groups (j+=64), is+=2, base=is*16 bytes:
+//   y[l]      = d*sc0 * (qs[base+l]&0xF) - dmin*m0     // low nibbles,  0..31
+//   y[l+32]   = d*sc1 * (qs[base+l]>>4)  - dmin*m1     // high nibbles, 32..63
+
+// Q5_K (176B): d@0,dmin@2,scales@4(12),qh@16(32),qs@48(128). masks u1=1<<(2*grp),u2=2<<(2*grp):
+//   y[l]    = d*sc0*((qs[base+l]&0xF)+(qh[l]&u1?16:0)) - dmin*m0
+//   y[l+32] = d*sc1*((qs[base+l]>>4)+(qh[l]&u2?16:0))  - dmin*m1
+
+// Q6_K (210B): ql@0(128),qh@128(64),scales@192(16 i8),d@208. 2 halves (n+=128):
+//   per l in 0..32, is=l/16, q = (ql.. &0xF or >>4) | (qh 2bits <<4) - 32   // signed [-32..31]
+//   y[l]=d*sc[sb+is+0]*q1; y[l+32]=...*sc[sb+is+2]*q2; y[l+64]=..*sc[+4]*q3; y[l+96]=..*sc[+6]*q4
+//   q1 low-nibble(l), q2 low-nibble(l+32), q3 high-nibble(l), q4 high-nibble(l+32);
+//   qh bits: q1<<0 &3, q2>>2 &3, q3>>4 &3, q4>>6 &3
+```
+**Пастки:** signedness — Q6_K `q` та `sc` СІГНОВАНІ (−32 bias, `sc` i8), Q4_K/Q5_K `sc/m`
+без знаку (0..63) і `q` без знаку (0..15 / 0..31), `min` віднімається; low-nibble → перші
+32, high-nibble → наступні 32 в межах 64-групи. Реалізовано: `src/quant.rs`
+`dequant_q4_k`/`dequant_q5_k`/`dequant_q6_k` (+ `get_scale_min_k4`), PH-202.
+
+> SIMD (`PH-203`) + repack (`PH-204`) мають відтворювати ЦЕЙ скалярний oracle;
+> числовий parity проти llama.cpp — на реальній моделі, `PH-405`.

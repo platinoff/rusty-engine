@@ -1,10 +1,11 @@
-//! Quantized-block sizes + scalar dequant — band B1 `PH-104`.
+//! Quantized-block sizes + scalar dequant — band B1 `PH-104` + band B2 `PH-202`.
 //!
-//! Authoritative layouts cached in `docs/research/ggml-blocks.md` (from
-//! `ggml-common.h`/`ggml-quants.c`). This slice implements the two formats with an
-//! unambiguous scalar reference — **Q4_0** (split-half nibbles) and **Q8_0** — plus the
-//! exact block sizes for **Q4_K/Q5_K/Q6_K** so tensor byte-ranges (and the loader's
-//! `slice`) compute correctly. K-quant *dequant math* lands in band **B2** (`PH-201`).
+//! Authoritative layouts + exact `dequantize_row_q{4,5,6}_K` scalar references cached in
+//! `docs/research/ggml-blocks.md` (from `ggml-common.h`/`ggml-quants.c`, fetched via
+//! explore-subagent). Implements: Q4_0 (split-half) + Q8_0 (signed, `PH-104`), block sizes
+//! for all formats, and now the **Q4_K/Q5_K/Q6_K** scalar reference dequant (`PH-202`),
+//! transcribed faithfully from the C (6-bit shared scale/min `get_scale_min_k4`, signed
+//! 8-bit Q6_K scales with `-32` bias, no lookup table). SIMD + repack follow in `PH-203/204`.
 
 use crate::core::{EngineError, Result};
 
@@ -94,8 +95,119 @@ pub fn dequant_q8_0(data: &[u8]) -> Vec<f32> {
     out
 }
 
-/// Dispatch scalar dequant by `GGML_TYPE_*`. Q4_0/Q8_0 supported here; K-quants are
-/// sized but their dequant math is `PH-201` (band B2) → `Err`.
+/// 6-bit scale/min extraction shared by Q4_K and Q5_K (llama.cpp `get_scale_min_k4`).
+/// `q` is the 12-byte super-block scale array; returns `(scale, min)` for sub-block `j`.
+fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        let d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        let m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+        (d, m)
+    }
+}
+
+/// Scalar reference dequant of Q4_K blocks (256 elements / 144 bytes). Faithful
+/// transcription of `dequantize_row_q4_K`; `y = d*sc*q - dmin*m` with 6-bit scales/mins.
+#[allow(clippy::needless_range_loop)]
+pub fn dequant_q4_k(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 144 * 256);
+    for b in data.chunks_exact(144) {
+        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+        let scales = &b[4..16];
+        let qs = &b[16..144];
+        for grp in 0..4 {
+            let (sc0, m0) = get_scale_min_k4(grp * 2, scales);
+            let (sc1, m1) = get_scale_min_k4(grp * 2 + 1, scales);
+            let d1 = d * sc0 as f32;
+            let dm1 = min * m0 as f32;
+            let d2 = d * sc1 as f32;
+            let dm2 = min * m1 as f32;
+            let base = grp * 32;
+            for l in 0..32 {
+                let q = qs[base + l];
+                out.push(d1 * (q & 0xF) as f32 - dm1);
+            }
+            for l in 0..32 {
+                let q = qs[base + l];
+                out.push(d2 * (q >> 4) as f32 - dm2);
+            }
+        }
+    }
+    out
+}
+
+/// Scalar reference dequant of Q5_K blocks (256 elements / 176 bytes). Shares Q4_K's
+/// 6-bit scale layout; adds the 5th bit from `qh` (mask `1<<(2*grp)` low / `2<<(2*grp)` high).
+#[allow(clippy::needless_range_loop)]
+pub fn dequant_q5_k(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 176 * 256);
+    for b in data.chunks_exact(176) {
+        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+        let scales = &b[4..16];
+        let qh = &b[16..48];
+        let qs = &b[48..176];
+        for grp in 0..4 {
+            let (sc0, m0) = get_scale_min_k4(grp * 2, scales);
+            let (sc1, m1) = get_scale_min_k4(grp * 2 + 1, scales);
+            let d1 = d * sc0 as f32;
+            let dm1 = min * m0 as f32;
+            let d2 = d * sc1 as f32;
+            let dm2 = min * m1 as f32;
+            let base = grp * 32;
+            let u1 = 1u8 << (2 * grp);
+            let u2 = 2u8 << (2 * grp);
+            for l in 0..32 {
+                let lo = (qs[base + l] & 0xF) as i32 + if qh[l] & u1 != 0 { 16 } else { 0 };
+                out.push(d1 * lo as f32 - dm1);
+            }
+            for l in 0..32 {
+                let hi = (qs[base + l] >> 4) as i32 + if qh[l] & u2 != 0 { 16 } else { 0 };
+                out.push(d2 * hi as f32 - dm2);
+            }
+        }
+    }
+    out
+}
+
+/// Scalar reference dequant of Q6_K blocks (256 elements / 210 bytes). Signed 8-bit
+/// `scales[16]`, no min; value = `ql_nibble | (qh_2bits << 4)` biased by `-32`, result `d*sc*q`.
+#[allow(clippy::needless_range_loop)]
+pub fn dequant_q6_k(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 210 * 256);
+    for b in data.chunks_exact(210) {
+        let d = f16_to_f32(u16::from_le_bytes([b[208], b[209]]));
+        let ql = &b[0..128];
+        let qh = &b[128..192];
+        let sc = &b[192..208];
+        for half in 0..2 {
+            let mut tmp = [0.0f32; 128];
+            let qb = half * 64;
+            let hb = half * 32;
+            let sb = half * 8;
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[qb + l] & 0xF) as i32 | ((qh[hb + l] & 3) as i32) << 4) - 32;
+                let q2 =
+                    ((ql[qb + l + 32] & 0xF) as i32 | (((qh[hb + l] >> 2) & 3) as i32) << 4) - 32;
+                let q3 = ((ql[qb + l] >> 4) as i32 | (((qh[hb + l] >> 4) & 3) as i32) << 4) - 32;
+                let q4 =
+                    ((ql[qb + l + 32] >> 4) as i32 | (((qh[hb + l] >> 6) & 3) as i32) << 4) - 32;
+                tmp[l] = d * sc[sb + is] as i8 as f32 * q1 as f32;
+                tmp[l + 32] = d * sc[sb + is + 2] as i8 as f32 * q2 as f32;
+                tmp[l + 64] = d * sc[sb + is + 4] as i8 as f32 * q3 as f32;
+                tmp[l + 96] = d * sc[sb + is + 6] as i8 as f32 * q4 as f32;
+            }
+            out.extend_from_slice(&tmp);
+        }
+    }
+    out
+}
+
+/// Dispatch scalar dequant by `GGML_TYPE_*` for all supported formats
+/// (F32/F16 are `PH-104`-not-applicable here; Q4_0/Q8_0/Q4_K/Q5_K/Q6_K handled).
 pub fn dequant(ggml_type: u32, data: &[u8]) -> Result<Vec<f32>> {
     match ggml_type {
         2 => {
@@ -114,11 +226,30 @@ pub fn dequant(ggml_type: u32, data: &[u8]) -> Result<Vec<f32>> {
             }
             Ok(dequant_q8_0(data))
         }
-        12..=14 => Err(EngineError {
-            message: format!(
-                "K-quant dequant (ggml {ggml_type}) is band B2; block size via block_info"
-            ),
-        }),
+        12 => {
+            if data.len() % 144 != 0 {
+                return Err(EngineError {
+                    message: format!("Q4_K data len {} not a multiple of 144", data.len()),
+                });
+            }
+            Ok(dequant_q4_k(data))
+        }
+        13 => {
+            if data.len() % 176 != 0 {
+                return Err(EngineError {
+                    message: format!("Q5_K data len {} not a multiple of 176", data.len()),
+                });
+            }
+            Ok(dequant_q5_k(data))
+        }
+        14 => {
+            if data.len() % 210 != 0 {
+                return Err(EngineError {
+                    message: format!("Q6_K data len {} not a multiple of 210", data.len()),
+                });
+            }
+            Ok(dequant_q6_k(data))
+        }
         t => Err(EngineError {
             message: format!("no scalar dequant for ggml type {t}"),
         }),
@@ -222,11 +353,62 @@ mod tests {
     }
 
     #[test]
-    fn dequant_dispatch_gates_kquants_and_ragged() {
-        assert!(dequant(12, &[0u8; 144]).is_err()); // K-quant -> B2
+    fn dequant_dispatch_lengths() {
         assert!(dequant(2, &[0u8; 17]).is_err()); // ragged Q4_0
+        assert!(dequant(12, &[0u8; 143]).is_err()); // ragged Q4_K
+        assert!(dequant(99, &[0u8; 8]).is_err()); // unsupported type
         let mut ok = vec![0u8; 18];
         ok[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
         assert_eq!(dequant(2, &ok).unwrap().len(), 32);
+        assert_eq!(dequant(12, &[0u8; 144]).unwrap().len(), 256);
+    }
+
+    #[test]
+    fn q4_k_zero_block_all_zero() {
+        // d=1, min=0, scales=0, qs=0 => y = d*0*q - min*0 = 0 for all 256.
+        let mut b = vec![0u8; 144];
+        b[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        let out = dequant_q4_k(&b);
+        assert_eq!(out.len(), 256);
+        assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn q4_k_uniform_scale_and_min() {
+        // d=1, min=1; sub-block0 scale=2 (scales[0]), min=1 (scales[4]); qs low nibble=3.
+        // out[0..32] (grp0 low) = d*sc*q - min*m = 1*2*3 - 1*1 = 5.
+        let mut b = vec![0u8; 144];
+        b[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        b[2..4].copy_from_slice(&0x3C00u16.to_le_bytes());
+        b[4] = 2;
+        b[8] = 1;
+        b[16..144].fill(0x03);
+        let out = dequant_q4_k(&b);
+        assert!((out[0] - 5.0).abs() < 1e-5);
+        assert!((out[31] - 5.0).abs() < 1e-5);
+        assert_eq!(out[32], 0.0); // grp0 high uses sub-block1 scale = 0
+    }
+
+    #[test]
+    fn q5_k_low_group() {
+        // d=1, min=0, sub-block0 scale=1; qs low nibble=3, qh=0 => out[0] = 1*1*3 = 3.
+        let mut b = vec![0u8; 176];
+        b[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        b[4] = 1;
+        b[48..176].fill(0x03);
+        let out = dequant_q5_k(&b);
+        assert_eq!(out.len(), 256);
+        assert!((out[0] - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn q6_k_signed_zero_bias() {
+        // d=1, all scales=1(i8), ql=qh=0 => q = 0 - 32 = -32 => y = 1*1*(-32) = -32 everywhere.
+        let mut b = vec![0u8; 210];
+        b[208..210].copy_from_slice(&0x3C00u16.to_le_bytes());
+        b[192..208].fill(1);
+        let out = dequant_q6_k(&b);
+        assert_eq!(out.len(), 256);
+        assert!(out.iter().all(|&v| (v + 32.0).abs() < 1e-5));
     }
 }

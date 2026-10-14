@@ -60,12 +60,13 @@ group-score + top_k_group restrict); `expert_ffn` = `down(swiglu(gate,up))` (`si
 `PagedKvCache` (append/get across pages); sampler chain `sample`/`apply_temperature`/`mask_top_k`/
 `mask_top_p`/`apply_repetition_penalty`/`argmax` (детермінований `r`).
 
-**B2 — Quantized kernels (частково):** `[~]` — **PH-201 done** (`src/kernel.rs`, pure):
-fused scalar **reference-оракул** `dot_q4_0`/`dot_q8_0` + `matvec_q4_0`/`matvec_q8_0`, перевірені
-інваріантом `fused == dequant-then-dot` (контракт для SIMD PH-203). **57 тести**, clippy `-D` 0.
+**B2 — Quantized kernels (частково):** `[~]` — **PH-201 + PH-201+ done**:
+fused scalar dot/gemv Q4_0/Q8_0 (`src/kernel.rs`, `== dequant-then-dot`) **і** скалярний
+reference-dequant Q4_K/Q5_K/Q6_K (`src/quant.rs` — `dequant_q{4,5,6}_k` + `get_scale_min_k4`,
+faithful з C: Q5_K ділить 6-bit layout, Q6_K signed `int8 scales` без таблиці, −32 bias).
+**61 тести**, clippy `-D` 0. C-ref кеш — `docs/research/ggml-blocks.md`.
 
-**Наступний крок (межа «чистих без-модельних»):** лишились **два важкі шляхи** —
-1. **K-quant reference/SIMD** (`PH-202..205`) — потрібен **точний `dequantize_*_K_ref` з llama.cpp**
-   (explore-subagent) + repack + NEON/SSE dispatch;
-2. **реальна GGUF-модель** → `PH-305` dense golden / `PH-306` `rusty run` / B4 `PH-404..407` /
-   числовий parity `PH-405`. Наступна `agi` обирає напрямок. Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
+**Наступний крок:** усередині B2 лишилось **залізо** — repack (`PH-202`), SSE/AVX/NEON
+runtime-dispatch (`PH-203`), fused K-quant dequant+dot (`PH-204`) — кожен з `cargo bench`
+проти скалярного oracle. Або **реальна GGUF-модель** → `PH-305/406/405` golden+parity.
+Обидва великі; наступна `agi` обирає (`simd` чи `model`). Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
