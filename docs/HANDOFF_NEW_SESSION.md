@@ -58,9 +58,14 @@ group-score + top_k_group restrict); `expert_ffn` = `down(swiglu(gate,up))` (`si
 **B3 — Dense forward (частково):** `[~]` — **PH-301/302/303/304 done** (`src/infer.rs`, pure-f32):
 `rmsnorm`; attention primitives `rope`/`apply_causal_mask`/`attention_causal`/`gqa_repeat_kv`;
 `PagedKvCache` (append/get across pages); sampler chain `sample`/`apply_temperature`/`mask_top_k`/
-`mask_top_p`/`apply_repetition_penalty`/`argmax` (детермінований `r`). **53 тести**, clippy `-D` 0.
+`mask_top_p`/`apply_repetition_penalty`/`argmax` (детермінований `r`).
 
-**Наступний крок (стеліть «мільйон-контекст»):** далі **потрібна реальна GGUF-модель** —
-`PH-305` dense golden (multi-head loop + RoPE-cache + forward → токени), `PH-306` `rusty run`,
-B4 `PH-404..407` (expert-cache/parity/run/bench). Або **B2** (`PH-201` K-quant dequant + SIMD,
-std-testable) як наступний чистий зріз без моделі. Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
+**B2 — Quantized kernels (частково):** `[~]` — **PH-201 done** (`src/kernel.rs`, pure):
+fused scalar **reference-оракул** `dot_q4_0`/`dot_q8_0` + `matvec_q4_0`/`matvec_q8_0`, перевірені
+інваріантом `fused == dequant-then-dot` (контракт для SIMD PH-203). **57 тести**, clippy `-D` 0.
+
+**Наступний крок (межа «чистих без-модельних»):** лишились **два важкі шляхи** —
+1. **K-quant reference/SIMD** (`PH-202..205`) — потрібен **точний `dequantize_*_K_ref` з llama.cpp**
+   (explore-subagent) + repack + NEON/SSE dispatch;
+2. **реальна GGUF-модель** → `PH-305` dense golden / `PH-306` `rusty run` / B4 `PH-404..407` /
+   числовий parity `PH-405`. Наступна `agi` обирає напрямок. Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.

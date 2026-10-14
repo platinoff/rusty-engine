@@ -12,15 +12,16 @@
 block-sizes+Q4_0/Q8_0 dequant→tokenizer-meta. **35 тестів**, clippy `-D` 0. Коміти локальні,
 **без push** (GitHub remote — B11 `PH-1105`).
 
-## Наступний крок (B3 attention/KV primitives — std, далі модель)
+## Наступний крок (межа: K-quant ref через C-фактаж, або реальна модель)
 
-Done цього сеансу: **B1 `PH-101..107`** (GGUF-контейнер завершено), **B4-core `PH-401/402/403`**
-(router/SwiGLU/shared), **B3-primitives `PH-301/302/303/304`** (RMSNorm + attention `rope`/
-`apply_causal_mask`/`attention_causal`/`gqa_repeat_kv` + `PagedKvCache` + sampler) — **53 тести**, clippy `-D` 0.
+Done цього сеансу: **B1 `PH-101..107`** (контейнер завершено), **B4-core `PH-401/402/403`**
+(router/SwiGLU/shared), **B3-primitives `PH-301..304`** (RMSNorm + attention + paged-KV + sampler),
+**B2 `PH-201`** (fused scalar reference Q4_0/Q8_0, == dequant-dot oracle) — **57 тести**, clippy `-D` 0.
 
-Чистих **std-зрізів без моделі** в B1/B3/B4 більше не лишилось. Наступна `agi` — на вибір:
-1. **B2 `PH-201`** scalar K-quant dequant + SIMD — ще possible «без моделі» (ручні block-вектори).
-2. **`PH-305`/`PH-406`** dense+MoE forward golden — потребує завантажити Tiny/real GGUF + deps.
+Чистих **без-модельних std-зрізів більше немає**. Наступна `agi` обирає напрямок:
+1. **B2 `PH-202..205`** — K-quant dequant/SIMD: спочатку **explore-subagent тягне точний
+   `dequantize_q{4,5,6}_K_ref` з llama.cpp** у `docs/research/`, потім ручні block-тести → repack/SIMD.
+2. **`PH-305`/`PH-406`/`PH-405`** — завантажити реальну tiny/real GGUF → dense/MoE golden + parity.
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
 
@@ -34,6 +35,7 @@ subagent-ах. Не тягну весь llama.cpp/vLLM у вікно за раз
 - `rusty-engine-gguf` (B1) — банда **завершена**: `PH-101..107` усі **done** (2026-10-14).
 - `rusty-engine-moe-core` (B4) — банда створена: `PH-401/402/403` **done** (router+SwiGLU+shared), `PH-404..407` **open** (потребують реальної GGUF-моделі).
 - B3 primitives (standalone тікети `PH-301/302/303/304`) — **done**; `PH-305/306` **open** (модель).
+- B2 (standalone `PH-201`) — **done** (fused scalar reference Q4_0/Q8_0); `PH-202..205` **open** (K-quant ref → C-fактаж).
 
 ## Reminder (session law)
 

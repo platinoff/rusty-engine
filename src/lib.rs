@@ -19,6 +19,7 @@ pub mod core;
 pub mod gguf;
 pub mod hub;
 pub mod infer;
+pub mod kernel;
 pub mod loader;
 pub mod moe;
 pub mod node;

@@ -64,13 +64,15 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B2 — Quantized kernels + SIMD  **`[ ]`**
+## Band B2 — Quantized kernels + SIMD  **`[~]` (PH-201 partial done, 2026-10-14)**
 
 > Мета: швидкі ядра для квантів, x86 + arm64, feature-gated dispatch.
+> Скалярний **reference-оракул** для Q4_0/Q8_0 готовий (SIMD має йому відповідати);
+> K-quant reference + repack/SIMD — далі (потребують реального блоку/паритету).
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
-| PH-201 | scalar reference (dot, gemv) для кожного блоку | `[ ]` | `src/core/kernel/scalar.rs` |
+| PH-201 | scalar reference (dot, gemv) — Q4_0/Q8_0 fused | `[~]` | `src/kernel.rs` — `dot_q4_0`/`dot_q8_0`/`matvec_q4_0`/`matvec_q8_0` (== dequant-then-dot, 4 unit); K-quant → PH-202/PH-405 |
 | PH-202 | repack у compute-friendly layout | `[ ]` | `src/core/kernel/repack.rs` |
 | PH-203 | SSE/AVX/AVX2 (x86) + NEON (arm64), runtime dispatch | `[ ]` | `src/core/kernel/simd.rs` |
 | PH-204 | fused dequant+dot inner loops | `[ ]` | `src/core/kernel/mod.rs` |
