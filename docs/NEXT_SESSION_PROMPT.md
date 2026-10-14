@@ -13,16 +13,15 @@ pure-Rust MoE-двигун (GGUF-first), MIT, під GSV-хабом. Workspace +
 `gsv.code-workspace` + ticket-сценарії. Перший локальний коміт зроблено (**без push** —
 push лише в B11 з згодою owner).
 
-## Наступний крок (B1 — лишились PH-104/PH-105, research-важкі)
+## Наступний крок (B1 — лишився PH-105, далі B3/B4)
 
-Done: `PH-101/102` (`parse()`), `PH-103` (mmap+staged loaders `src/loader.rs`, `memmap2` —
-регістр доступний, перевірено на старті), `PH-106` (disk round-trip), `PH-107` (`rusty inspect`).
-Фактаж — `docs/research/gguf-format.md`.
+Done: `PH-101/102` (`parse()`), `PH-103` (mmap+staged loaders `src/loader.rs`, `memmap2`),
+`PH-104` (quant `src/quant.rs`: block-sizes усіх 5 + scalar dequant Q4_0/Q8_0; K-quant dequant
+→ B2), `PH-106` (disk round-trip), `PH-107` (`rusty inspect`). Фактаж — `docs/research/`.
 
-1. `PH-104` dequant Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 → **точні block-sizes з `ggml-common.h`**
-   (через explore-subagent → дописати в `docs/research/`), `src/core/quant.rs` + unit-паритет.
-2. `PH-105` BPE-токенізатор (`tokenizer.ggml.tokens/scores/token_type/merges`) — `src/gguf/tok.rs`.
-3. Далі — **B3 dense-forward** (RMSNorm/attn/RoPE/paged-KV/sampler) і **B4 MoE-ядро**
+1. `PH-105` tokenizer-**metadata ingest** (`tokenizer.ggml.tokens/scores/token_type/merges/bos/eos/pre`)
+   → `src/tokenizer.rs` `TokenizerMeta::from_file(&GgufFile)` (не сам BPE-алгоритм — той у B3).
+2. Далі — **B3 dense-forward** (RMSNorm/attn/RoPE/paged-KV/sampler) і **B4 MoE-ядро**
    (`rusty-engine-moe-core` ready) — марquee-діференціатор.
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
@@ -34,7 +33,7 @@ subagent-ах. Не тягну весь llama.cpp/vLLM у вікно за раз
 ## Тікети на дошці
 
 - `rusty-engine-bootstrap` (B0) — 10/10 **done** (сесія 2026-10-14).
-- `rusty-engine-gguf` (B1) — банда створена: `PH-101/102/103/106/107` **done**, `PH-104/105` **open** (research-heavy).
+- `rusty-engine-gguf` (B1) — банда створена: `PH-101/102/103/104/106/107` **done**, `PH-105` **open**.
 - `rusty-engine-moe-core` (B4) — ready-to-hook (марquee-діференціатор: native MoE forward).
 
 ## Reminder (session law)

@@ -43,9 +43,12 @@ MoE-двигун** (GGUF-first), MIT, під GSV-хабом. Рішення owne
 вкладені arrays), `PH-102` tensor-info (`TensorEntry`+`ggml_dtype`), `PH-103` mmap/staged
 loader (`src/loader.rs`: `MmapModel`/`lock_pages`(unix)/`staged_read`+progress — **перша
 не-std залежність `memmap2`**, регістр перевірено на старті), `PH-106` disk round-trip,
-`PH-107` `rusty inspect`. **26 тестів**, clippy `-D` 0. Фактаж формату — `docs/research/gguf-format.md`.
+`PH-107` `rusty inspect`. **33 тести**, clippy `-D` 0. Фактаж — `docs/research/gguf-format.md` + `docs/research/ggml-blocks.md`.
 
-Решта B1 — **open**, **важкі/research** зрізи (лишаємо на окремі сесії): `PH-104` dequant-блоки
-(точні block-sizes з `ggml-common.h` → explore-subagent у `docs/research/`) → `PH-105`
-BPE-токенізатор (`tokenizer.ggml.tokens/scores/token_type/merges`). Канон: `docs/roadmap.md`,
-`NEXT_SESSION_PROMPT.md`.
+Додав `PH-104` (`src/quant.rs`): `f16_to_f32`, `block_info`/`bytes_for_numel` для **усіх 5**
+(Q4_0/Q8_0/Q4_K/Q5_K/Q6_K = 18/34/144/176/210 B/block — offset-математика готова), скалярний
+`dequant_q4_0` (**split-half**, не 2i/2i+1) + `dequant_q8_0` (signed); K-quant *dequant math* → B2.
+
+Решта B1 — **open**: `PH-105` BPE tokenizer-metadata ingest (`tokenizer.ggml.tokens/scores/
+token_type/merges/bos/eos/...`) — ключі в `docs/research/ggml-blocks.md`. Далі глибина: **B3
+dense-forward** і **B4 MoE-ядро**. Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.

@@ -22,6 +22,7 @@ pub mod infer;
 pub mod loader;
 pub mod moe;
 pub mod node;
+pub mod quant;
 pub mod serve;
 
 /// Crate name as reported by `rusty --version` / `banner()`.
