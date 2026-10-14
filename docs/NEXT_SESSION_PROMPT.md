@@ -20,7 +20,7 @@ encode/decode**), баг `ggml_dtype` знайдено/виправлено + р
 (RMSNorm+attention+paged-KV+sampler) + **`PH-305a`** (mmap→byte-range→**real Q6_K dequant 4.36M finite**);
 **B2 `PH-201`+`PH-201+`+`PH-201c`** (fused dot/gemv Q4_0/Q8_0 + скалярний reference-dequant Q4_K/Q5_K/Q6_K **+ Q5_0** —
 real `token_embd` dequantize 136M finite → **embedding розблоковано**) —
-**73 тести**, clippy `-D` 0. Модель у `data/models/` (gitignored); offset-семантика + BPE — у `docs/research/`.
+**77 тести**, clippy `-D` 0. Модель у `data/models/` (gitignored); offset-семантика + BPE — у `docs/research/`.
 
 Наступна `agi` обирає:
 1. **`PH-305` dense forward** (⭐ embedding тепер деquantizeʼться — Q5_0 готовий): лишилось
@@ -39,7 +39,7 @@ subagent-ах. Не тягну весь llama.cpp/vLLM у вікно за раз
 - `rusty-engine-bootstrap` (B0) — 10/10 **done** (сесія 2026-10-14).
 - `rusty-engine-gguf` (B1) — банда **завершена**: `PH-101..107` + **`PH-105b`** (BPE) **done** (2026-10-14).
 - `rusty-engine-moe-core` (B4) — `PH-401/402/403` **done** (router+SwiGLU+shared) + **`PH-406a` `moe_layer_forward`** (повний цикл шару, детермін.), `PH-404/405/406/407` **open** (потребують реальної GGUF-моделі).
-- B3 primitives (`PH-301..304`) + **`PH-305a`** (real-tensor mmap→byte-range→dequant) + **`PH-305c`** (`ModelConfig`, rusty config) — **done**; `PH-305` (single-block+24-layer loop)/`PH-306`/`PH-305b` (HF-parity) **open**.
+- B3 primitives (`PH-301..304`) + **`PH-305a`** (real mmap→dequant) + **`PH-305c`** (`ModelConfig`) + **`PH-305d`** (`forward::block_forward` decode-step) — **done**; `PH-305` (multi-layer loop over real tensors + KV cache)/`PH-306`/`PH-305b` (HF-parity) **open**.
 - B2 — `PH-201` + `PH-201+` + **`PH-201c` (Q5_0)** **done** (fused dot Q4_0/Q8_0 + K-quant + Q5_0 scalar reference); `PH-202..204` **open** (repack/SIMD/fused-gemv).
 
 ## Reminder (session law)

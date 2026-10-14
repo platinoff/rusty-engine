@@ -16,6 +16,7 @@
 //! - [`hub`]   — GSV-native master supervisor (Rust k8s-lite, B8)
 
 pub mod core;
+pub mod forward;
 pub mod gguf;
 pub mod hub;
 pub mod infer;

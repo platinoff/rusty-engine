@@ -86,7 +86,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B3 — Dense forward (control path)  **`[~]` (PH-301..304 + PH-305a/305c done, 2026-10-14)**
+## Band B3 — Dense forward (control path)  **`[~]` (PH-301..304 + PH-305a/c/d done, 2026-10-14)**
 
 > Мета: згенерувати текст на DENSE-моделі як контроль перед MoE. Примітиви готові;
 > **реальна вага матеріалізується** (`PH-305a`: mmap→byte-range→Q6_K dequant, 4.36M finite)
@@ -102,6 +102,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-304 | sampler chain (temp/top-k/top-p/repetition/argmax) | `[x]` | `src/infer.rs` — `sample`/`mask_top_k`/`mask_top_p`/`apply_repetition_penalty`/`argmax` (grammar →later) |
 | PH-305a | real-tensor **mmap→byte-range→dequant** (single weight) | `[x]` | `src/loader.rs` — `tensor_bytes`/`dequant` + `gguf` `TensorEntry::nbytes`; CLI `rusty tensor`; real Q6_K 4.36M finite; synthetic layout test |
 | PH-305c | GGUF **model config reader** (forward-loop geometry) | `[x]` | `src/model.rs` — `ModelConfig::from_file`/`head_dim`/`is_moe`; CLI `rusty config`; real qwen2 24/896/14/2/4864; synth+missing-arch tests |
+| PH-305d | **transformer decode-step forward** (attn+FFN+residual) | `[x]` | `src/forward.rs` — `block_forward`/`attention_decode`/`logits_from_hidden`/`Geometry`/`BlockWeights`; toy-oracle: residual-identity + known greedy token + GQA; llama-parity → PH-405 |
 | PH-305 | end-to-end dense-генерація (TinyLlama/Qwen2 GGUF), golden tokens | `[ ]` | `tests/dense_gen.rs` |
 | PH-306 | CLI `rusty run -m model.gguf -p "..."` | `[ ]` | `src/bin/rusty.rs` |
 
