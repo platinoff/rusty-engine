@@ -22,6 +22,7 @@
 //! - [`gpt2`] — HF GPT-2/Qwen2 pre-tokenizer regex splitter (std-only, PH-305b)
 //! - [`textgen`] — text in / text out pipeline: BPE encode → generate → decode (PH-306b)
 //! - [`serve`] — OpenAI-compat HTTP server (B5)
+//! - [`http`] — std-only request→response layer, pure `route()` (B5 `PH-501a`)
 //! - [`node`]  — slave/worker runtime over local Wi-Fi (B7/B8)
 //! - [`hub`]   — GSV-native master supervisor (Rust k8s-lite, B8)
 
@@ -30,6 +31,7 @@ pub mod core;
 pub mod forward;
 pub mod gguf;
 pub mod gpt2;
+pub mod http;
 pub mod hub;
 pub mod infer;
 pub mod kernel;

@@ -22,7 +22,7 @@ fn main() {
             println!("  validate <file>           check tensor names/dims vs config (PH-305e)");
             println!("  run -m <model> -p <text>  BPE text generation        (PH-306b)");
             println!("  run -m <model> -t <ids>   numeric-token greedy       (PH-306)");
-            println!("  serve                     OpenAI-compat server       (band B5)");
+            println!("  serve [--port N]          std-only OpenAI-compat HTTP (PH-501a)");
             println!("  node                      Wi-Fi slave runtime        (band B7)");
             println!("  hub                       GSV master supervisor      (band B8)");
         }
@@ -55,6 +55,7 @@ fn main() {
             }
         },
         Some("run") => run(args),
+        Some("serve") => serve_cmd(args),
         Some(other) => {
             println!(
                 "{}: subcommand '{other}' is scaffolded (bands B1+)",
@@ -335,5 +336,37 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
         tokens,
         ids.join(",")
     );
+    std::process::exit(0);
+}
+
+/// `rusty serve [--port N]` — bind loopback and pump `crate::http::route` (PH-501a).
+/// Loopback-only by default (dry-run posture); blocks serving one connection per request.
+fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
+    let mut port = 8090u16;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--port" | "-p" => {
+                port = args.next().map_or(8090, |v| {
+                    v.parse::<u16>().unwrap_or_else(|_| {
+                        eprintln!("rusty serve: bad --port");
+                        std::process::exit(2)
+                    })
+                })
+            }
+            other => {
+                eprintln!("rusty serve: unknown arg '{other}'");
+                std::process::exit(2);
+            }
+        }
+    }
+    let addr = format!("127.0.0.1:{port}");
+    println!(
+        "{} — serving loopback on http://{addr} (Ctrl-C to stop)",
+        rusty_engine::banner()
+    );
+    if let Err(e) = rusty_engine::serve::serve(&addr) {
+        eprintln!("rusty serve {addr}: {e}");
+        std::process::exit(1);
+    }
     std::process::exit(0);
 }
