@@ -299,9 +299,133 @@ pub fn moe_layer_forward(
     out
 }
 
+/// `PH-404b`: the same MoE layer forward, but each routed expert's weights are pulled
+/// through a byte-budgeted [`crate::cache::ExpertCache`] via `load` instead of requiring
+/// all `n_experts` to be resident. Only the top-k experts are touched, so a small cache
+/// evicts between calls yet the **result is identical** to [`moe_layer_forward`] for a
+/// deterministic loader — the substrate for `PH-406` running Qwen3-30B-A3B / Mixtral
+/// GGUFs whose full expert set never fits in RAM.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_layer_forward_cached<L>(
+    hidden: &[f32],
+    router_w: &[f32],
+    n_experts: usize,
+    layer: usize,
+    cache: &mut crate::cache::ExpertCache,
+    shared: Option<&ExpertWeights>,
+    inter: usize,
+    cfg: RouterConfig,
+    mut load: L,
+) -> Vec<f32>
+where
+    L: FnMut(usize) -> ExpertWeights,
+{
+    let dmodel = hidden.len();
+    let logits = matvec(router_w, n_experts, dmodel, hidden);
+    let chosen = route(&logits, cfg);
+    let mut out = vec![0.0f32; dmodel];
+    for e in &chosen {
+        let w = cache.get_or_load(crate::cache::ExpertKey::new(layer, e.id), |k| {
+            load(k.expert)
+        });
+        let eo = expert_ffn(hidden, &w.gate, &w.up, &w.down, dmodel, inter);
+        for (o, v) in out.iter_mut().zip(eo) {
+            *o += e.weight * v;
+        }
+    }
+    if let Some(s) = shared {
+        let so = expert_ffn(hidden, &s.gate, &s.up, &s.down, dmodel, inter);
+        for (o, v) in out.iter_mut().zip(so) {
+            *o += v;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::{expert_bytes, ExpertCache};
+
+    /// Two experts of distinct weight; returns (router_w, experts, inter) for a 3-expert top-1.
+    fn cached_forward_fixtures() -> (Vec<f32>, Vec<ExpertWeights>, usize, usize, RouterConfig) {
+        // hidden dim 2, 3 experts, router picks expert 2 (largest logit) with top_k=1.
+        let dmodel = 2usize;
+        let inter = 4usize;
+        let router_w = vec![0.1, 0.2, -0.3, 0.4, -0.2, 0.9]; // 3 rows × dmodel
+        let mk = |tag: f32| ExpertWeights {
+            gate: vec![tag, 0.5, -0.5, tag, 0.25, -0.25, tag, 0.75],
+            up: vec![1.0, 0.5, 0.5, 1.0, 0.25, 0.75, 0.5, 1.0],
+            down: vec![0.5, -0.5, tag, 0.25, 0.75, -0.25, 1.0, tag],
+        };
+        let experts = vec![mk(0.1), mk(0.4), mk(0.9)];
+        let cfg = RouterConfig {
+            gate: Gate::Softmax,
+            top_k: 1,
+        };
+        (router_w, experts, dmodel, inter, cfg)
+    }
+
+    #[test]
+    fn cached_forward_matches_resident_forward() {
+        let (router_w, experts, _dmodel, inter, cfg) = cached_forward_fixtures();
+        let hidden = [0.3, -0.7];
+        // Reference: all experts resident.
+        let want = moe_layer_forward(&hidden, &router_w, 3, &experts, None, inter, cfg);
+        // Cached: budget fits only ONE expert (forces eviction between the calls), loader
+        // returns the same weights, so the compute is bit-for-bit identical.
+        let one = expert_bytes(&experts[0]);
+        let mut cache = ExpertCache::new(one);
+        let got = moe_layer_forward_cached(
+            &hidden,
+            &router_w,
+            3,
+            0,
+            &mut cache,
+            None,
+            inter,
+            cfg,
+            |id| experts[id].clone(),
+        );
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 1e-6, "cached={a} resident={b}");
+        }
+    }
+
+    #[test]
+    fn cached_forward_reuses_resident_expert() {
+        let (router_w, experts, _dmodel, inter, cfg) = cached_forward_fixtures();
+        let hidden = [0.3, -0.7];
+        let mut cache = ExpertCache::new(expert_bytes(&experts[0]) * 3);
+        // first call loads (miss), second call should hit (all three experts now affordable).
+        moe_layer_forward_cached(
+            &hidden,
+            &router_w,
+            3,
+            0,
+            &mut cache,
+            None,
+            inter,
+            cfg,
+            |id| experts[id].clone(),
+        );
+        let mut loads_after_first = 0;
+        moe_layer_forward_cached(
+            &hidden,
+            &router_w,
+            3,
+            0,
+            &mut cache,
+            None,
+            inter,
+            cfg,
+            |id| {
+                loads_after_first += 1;
+                experts[id].clone()
+            },
+        );
+        assert_eq!(loads_after_first, 0, "hit ⇒ loader not called");
+    }
 
     const EPS: f32 = 1e-5;
 

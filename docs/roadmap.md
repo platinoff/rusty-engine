@@ -114,7 +114,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B4 — MoE-ядро (ДИФЕРЕНЦІЯТОР)  **`[~]` (PH-401/402/403/404/406a done, 2026-10-14)**
+## Band B4 — MoE-ядро (ДИФЕРЕНЦІЯТОР)  **`[~]` (PH-401/402/403/404/404b/406a done, 2026-10-14)**
 
 > Мета: Qwen3-30B-A3B / Mixtral GGUF **нативно в Rust**, минаючи llama.cpp.
 > **Повний compute-цикл MoE-шара вже зʼєднаний і детермінований** (`moe_layer_forward`);
@@ -128,6 +128,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-403 | shared-expert merge (DeepSeek/Qwen3) | `[x]` | `src/moe.rs` — `combine` (shared=Some/None, shape-validated) |
 | PH-406a | MoE FFN **layer forward** (router→experts→shared) | `[x]` | `src/moe.rs` — `moe_layer_forward`/`ExpertWeights`; 2 integration (63 total) |
 | PH-404 | **expert-cache LRU** + byte-budget + pin + prefetch | `[x]` | `src/cache.rs` — `ExpertCache::get_or_load/put/prefetch/set_pinned` + `ExpertKey`/`CacheStats`, budgeted LRU eviction (pinned skipped), oversized→uncached; 7 unit |
+| PH-404b | **MoE forward через cache** (top-k experts on demand) | `[x]` | `src/moe.rs` — `moe_layer_forward_cached(...&mut ExpertCache, load)`: route→`get_or_load` per expert; == `moe_layer_forward` (deterministic loader, 1e-6) навіть при budget<resident; hit⇒loader not called (2 unit) |
 | PH-405 | greedy-parity vs llama.cpp-референс + perplexity smoke | `[ ]` | `tests/moe_parity.rs` |
 | PH-406 | run Qwen3-30B-A3B / Mixtral GGUF pure-Rust | `[ ]` | `src/moe/forward.rs` |
 | PH-407 | bench tok/s vs llama-rs baseline | `[ ]` | `benches/moe.rs` |
