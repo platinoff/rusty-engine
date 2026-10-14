@@ -33,7 +33,9 @@ fused kernels). **+ B3 `PH-306b` text pipeline** (`src/textgen.rs` `TextRunner`
 = Bpe + DenseRunner; `rusty run -p "text"` prints generated text; `tests/text_gen.rs`
 synth round-trip). **+ B3 `PH-307` incremental decode + KV** (`forward::LayerKv`+
 `block_forward_cached`, `runner::DenseDecoder` — O(1)/крок, `full == incremental`
-еквівалентність). **112 тести** (103 lib + 3 dense + 2 text + 4
+еквівалентність). **+ B3 `PH-304b` sampler wiring** (`GenerationOptions.repetition_penalty`,
+`infer::SeedRng` xorshift64*, `DenseRunner::generate_with` — temp/top-k/top-p/repetition,
+`temp<=0`==greedy). **115 тести** (104 lib + 5 dense + 2 text + 4
 scaffold), clippy `-D` 0, ratio Rust ~96%. Модель у `data/models/` (gitignored).
 **Checkpoint:** зріз стану — `docs/STATUS.md`; порівняння рушіїв —
 `docs/research/engine-landscape-2026.md`; offset-семантика — `docs/research/`.

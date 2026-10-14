@@ -12,7 +12,7 @@ use crate::forward::{
     block_forward_cached, block_forward_seq, last_logits, logits_from_hidden, BlockWeights,
     Geometry, LayerKv,
 };
-use crate::infer::{argmax, rmsnorm};
+use crate::infer::{apply_repetition_penalty, argmax, rmsnorm, sample, GenerationOptions, SeedRng};
 use crate::loader::MmapModel;
 use crate::model::ModelConfig;
 
@@ -135,6 +135,35 @@ impl DenseRunner {
         let mut seq: Vec<u32> = prompt.to_vec();
         for _ in 0..max_new {
             match self.greedy(&seq) {
+                Some(t) if Some(t as u32) == self.eos_token_id => break,
+                Some(t) => seq.push(t as u32),
+                None => break,
+            }
+        }
+        seq
+    }
+
+    /// Sampled generation under `opts` (temperature/top-k/top-p/repetition) driven by the
+    /// deterministic `rng`. `temperature<=0` reduces to greedy, so `generate_with` with the
+    /// greedy opts reproduces [`generate`] exactly. Repetition penalty applies to the prior
+    /// token ids; stops early on `eos_token_id`.
+    pub fn generate_with(
+        &self,
+        prompt: &[u32],
+        opts: &GenerationOptions,
+        max_new: usize,
+        rng: &mut SeedRng,
+    ) -> Vec<u32> {
+        assert!(!prompt.is_empty(), "generate_with: empty prompt");
+        let mut seq: Vec<u32> = prompt.to_vec();
+        for _ in 0..max_new {
+            let logits = self.prefill_logits(&seq);
+            let penalized = apply_repetition_penalty(
+                &logits,
+                &seq.iter().map(|&t| t as usize).collect::<Vec<usize>>(),
+                opts.repetition_penalty,
+            );
+            match sample(&penalized, opts, rng.next_f32()) {
                 Some(t) if Some(t as u32) == self.eos_token_id => break,
                 Some(t) => seq.push(t as u32),
                 None => break,

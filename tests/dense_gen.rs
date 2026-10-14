@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use rusty_engine::infer::{GenerationOptions, SeedRng};
 use rusty_engine::loader::MmapModel;
 use rusty_engine::model::ModelConfig;
 use rusty_engine::runner::{DenseDecoder, DenseRunner};
@@ -252,6 +253,54 @@ fn incremental_decode_matches_full_prefill() {
     let mut dec = DenseDecoder::new(&runner);
     let inc = dec.generate_incremental(&[2, 3], 5);
     assert_eq!(full, inc, "incremental == re-prefill greedy stream");
+
+    drop(model);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn generate_with_greedy_opts_matches_generate() {
+    // PH-304b: temperature<=0 sampling reduces to argmax => identical to DenseRunner::generate.
+    let bytes = synth_dense_gguf();
+    std::fs::create_dir_all("target").unwrap();
+    let path = fixture_path("sample_greedy");
+    std::fs::write(&path, &bytes).unwrap();
+    let model = unsafe { MmapModel::open(&path) }.expect("mmap open");
+    let cfg = ModelConfig::from_file(model.header()).expect("config");
+    let runner = DenseRunner::from_model(&model, &cfg).expect("runner");
+
+    let greedy_opts = GenerationOptions {
+        temperature: 0.0,
+        ..Default::default()
+    };
+    let mut rng = SeedRng::new(42);
+    let via_sample = runner.generate_with(&[2, 3], &greedy_opts, 5, &mut rng);
+    let via_argmax = runner.generate(&[2, 3], 5);
+    assert_eq!(via_sample, via_argmax, "greedy sampling == argmax greedy");
+
+    drop(model);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn generate_with_is_deterministic_under_a_seed() {
+    let bytes = synth_dense_gguf();
+    std::fs::create_dir_all("target").unwrap();
+    let path = fixture_path("sample_det");
+    std::fs::write(&path, &bytes).unwrap();
+    let model = unsafe { MmapModel::open(&path) }.expect("mmap open");
+    let cfg = ModelConfig::from_file(model.header()).expect("config");
+    let runner = DenseRunner::from_model(&model, &cfg).expect("runner");
+
+    let warm = GenerationOptions {
+        temperature: 0.8,
+        top_k: 40,
+        top_p: 1.0,
+        ..Default::default()
+    };
+    let a = runner.generate_with(&[2, 3], &warm, 6, &mut SeedRng::new(7));
+    let b = runner.generate_with(&[2, 3], &warm, 6, &mut SeedRng::new(7));
+    assert_eq!(a, b, "same seed => same sampled stream");
 
     drop(model);
     let _ = std::fs::remove_file(&path);

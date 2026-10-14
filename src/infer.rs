@@ -16,6 +16,8 @@ pub struct GenerationOptions {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: usize,
+    /// Repetition penalty on prior tokens (llama.cpp-style); `1.0` disables it.
+    pub repetition_penalty: f32,
 }
 
 impl Default for GenerationOptions {
@@ -25,7 +27,38 @@ impl Default for GenerationOptions {
             temperature: 1.0,
             top_p: 1.0,
             top_k: 40,
+            repetition_penalty: 1.0,
         }
+    }
+}
+
+/// Deterministic xorshift64* RNG supplying the uniform draws for [`sample`]. Not
+/// cryptographic — reproducible decoding (same seed ⇒ same token stream) is the point.
+#[derive(Debug, Clone)]
+pub struct SeedRng {
+    state: u64,
+}
+
+impl SeedRng {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+        }
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    /// Uniform draw in `[0, 1)`.
+    pub fn next_f32(&mut self) -> f32 {
+        // use the high 24 bits for a float mantissa in [0,1)
+        ((self.next_u64() >> 40) as f32) / (1u64 << 24) as f32
     }
 }
 
@@ -298,6 +331,7 @@ mod tests {
         let o = GenerationOptions::default();
         assert_eq!(o.max_tokens, 256);
         assert!((o.temperature - 1.0).abs() < f32::EPSILON);
+        assert!((o.repetition_penalty - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -389,7 +423,22 @@ mod tests {
             top_k: 40,
             top_p: 1.0,
             max_tokens: 8,
+            repetition_penalty: 1.0,
         };
         assert_eq!(sample(&[0.0, 0.0, 10.0], &warm, 0.5), Some(2));
+    }
+
+    #[test]
+    fn seed_rng_is_deterministic_and_bounded() {
+        let mut a = SeedRng::new(123);
+        let mut b = SeedRng::new(123);
+        let xs: Vec<f32> = (0..32).map(|_| a.next_f32()).collect();
+        let ys: Vec<f32> = (0..32).map(|_| b.next_f32()).collect();
+        assert_eq!(xs, ys, "same seed ⇒ same stream");
+        assert!(
+            xs.iter().all(|&v| (0.0..1.0).contains(&v)),
+            "uniform in [0,1)"
+        );
+        assert!(xs.windows(2).any(|w| w[0] != w[1]), "not constant");
     }
 }
