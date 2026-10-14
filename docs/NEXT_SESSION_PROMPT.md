@@ -20,7 +20,10 @@ encode/decode**), баг `ggml_dtype` знайдено/виправлено + р
 (RMSNorm+attention+paged-KV+sampler) + **`PH-305a`** (mmap→byte-range→**real Q6_K dequant 4.36M finite**);
 **B2 `PH-201`+`PH-201+`+`PH-201c`** (fused dot/gemv Q4_0/Q8_0 + скалярний reference-dequant Q4_K/Q5_K/Q6_K **+ Q5_0** —
 real `token_embd` dequantize 136M finite → **embedding розблоковано**) —
-**77 тести**, clippy `-D` 0. Модель у `data/models/` (gitignored); offset-семантика + BPE — у `docs/research/`.
+**79 тести**, clippy `-D` 0, ratio Rust 96%. Модель у `data/models/` (gitignored).
+**Checkpoint «verify+research»:** зріз стану — [`docs/STATUS.md`](STATUS.md); порівняння рушіїв —
+[`docs/research/engine-landscape-2026.md`](research/engine-landscape-2026.md); offset-семантика +
+GGML-кеш — `docs/research/`.
 
 Наступна `agi` обирає:
 1. **`PH-305` dense forward** (⭐ embedding тепер деquantizeʼться — Q5_0 готовий): лишилось

@@ -16,10 +16,13 @@ Windows/Linux hosts and Android slaves over local Wi-Fi/LAN.
 
 | Doc | Что |
 |-----|-----|
+| [`docs/STATUS.md`](docs/STATUS.md) | **VERIFIED project state** (tests/commits/ratio/real-model validation) |
 | [`docs/concept.md`](docs/concept.md) | концепція / vision / non-goals / джерела методів |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | crate/модуль-мапа, дані-потік, MoE-ядро, оркестрація |
 | [`docs/roadmap.md`](docs/roadmap.md) | логічні бенди B0..B11 + PH-* тікети |
 | [`docs/UI.md`](docs/UI.md) | веб UI design system (токени, сторінки, хоткеї, chrome-only law) |
+| [`docs/research/engine-landscape-2026.md`](docs/research/engine-landscape-2026.md) | **research: порівняння з vLLM/SGLang/TRT-LLM/llama.cpp/ktransformers** |
+| [`docs/research/`](docs/research/) | кеш фактажу (GGUF/quant/offsets/BPE) + real-model evidence |
 | [`docs/HANDOFF_NEW_SESSION.md`](docs/HANDOFF_NEW_SESSION.md) | журнал сесій |
 | [`docs/NEXT_SESSION_PROMPT.md`](docs/NEXT_SESSION_PROMPT.md) | наступний крок (owner pick) |
 
@@ -32,12 +35,15 @@ cargo run --bin rusty -- --version
 cargo run --bin rusty -- --help
 ```
 
-## Status (B0)
+## Status (verified 2026-10-14)
 
-Workspace scaffold compiles green: `rusty-engine` lib (`rusty_engine`) + `rusty` bin +
-`xtask`; modules `core / gguf / moe / infer / serve / node / hub`; **17 tests pass**
-(MoE top-k router proven in pure Rust before any model loads). GGUF parser + quant
-kernels land in B1–B2; native MoE forward in B3–B4; fleet supervisor in B8.
+**19 commits · 79 tests · clippy `-D` clean · Rust ratio 96%.** End-to-end plumbing works:
+`ModelConfig → validate → GGUF dequant (Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K) → embed →
+`moe_layer_forward`/`block_forward` → sampler → byte-level BPE`. A **real** Qwen2.5-0.5B GGUF
+is parsed and geometry-validated (`rusty validate` = OK, 24 layers), first real weight
+materialized (`rusty tensor`). See [`docs/STATUS.md`](docs/STATUS.md) and
+[`docs/research/engine-landscape-2026.md`](docs/research/engine-landscape-2026.md).
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the band-by-band plan and
-`S:/rust/GSV/docs/gsv/PRODUCTS.md` for the registration row (`rusty-engine`).
+Remaining: `PH-305` real multi-layer forward (numeric parity needs a llama-rs/llama.cpp
+reference → `PH-405`), HF-exact Qwen tokenization (`PH-305b`), then serving/build-matrix/fleet.
+See [`docs/roadmap.md`](docs/roadmap.md) and `S:/rust/GSV/docs/gsv/PRODUCTS.md` (row `rusty-engine`).

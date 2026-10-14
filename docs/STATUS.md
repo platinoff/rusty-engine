@@ -1,0 +1,55 @@
+# rusty-engine — PROJECT STATUS
+
+**Snapshot:** 2026-10-14 (agi-сесія «verify + save state + research») · **без push** (remote-only у B11).
+
+## Верифікований стан (zmіряно цього сеансу, не «на памʼять»)
+
+| Метрика | Значення |
+|---------|----------|
+| `git status` | **clean** (0 drift) |
+| Локальні коміти | **19** |
+| Тести | **79** (75 lib unit + 4 integration `scaffold_contracts`), 0 failed |
+| `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
+| `cargo fmt --check` | **ok** |
+| Rust LOC | **3909** (`src`+`tests`+`xtask`) |
+| UI LOC (glue) | **157** (html+css+js) |
+| **Rust ratio** | **96.1%** (ціль 95–100 ✓) |
+| Docs LOC | 969 (concept/arch/roadmap/UI/research) |
+| Tracked files | 41 |
+| Реальна модель | `data/models/qwen2.5-0.5b-q4_k_m.gguf` (491 400 032 B, **gitignored**, sha256 `74a4da8c…`) |
+| Трекінг `data/` | лише `.gitkeep` (модель не в репо ✓) |
+
+## Що зроблено (канон смуг → `docs/roadmap.md`)
+
+| Бенд | Статус | Ядро в Rust |
+|------|--------|-------------|
+| **B0** scaffold | ✅ | workspace + bin `rusty` + `xtask`; MoE `top_k`; 7 модулів |
+| **B1** GGUF-чанкер | ✅ **complete** | header+KV+tensor-info, mmap/staged, sizes+Q4_0/Q8_0/Q4_K/Q5_K/Q6_K dequant, tokenizer-meta, `rusty inspect` |
+| B1-real parity | ✅ | реальний Qwen2.5: парсер+`ggml_dtype` (баг off-by-K знайдено/виправлено) |
+| **B2** kernels | 🟡 | `PH-201/201+/201c`: fused dot Q4_0/Q8_0 + скалярний oracle Q5_0+K-кванти; repack/SIMD (202..204) open |
+| **B3** forward | 🟡 | `PH-301..304` (RMSNorm/RoPE/causal-SDPA/GQA/paged-KV/sampler) + `PH-305a/c/d/e` (real dequant, `ModelConfig`, `block_forward`, `validate`); **multi-layer loop + llama-parity open** |
+| **B4** MoE-core | 🟡 | `PH-401..403` (router softmax/sigmoid/group, SwiGLU, shared) + `PH-406a` `moe_layer_forward`; expert-cache/parity/run/bench (404..407) open |
+| B5 serve / B6 build-matrix(exe/bin/apk) / B7 docker / B8 supervisor / B9 dist-MoE / B10 UI / B11 distribs | ☐ | заплановано (бенди в роадмепі) |
+
+**Між конекцій:** від токена до logits стек повний — `config → validate → dequant → embed →
+block_forward → sampler → BPE` — і реальна геометрія Qwen2.5 підтверджена (`rusty validate` = OK).
+
+## Поточна межа (чому не «далі сліпо»)
+
+1. Реальний `PH-305` multi-layer forward верифікується **тільки проти референсу** (row/col-major,
+   RoPE-scaling, qk-norm, GQA-мапа) → gate **`PH-405`**; `llama-rs` живий → кандидат на оракул.
+2. HF-exact Qwen BPE (`PH-305b`: `qwen2` pre-regex, byte-fallback, specials) — для читабельного тексту.
+3. Далі — важкі/інфра-бенди (SIMD, axum-server, fleet/docker, build-matrix/apk) — кожен окремий великий зріз.
+
+## Research / позиціонування
+
+Див. **[`docs/research/engine-landscape-2026.md`](research/engine-landscape-2026.md)**:
+vLLM v0.28 / SGLang v0.5.19 (RadixArk) / TensorRT-LLM v1.2.1 / llama.cpp / ktransformers.
+`rusty-engine` — **не** GPU-cluster-throughput-ліга; ніша = pure-Rust MoE + один exe/bin/**apk**
++ edge/Android-no-Docker + GSV-native master/slave флот + нативний Rust-MoE (чого немає в llama-rs).
+
+## Наступна `agi` (точка входу)
+
+Див. **`docs/NEXT_SESSION_PROMPT.md`** (`Owner product pick: rusty-engine`). Готові green-зрізи:
+`PH-305` real multi-layer forward (**потрібен дозвіл на llama-rs-референс** для числової parity) ·
+`PH-202..204` (repack/SIMD, std-testable) · `PH-305b` (HF BPE parity) · `PH-501` (axum serve).

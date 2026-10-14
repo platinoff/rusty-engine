@@ -39,6 +39,13 @@ MoE-двигун** (GGUF-first), MIT, під GSV-хабом. Рішення owne
 
 ## Наступний крок
 
+## Наступний крок
+
+**Сесія 2026-10-14 «verify + research»:** стан верифіковано (git чистий, **19 комітів**, **79 тестів**,
+clippy `-D` 0, Rust ratio **96%**, модель gitignored), додано [`docs/STATUS.md`](STATUS.md) +
+[`docs/research/engine-landscape-2026.md`](research/engine-landscape-2026.md) (порівняння з
+vLLM/SGLang/TensorRT-LLM/llama.cpp/ktransformers + позиціонування rusty-engine). Код не змінено.
+
 **B1 — GGUF-чанкер:** `[x]` **ЗАВЕРШЕНО** (усі PH-101..107) — GGUF-контейнер читається
 повністю в Rust без llama.cpp. **35 тестів**, clippy `-D` 0. Фактаж — `docs/research/gguf-format.md`
 + `docs/research/ggml-blocks.md` (cached через explore-subagent).
