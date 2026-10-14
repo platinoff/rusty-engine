@@ -115,7 +115,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B4 — MoE-ядро (ДИФЕРЕНЦІЯТОР)  **`[~]` (PH-401/401b/402/403/404/404b/406a done, 2026-10-14)**
+## Band B4 — MoE-ядро (ДИФЕРЕНЦІЯТОР)  **`[~]` (PH-401/401b/402/403/403b/404/404b/406a done, 2026-10-14)**
 
 > Мета: Qwen3-30B-A3B / Mixtral GGUF **нативно в Rust**, минаючи llama.cpp.
 > **Повний compute-цикл MoE-шара вже зʼєднаний і детермінований** (`moe_layer_forward`);
@@ -128,6 +128,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-401b | **exact `noaux_tc` group routing** (DeepSeek-V3/Qwen3) | `[x]` | `src/moe.rs` — `route_noaux_tc`: group score = **sum of top-2** (not all-sum), select `top_k_group`, global top-k renorm, stable ties; distinguishes from `route_group` (3 unit) |
 | PH-402 | expert FFN SwiGLU (`ffn_gate/up/down_exps`) | `[x]` | `src/moe.rs` — `expert_ffn`/`swiglu`/`silu`/`matvec`; 44 unit |
 | PH-403 | shared-expert merge (DeepSeek/Qwen3) | `[x]` | `src/moe.rs` — `combine` (shared=Some/None, shape-validated) |
+| PH-403b | **MoE transformer block forward** (attn+KV → cached MoE FFN) | `[x]` | `forward.rs` `attention_forward_cached` (head-only, shared core) + `moe.rs` `moe_block_forward` — attn+residual→rmsnorm(ffn_norm)→`moe_layer_forward_cached`→residual; 1-expert top-1 == `block_forward_cached` (1e-5, kv equal) |
 | PH-406a | MoE FFN **layer forward** (router→experts→shared) | `[x]` | `src/moe.rs` — `moe_layer_forward`/`ExpertWeights`; 2 integration (63 total) |
 | PH-404 | **expert-cache LRU** + byte-budget + pin + prefetch | `[x]` | `src/cache.rs` — `ExpertCache::get_or_load/put/prefetch/set_pinned` + `ExpertKey`/`CacheStats`, budgeted LRU eviction (pinned skipped), oversized→uncached; 7 unit |
 | PH-404b | **MoE forward через cache** (top-k experts on demand) | `[x]` | `src/moe.rs` — `moe_layer_forward_cached(...&mut ExpertCache, load)`: route→`get_or_load` per expert; == `moe_layer_forward` (deterministic loader, 1e-6) навіть при budget<resident; hit⇒loader not called (2 unit) |

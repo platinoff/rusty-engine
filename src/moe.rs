@@ -420,10 +420,49 @@ where
     out
 }
 
+/// One **MoE transformer block** decode step — band B4 `PH-403b`: `rmsnorm → causal
+/// attention (KV cache) → residual → MoE FFN (top-k experts via the budgeted cache) →
+/// residual`. Composes `forward::attention_forward_cached` + [`moe_layer_forward_cached`].
+///
+/// **Equivalence:** with a single expert (`n_experts = 1`, `top_k = 1`) whose gate/up/down
+/// equal a dense block's `ffn_gate/ffn_up/ffn_down`, this reproduces
+/// [`crate::forward::block_forward_cached`] bit-for-bit (asserted in tests) — i.e. the MoE
+/// path is a strict generalization of the dense FFN, so real dense layers can be run as
+/// degenerate MoE blocks until `PH-406` binds genuine Qwen3/Mixtral experts.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_block_forward<L>(
+    x: &[f32],
+    attn: &crate::forward::BlockWeights,
+    g: &crate::forward::Geometry,
+    pos: usize,
+    kv: &mut crate::forward::LayerKv,
+    router_w: &[f32],
+    n_experts: usize,
+    layer: usize,
+    moe_cache: &mut crate::cache::ExpertCache,
+    shared: Option<&ExpertWeights>,
+    inter: usize,
+    cfg: RouterConfig,
+    load: L,
+) -> Vec<f32>
+where
+    L: FnMut(usize) -> ExpertWeights,
+{
+    let attn_out = crate::forward::attention_forward_cached(x, attn, g, pos, kv);
+    let y: Vec<f32> = x.iter().zip(&attn_out).map(|(a, b)| a + b).collect();
+    // Match the dense block's pre-FFN RMSNorm so a 1-expert top-1 MoE reduces to it exactly.
+    let y_norm = crate::infer::rmsnorm(&y, &attn.ffn_norm, g.rms_eps);
+    let moe_out = moe_layer_forward_cached(
+        &y_norm, router_w, n_experts, layer, moe_cache, shared, inter, cfg, load,
+    );
+    y.iter().zip(&moe_out).map(|(a, b)| a + b).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::{expert_bytes, ExpertCache};
+    use crate::forward::{block_forward_cached, BlockWeights, Geometry, LayerKv};
 
     /// Two experts of distinct weight; returns (router_w, experts, inter) for a 3-expert top-1.
     fn cached_forward_fixtures() -> (Vec<f32>, Vec<ExpertWeights>, usize, usize, RouterConfig) {
@@ -503,6 +542,64 @@ mod tests {
             },
         );
         assert_eq!(loads_after_first, 0, "hit ⇒ loader not called");
+    }
+
+    #[test]
+    fn moe_block_single_expert_equals_dense_block() {
+        // PH-403b equivalence: 1-expert top-1 MoE block reproduces the dense block forward
+        // step-by-step over a growing KV prefix (positions 0,1,2).
+        let g = Geometry::new(4, 2, 1, 8, 10_000.0, 1e-5); // d_model4 heads2 kv1 head2 ff8
+        let w = BlockWeights {
+            attn_norm: vec![1.0; 4],
+            q: (0..16).map(|i| i as f32 * 0.02 - 0.15).collect(),
+            k: (0..8).map(|i| i as f32 * 0.03 - 0.1).collect(),
+            v: (0..8).map(|i| 0.2 - i as f32 * 0.05).collect(),
+            o: (0..16).map(|i| i as f32 * 0.025 - 0.18).collect(),
+            ffn_norm: vec![1.0; 4],
+            ffn_gate: (0..32).map(|i| i as f32 * 0.01 - 0.15).collect(),
+            ffn_up: (0..32).map(|i| 0.2 - i as f32 * 0.012).collect(),
+            ffn_down: (0..32).map(|i| i as f32 * 0.006 - 0.09).collect(),
+        };
+        let ffn = ExpertWeights {
+            gate: w.ffn_gate.clone(),
+            up: w.ffn_up.clone(),
+            down: w.ffn_down.clone(),
+        };
+        let router_w = [1.0f32, 0.0, 0.0, 0.0]; // 1 expert × d_model
+        let cfg = RouterConfig {
+            gate: Gate::Softmax,
+            top_k: 1,
+        };
+        let mut dense_kv = LayerKv::default();
+        let mut moe_kv = LayerKv::default();
+        let mut moe_cache = ExpertCache::new(expert_bytes(&ffn));
+        let inputs = [
+            [0.6, -0.3, 0.4, 0.1],
+            [0.1, 0.5, -0.2, 0.7],
+            [-0.4, 0.2, 0.9, -0.1],
+        ];
+        for (pos, x) in inputs.iter().enumerate() {
+            let dense = block_forward_cached(x, &w, &g, pos, &mut dense_kv);
+            let got = moe_block_forward(
+                x,
+                &w,
+                &g,
+                pos,
+                &mut moe_kv,
+                &router_w,
+                1,
+                0,
+                &mut moe_cache,
+                None,
+                g.d_ff,
+                cfg,
+                |_| ffn.clone(),
+            );
+            for (a, b) in got.iter().zip(&dense) {
+                assert!((a - b).abs() < 1e-5, "pos {pos}: moe={a} dense={b}");
+            }
+        }
+        assert_eq!(moe_kv, dense_kv, "attention cache identical");
     }
 
     const EPS: f32 = 1e-5;

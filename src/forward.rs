@@ -120,32 +120,30 @@ pub fn logits_from_hidden(x: &[f32], out_w: &[f32], g: &Geometry, n_vocab: usize
 /// Per-layer K/V cache (row-major `seq × kv_dim`), appended one position per decode step.
 /// This is the incremental-decoding substrate for `PH-307` (the paged version lives in
 /// `crate::infer::PagedKvCache`; a dense linear buffer is enough for the shape gate).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LayerKv {
     pub k: Vec<f32>,
     pub v: Vec<f32>,
 }
 
-/// Decode **one** new token at `pos`, attending over every cached key/value (causal), and
-/// append this step's K/V into `cache`. Mathematically identical to running
-/// [`block_forward_seq`] over the whole prefix — RoPE is applied per stored position and
-/// scores accumulate in the same order — so `cache.len()/kv_dim` must equal `pos + 1`.
+/// Head-only causal attention over the KV cache (no FFN, no residual): rmsnorm(`x`) → q/k/v
+/// → append K/V to `cache` → head-major causal attention over `0..=pos` → o-projection.
+/// Extracted so `block_forward_cached` and the MoE block (`PH-403b`) share one attention core.
 #[allow(clippy::needless_range_loop)]
-pub fn block_forward_cached(
+pub fn attention_forward_cached(
     x: &[f32],
     w: &BlockWeights,
     g: &Geometry,
     pos: usize,
     cache: &mut LayerKv,
 ) -> Vec<f32> {
-    assert_eq!(x.len(), g.d_model, "block_forward_cached: hidden width");
+    assert_eq!(x.len(), g.d_model, "attention_forward_cached: hidden width");
     let kv_dim = g.n_kv_heads * g.head_dim;
     let q_dim = g.n_heads * g.head_dim;
     let n = rmsnorm(x, &w.attn_norm, g.rms_eps);
     let q = matvec(&w.q, q_dim, g.d_model, &n);
     let k = matvec(&w.k, kv_dim, g.d_model, &n);
     let v = matvec(&w.v, kv_dim, g.d_model, &n);
-    // Append this position's (un-rotated) K/V; RoPE is applied on read, per stored index.
     cache.k.extend_from_slice(&k);
     cache.v.extend_from_slice(&v);
     let scale = 1.0 / (g.head_dim as f32).sqrt();
@@ -171,7 +169,22 @@ pub fn block_forward_cached(
             ctx[hs + d] = acc;
         }
     }
-    let attn = matvec(&w.o, g.d_model, q_dim, &ctx);
+    matvec(&w.o, g.d_model, q_dim, &ctx)
+}
+
+/// Decode **one** new token at `pos`, attending over every cached key/value (causal), and
+/// append this step's K/V into `cache`. Mathematically identical to running
+/// [`block_forward_seq`] over the whole prefix — RoPE is applied per stored position and
+/// scores accumulate in the same order — so `cache.len()/kv_dim` must equal `pos + 1`.
+#[allow(clippy::needless_range_loop)]
+pub fn block_forward_cached(
+    x: &[f32],
+    w: &BlockWeights,
+    g: &Geometry,
+    pos: usize,
+    cache: &mut LayerKv,
+) -> Vec<f32> {
+    let attn = attention_forward_cached(x, w, g, pos, cache);
     let y: Vec<f32> = x.iter().zip(&attn).map(|(a, b)| a + b).collect();
     let ffn = expert_ffn(
         &rmsnorm(&y, &w.ffn_norm, g.rms_eps),
