@@ -81,6 +81,28 @@ mod tests {
     }
 
     #[test]
+    fn serve_one_streams_sse_when_requested() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local_addr");
+        let th = std::thread::spawn(move || {
+            serve_one(&listener).expect("serve_one");
+        });
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client
+            .write_all(
+                b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n{\"stream\":true}",
+            )
+            .expect("write");
+        client.flush().expect("flush");
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).expect("read");
+        assert!(resp.contains("Content-Type: text/event-stream\r\n"));
+        assert!(resp.contains("chat.completion.chunk"));
+        assert!(resp.ends_with("data: [DONE]\n\n"), "{resp}");
+        th.join().expect("server thread");
+    }
+
+    #[test]
     fn routes_are_openai_shaped() {
         assert_eq!(PATH_MODELS, "/v1/models");
         assert_eq!(PATH_CHAT_COMPLETIONS, "/v1/chat/completions");

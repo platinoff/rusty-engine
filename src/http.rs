@@ -57,6 +57,45 @@ pub fn parse_request_line(first_line: &str) -> Option<(&str, &str)> {
     Some((method, path))
 }
 
+/// Body after the `\r\n\r\n` header terminator (empty when there is none).
+pub fn body_of(request: &str) -> &str {
+    match request.find("\r\n\r\n") {
+        Some(i) => &request[i + 4..],
+        None => "",
+    }
+}
+
+/// A request "wants streaming" when its JSON body carries `"stream": true`.
+pub fn wants_stream(body: &str) -> bool {
+    let b = body.replace(' ', "");
+    b.contains("\"stream\":true")
+}
+
+/// Build an OpenAI-style `text/event-stream` body from completion deltas, terminated by
+/// `data: [DONE]`. Each event is a `chat.completion.chunk` with an incremental assistant
+/// fragment. `PH-502` builds the whole stream then writes it (Content-Length known); true
+/// incremental socket writes land later in B5.
+pub fn sse_body(id: &str, model: &str, deltas: &[&str]) -> String {
+    let mut out = String::new();
+    for (i, d) in deltas.iter().enumerate() {
+        let ev = format!(
+            r#"{{"id":"{id}","object":"chat.completion.chunk","model":"{model}","index":{i},"delta":{{"role":"assistant","content":"{d}"}}}}"#
+        );
+        out.push_str("data: ");
+        out.push_str(&ev);
+        out.push_str("\n\n");
+    }
+    let finish = format!(
+        r#"{{"id":"{id}","object":"chat.completion.chunk","model":"{model}","index":{},"delta":{{}},"finish_reason":"stop"}}"#,
+        deltas.len()
+    );
+    out.push_str("data: ");
+    out.push_str(&finish);
+    out.push_str("\n\n");
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
 /// Route a raw HTTP request (only the request line + method are needed) to a [`Response`].
 /// Pure and side-effect-free — the whole wire contract lives here.
 pub fn route(request: &[u8]) -> Response {
@@ -87,11 +126,24 @@ pub fn route(request: &[u8]) -> Response {
         ("GET", crate::serve::PATH_CHAT_COMPLETIONS) => {
             Response::json(405, r#"{"error":"method not allowed, use POST"}"#.to_string())
         }
-        ("POST", crate::serve::PATH_CHAT_COMPLETIONS) => Response::json(
-            200,
-            r#"{"id":"cmpl-0","object":"chat.completion","model":"rusty-engine","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#
-                .to_string(),
-        ),
+        ("POST", crate::serve::PATH_CHAT_COMPLETIONS) => {
+            let body = body_of(text);
+            if wants_stream(body) {
+                let sse = sse_body("cmpl-0", "rusty-engine", &[]);
+                Response {
+                    status: 200,
+                    reason: "OK",
+                    content_type: "text/event-stream",
+                    body: sse,
+                }
+            } else {
+                Response::json(
+                    200,
+                    r#"{"id":"cmpl-0","object":"chat.completion","model":"rusty-engine","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#
+                        .to_string(),
+                )
+            }
+        }
         ("GET", _) | ("POST", _) => {
             Response::json(404, format!(r#"{{"error":"no route {path}"}}"#))
         }
@@ -163,5 +215,40 @@ mod tests {
             Some(("POST", "/v1/chat/completions"))
         );
         assert!(parse_request_line("onlyone").is_none());
+    }
+
+    #[test]
+    fn sse_body_is_event_framed_and_terminated() {
+        let sse = sse_body("cmpl-1", "m", &["he", "llo"]);
+        assert!(sse.starts_with("data: {"));
+        assert!(sse.contains("\"delta\":{\"role\":\"assistant\",\"content\":\"he\"}"));
+        assert!(sse.contains("\"content\":\"llo\""));
+        assert!(sse.contains("\"finish_reason\":\"stop\""));
+        assert!(sse.ends_with("data: [DONE]\n\n"), "{sse}");
+        // every event line ends with a blank line separator
+        assert_eq!(sse.matches("\n\n").count(), 4); // 2 delta + 1 finish + [DONE]
+    }
+
+    #[test]
+    fn body_of_and_wants_stream() {
+        let raw = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n{\"stream\": true}";
+        assert_eq!(body_of(raw), "{\"stream\": true}");
+        assert!(wants_stream(body_of(raw)), "space-tolerant stream flag");
+        assert!(wants_stream(r#"{"stream":true,"max_tokens":4}"#));
+        assert!(!wants_stream(r#"{"stream":false}"#));
+        assert_eq!(body_of("GET /health HTTP/1.1\r\n\r\n"), "");
+    }
+
+    #[test]
+    fn stream_flag_switches_to_event_stream() {
+        let r = route(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n{\"stream\":true}");
+        assert_eq!(r.status, 200);
+        assert_eq!(r.content_type, "text/event-stream");
+        assert!(r.body.contains("chat.completion.chunk"));
+        assert!(r.body.ends_with("data: [DONE]\n\n"));
+        // non-streaming body still gets the JSON completion
+        let j = route(b"POST /v1/chat/completions HTTP/1.1\r\n\r\n{}");
+        assert_eq!(j.content_type, "application/json");
+        assert!(j.body.contains("chat.completion"));
     }
 }

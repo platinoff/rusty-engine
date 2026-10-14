@@ -148,6 +148,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 |----|--------|------|-------|
 | PH-501a | **std-only HTTP layer** (pure `route()` + TcpListener pump) | `[x]` | `src/http.rs` — `Response::to_http_bytes`(Content-Length exact)/`parse_request_line`/`route`: GET /health, GET /v1/models, POST /v1/chat/completions (OpenAI stub), 404/405/400; `src/serve.rs` — `serve_one/handle_conn/serve` (loopback, fail-open); CLI `rusty serve [--port N]`; 7 http unit + 1 wire test |
 | PH-501 | HTTP server (tokio+axum) — `/v1/models`,`/v1/chat/completions` | `[ ]` | `src/serve/http.rs` |
+| PH-502 | **SSE-стрімінг токенів, stop-tokens, usage** | `[~]` | `src/http.rs` — `sse_body` (OpenAI `chat.completion.chunk` + `finish_reason:stop` + `data:[DONE]`, event-framed) + `body_of`/`wants_stream`; `route` → `text/event-stream`; serve.rs wire-тест `[DONE]`. Інкрементні socket-writes + usage → далі |
 | PH-502 | SSE-стрімінг токенів, stop-tokens, usage | `[ ]` | `src/serve/stream.rs` |
 | PH-503 | prompt-cache / multi-slot | `[ ]` | `src/serve/slot.rs` |
 | PH-504 | GSV keep-live `target/live/rusty_heartbeat.json` (GSV_LIVE=1) | `[ ]` | `src/serve/heartbeat.rs` |
