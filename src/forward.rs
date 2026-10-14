@@ -117,6 +117,73 @@ pub fn logits_from_hidden(x: &[f32], out_w: &[f32], g: &Geometry, n_vocab: usize
     matvec(out_w, n_vocab, g.d_model, x)
 }
 
+/// Per-layer K/V cache (row-major `seq × kv_dim`), appended one position per decode step.
+/// This is the incremental-decoding substrate for `PH-307` (the paged version lives in
+/// `crate::infer::PagedKvCache`; a dense linear buffer is enough for the shape gate).
+#[derive(Debug, Clone, Default)]
+pub struct LayerKv {
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+}
+
+/// Decode **one** new token at `pos`, attending over every cached key/value (causal), and
+/// append this step's K/V into `cache`. Mathematically identical to running
+/// [`block_forward_seq`] over the whole prefix — RoPE is applied per stored position and
+/// scores accumulate in the same order — so `cache.len()/kv_dim` must equal `pos + 1`.
+#[allow(clippy::needless_range_loop)]
+pub fn block_forward_cached(
+    x: &[f32],
+    w: &BlockWeights,
+    g: &Geometry,
+    pos: usize,
+    cache: &mut LayerKv,
+) -> Vec<f32> {
+    assert_eq!(x.len(), g.d_model, "block_forward_cached: hidden width");
+    let kv_dim = g.n_kv_heads * g.head_dim;
+    let q_dim = g.n_heads * g.head_dim;
+    let n = rmsnorm(x, &w.attn_norm, g.rms_eps);
+    let q = matvec(&w.q, q_dim, g.d_model, &n);
+    let k = matvec(&w.k, kv_dim, g.d_model, &n);
+    let v = matvec(&w.v, kv_dim, g.d_model, &n);
+    // Append this position's (un-rotated) K/V; RoPE is applied on read, per stored index.
+    cache.k.extend_from_slice(&k);
+    cache.v.extend_from_slice(&v);
+    let scale = 1.0 / (g.head_dim as f32).sqrt();
+    let mut ctx = vec![0.0f32; q_dim];
+    for h in 0..g.n_heads {
+        let hs = h * g.head_dim;
+        let kv_h = (h * g.n_kv_heads / g.n_heads) * g.head_dim;
+        let q_r = rope(&q[hs..hs + g.head_dim], pos, g.rope_freq_base);
+        let probs = softmax(
+            &(0..=pos)
+                .map(|j| {
+                    let k_raw = &cache.k[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
+                    let k_r = rope(k_raw, j, g.rope_freq_base);
+                    q_r.iter().zip(&k_r).map(|(a, b)| a * b).sum::<f32>() * scale
+                })
+                .collect::<Vec<f32>>(),
+        );
+        for d in 0..g.head_dim {
+            let mut acc = 0.0f32;
+            for j in 0..=pos {
+                acc += probs[j] * cache.v[j * kv_dim + kv_h + d];
+            }
+            ctx[hs + d] = acc;
+        }
+    }
+    let attn = matvec(&w.o, g.d_model, q_dim, &ctx);
+    let y: Vec<f32> = x.iter().zip(&attn).map(|(a, b)| a + b).collect();
+    let ffn = expert_ffn(
+        &rmsnorm(&y, &w.ffn_norm, g.rms_eps),
+        &w.ffn_gate,
+        &w.ffn_up,
+        &w.ffn_down,
+        g.d_model,
+        g.d_ff,
+    );
+    y.iter().zip(&ffn).map(|(a, b)| a + b).collect()
+}
+
 /// Multi-position prefill: one transformer block over a `seq × d_model` row-major buffer.
 /// Attention is causal + GQA + RoPE (head-major); FFN is applied per row. Returns a
 /// `seq × d_model` buffer. `pos_start` is the absolute position of row 0 (so prompts
@@ -311,5 +378,45 @@ mod tests {
         let kv_of = |h: usize| h * g.n_kv_heads / g.n_heads;
         assert_eq!(kv_of(0), 0);
         assert_eq!(kv_of(1), 0);
+    }
+
+    fn nonzero_block() -> BlockWeights {
+        // attention + FFN branches active, so causal context really matters.
+        BlockWeights {
+            attn_norm: vec![1.0; 4],
+            q: (0..16).map(|i| i as f32 * 0.03 - 0.2).collect(),
+            k: (0..8).map(|i| i as f32 * 0.02 - 0.06).collect(),
+            v: (0..8).map(|i| 0.11 - i as f32 * 0.04).collect(),
+            o: (0..16).map(|i| i as f32 * 0.015 - 0.1).collect(),
+            ffn_norm: vec![1.0; 4],
+            ffn_gate: (0..32).map(|i| i as f32 * 0.01 - 0.14).collect(),
+            ffn_up: (0..32).map(|i| 0.2 - i as f32 * 0.012).collect(),
+            ffn_down: (0..32).map(|i| i as f32 * 0.006 - 0.08).collect(),
+        }
+    }
+
+    #[test]
+    fn block_forward_cached_matches_seq_over_prefix() {
+        // Feeding rows one-by-one through the KV cache reproduces block_forward_seq's
+        // per-position outputs exactly (causal attention over 0..=pos).
+        let g = geom();
+        let w = nonzero_block();
+        let x_seq: Vec<f32> = vec![
+            0.5, -0.2, 0.1, 0.4, // pos 0
+            -0.3, 0.7, 0.2, -0.1, // pos 1
+            0.9, 0.1, -0.4, 0.3, // pos 2
+        ];
+        let seq = x_seq.len() / g.d_model;
+        let reference = block_forward_seq(&x_seq, &w, &g, 0);
+        let mut cache = LayerKv::default();
+        for i in 0..seq {
+            let row = &x_seq[i * g.d_model..(i + 1) * g.d_model];
+            let out = block_forward_cached(row, &w, &g, i, &mut cache);
+            let want = &reference[i * g.d_model..(i + 1) * g.d_model];
+            for (a, b) in out.iter().zip(want) {
+                assert!((a - b).abs() < 1e-5, "pos {i}: cached={a} seq={b}");
+            }
+        }
+        assert_eq!(cache.k.len(), seq * (g.n_kv_heads * g.head_dim));
     }
 }

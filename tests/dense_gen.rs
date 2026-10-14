@@ -7,7 +7,7 @@ use std::path::Path;
 
 use rusty_engine::loader::MmapModel;
 use rusty_engine::model::ModelConfig;
-use rusty_engine::runner::DenseRunner;
+use rusty_engine::runner::{DenseDecoder, DenseRunner};
 
 fn u32le(b: &mut Vec<u8>, x: u32) {
     b.extend_from_slice(&x.to_le_bytes());
@@ -231,6 +231,27 @@ fn dense_generate_is_greedy_and_bounded() {
 
     let seq = runner.generate(&[2], 3);
     assert_eq!(seq, vec![2, 4, 4, 4]);
+
+    drop(model);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn incremental_decode_matches_full_prefill() {
+    // PH-307: causal equivalence — stepping token-by-token with the KV cache yields the
+    // exact same greedy stream as re-prefilling the whole prefix each step.
+    let bytes = synth_dense_gguf();
+    std::fs::create_dir_all("target").unwrap();
+    let path = fixture_path("incremental");
+    std::fs::write(&path, &bytes).unwrap();
+    let model = unsafe { MmapModel::open(&path) }.expect("mmap open");
+    let cfg = ModelConfig::from_file(model.header()).expect("config");
+    let runner = DenseRunner::from_model(&model, &cfg).expect("runner");
+
+    let full = runner.generate(&[2, 3], 5);
+    let mut dec = DenseDecoder::new(&runner);
+    let inc = dec.generate_incremental(&[2, 3], 5);
+    assert_eq!(full, inc, "incremental == re-prefill greedy stream");
 
     drop(model);
     let _ = std::fs::remove_file(&path);

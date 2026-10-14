@@ -8,8 +8,11 @@
 //! separate band.
 
 use crate::core::{EngineError, Result};
-use crate::forward::{block_forward_seq, last_logits, BlockWeights, Geometry};
-use crate::infer::argmax;
+use crate::forward::{
+    block_forward_cached, block_forward_seq, last_logits, logits_from_hidden, BlockWeights,
+    Geometry, LayerKv,
+};
+use crate::infer::{argmax, rmsnorm};
 use crate::loader::MmapModel;
 use crate::model::ModelConfig;
 
@@ -134,6 +137,71 @@ impl DenseRunner {
             match self.greedy(&seq) {
                 Some(t) if Some(t as u32) == self.eos_token_id => break,
                 Some(t) => seq.push(t as u32),
+                None => break,
+            }
+        }
+        seq
+    }
+}
+
+/// Incremental greedy decoder over a [`DenseRunner`] — band B3 `PH-307`.
+///
+/// Keeps one [`LayerKv`] cache per layer and advances position-by-position, so each new
+/// token costs a single row through every block (O(n) per step over the growing cache)
+/// instead of re-prefilling the whole prefix. Produces **exactly** the same token stream
+/// as [`DenseRunner::generate`] (causal equivalence, asserted by a test).
+pub struct DenseDecoder<'a> {
+    runner: &'a DenseRunner,
+    caches: Vec<LayerKv>,
+    seq_len: usize,
+}
+
+impl<'a> DenseDecoder<'a> {
+    pub fn new(runner: &'a DenseRunner) -> Self {
+        Self {
+            runner,
+            caches: vec![LayerKv::default(); runner.blocks.len()],
+            seq_len: 0,
+        }
+    }
+
+    /// Feed one token, return last-position logits after all layers.
+    pub fn step(&mut self, tok: u32) -> Vec<f32> {
+        let pos = self.seq_len;
+        let mut hidden = self.runner.embed_row(tok).to_vec();
+        for (l, blk) in self.runner.blocks.iter().enumerate() {
+            hidden =
+                block_forward_cached(&hidden, blk, &self.runner.geom, pos, &mut self.caches[l]);
+        }
+        self.seq_len += 1;
+        let normed = rmsnorm(&hidden, &self.runner.output_norm, self.runner.geom.rms_eps);
+        logits_from_hidden(
+            &normed,
+            &self.runner.output,
+            &self.runner.geom,
+            self.runner.n_vocab,
+        )
+    }
+
+    /// Prefill the prompt, then greedily append up to `max_new` tokens (stop at EOS).
+    /// `step` returns the distribution for the token *after* its input, so the last
+    /// prefill step's logits already selects the first generated token — exactly the
+    /// re-prefill `DenseRunner::generate` semantics.
+    pub fn generate_incremental(&mut self, prompt: &[u32], max_new: usize) -> Vec<u32> {
+        assert!(!prompt.is_empty(), "generate_incremental: empty prompt");
+        let mut seq: Vec<u32> = Vec::with_capacity(prompt.len() + max_new);
+        let mut logits = Vec::new();
+        for &t in prompt {
+            logits = self.step(t);
+            seq.push(t);
+        }
+        for _ in 0..max_new {
+            match argmax(&logits) {
+                Some(t) if Some(t as u32) == self.runner.eos_token_id => break,
+                Some(t) => {
+                    seq.push(t as u32);
+                    logits = self.step(t as u32);
+                }
                 None => break,
             }
         }
