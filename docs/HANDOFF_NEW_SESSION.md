@@ -63,11 +63,14 @@ vLLM/SGLang/TensorRT-LLM/llama.cpp/ktransformers + позиціонування 
   регресійний тест `ggml_dtype_maps_canonical_ggml_codes`; `inspect` тепер друкує dtype. Доказ —
   `docs/research/real-model-inspect.md`. **64 тести** загалом, clippy `-D` 0.
 
-**B4 — MoE-ядро (частково):** `[~]` — **PH-401/402/403/406a done** (`src/moe.rs`, pure-f32): роутер
+**B4 — MoE-ядро (частково):** `[~]` — **PH-401/402/403/404/406a done** (`src/moe.rs`, `src/cache.rs`, pure-f32): роутер
 `route` (softmax-renorm) + `top_k_sigmoid` (Qwen3/DeepSeek renorm) + `route_group` (noaux_tc-lite:
 group-score + top_k_group restrict); `expert_ffn` = `down(swiglu(gate,up))` (`silu`/`matvec`);
 `combine` shared-expert merge; **`moe_layer_forward` = повний цикл шару** (router→top-k experts
-weighted-sum→+shared) з детермінованим інтеграційним тестом. **63 тести**, clippy `-D` 0.
+weighted-sum→+shared) з детермінованим інтеграційним тестом; **`PH-404` expert-cache LRU**
+(`ExpertCache::get_or_load/put/prefetch/set_pinned` — byte-budget + pinned-skipped eviction,
+oversized→uncached, 7 unit). Лишилось: `PH-405` llama/HF-parity (оракул) + `PH-406` real
+MoE GGUF run + `PH-407` bench. **95 тестів**, clippy `-D` 0.
 Фактаж — `docs/research/moe-router.md`.
 
 **B3 — Dense forward (частково):** `[~]` — **PH-301/302/303/304 done** (`src/infer.rs`, pure-f32):

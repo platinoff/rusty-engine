@@ -10,6 +10,7 @@
 //! - [`gguf`]  — GGUF v3 header + tensor-info parsing (B1)
 //! - [`loader`] — mmap + staged disk→RAM loaders with progress (PH-103, first non-std dep)
 //! - [`moe`]   — top-k router + expert FFN (the differentiator, B4)
+//! - [`cache`] — byte-budgeted LRU expert cache + prefetch (B4 `PH-404`)
 //! - [`infer`] — transformer forward, paged KV-cache, sampler (B3)
 //! - [`forward`] — single-block transformer composition (PH-305d) + seq prefill (PH-305)
 //! - [`model`] — GGUF model-config + tensor-geometry validation (PH-305c/e)
@@ -18,6 +19,7 @@
 //! - [`node`]  — slave/worker runtime over local Wi-Fi (B7/B8)
 //! - [`hub`]   — GSV-native master supervisor (Rust k8s-lite, B8)
 
+pub mod cache;
 pub mod core;
 pub mod forward;
 pub mod gguf;
