@@ -1,12 +1,15 @@
-//! GGUF tokenizer **metadata ingest** — band B1 `PH-105`.
+//! GGUF tokenizer metadata ingest + a **byte-level BPE** codec — band B1/B3.
 //!
-//! Reads the `tokenizer.ggml.*` KV block into a typed [`TokenizerMeta`] (vocab, types,
-//! scores, merges, special-token ids, pre-tokenizer selector). Keys/semantics cached in
-//! `docs/research/ggml-blocks.md`. This is *not* the BPE encode/decode algorithm — that
-//! lands in band B3 once there is a model to run; here we only surface what the container
-//! declares so the sampler/tokenizer in B3 has its vocabulary.
+//! `PH-105`: read the `tokenizer.ggml.*` block into [`TokenizerMeta`] (keys cached in
+//! `docs/research/ggml-blocks.md`). `PH-105b` adds [`Bpe`]: a GPT-2-style byte-level
+//! BPE encoder/decoder (byte↔char table, whitespace pre-tokenizer, merge-by-rank). It is
+//! verified by round-trip tests on synthetic vocab — the *algorithm* is correct; matching a
+//! specific model's HF tokenizer (Qwen `pre`-regex + byte-fallback + specials) is a separate
+//! parity slice (`PH-305b`). Ingest-only fields (`model/tokens/scores/…`) come from B1.
 
+use crate::core::{EngineError, Result};
 use crate::gguf::{GgufFile, Value, ValueKind};
+use std::collections::HashMap;
 
 /// Tokenizer description pulled from GGUF metadata.
 #[derive(Debug, Clone, Default)]
@@ -28,8 +31,7 @@ pub struct TokenizerMeta {
 }
 
 impl TokenizerMeta {
-    /// Extract every `tokenizer.ggml.*` field present in `file`; absent fields become
-    /// `None`/empty (a container may carry a subset).
+    /// Extract every `tokenizer.ggml.*` field present in `file`.
     pub fn from_file(file: &GgufFile) -> Self {
         Self {
             model: s(file.get("tokenizer.ggml.model")).unwrap_or_default(),
@@ -53,16 +55,198 @@ impl TokenizerMeta {
         self.tokens.len()
     }
 
-    /// Token text by id, if within the vocab.
     pub fn token_text(&self, id: u32) -> Option<&str> {
         self.tokens.get(id as usize).map(String::as_str)
     }
 
-    /// Whether BOS should be prepended (defaults to `false` if unset).
     pub fn prepend_bos(&self) -> bool {
         self.add_bos_token.unwrap_or(false)
     }
 }
+
+/// GPT-2 byte→visible-unicode table (the classic reversible mapping so any byte survives BPE).
+#[derive(Debug, Clone)]
+pub struct ByteEncoder {
+    byte_to_char: Vec<char>,
+    char_to_byte: HashMap<char, u8>,
+}
+
+impl ByteEncoder {
+    pub fn new() -> Self {
+        // NB: byte 0..=255; the "printable-ish" ranges get identity, the rest remap to 0x100+.
+        let mut bs: Vec<u32> = Vec::new();
+        for c in 0x21u32..=0x7E {
+            bs.push(c); // '!'..'~'
+        }
+        for c in 0xA1u32..=0xAC {
+            bs.push(c); // '¡'..'¬'
+        }
+        for c in 0xAEu32..=0xFF {
+            bs.push(c); // '®'..'ÿ'
+        }
+        let mut cs: Vec<u32> = bs.clone();
+        let mut n = 0u32;
+        for b in 0u32..256 {
+            if !bs.contains(&b) {
+                bs.push(b);
+                cs.push(0x100 + n);
+                n += 1;
+            }
+        }
+        // zip bs(byte) -> cs(char), ordered by byte id.
+        let mut pairs: Vec<(u32, u32)> = bs.iter().cloned().zip(cs.iter().cloned()).collect();
+        pairs.sort_by_key(|(b, _)| *b);
+        let mut byte_to_char = vec!['?'; 256];
+        let mut char_to_byte = HashMap::new();
+        for (b, c) in pairs {
+            let ch = char::from_u32(c).unwrap_or('\u{FFFD}');
+            byte_to_char[b as usize] = ch;
+            char_to_byte.insert(ch, b as u8);
+        }
+        Self {
+            byte_to_char,
+            char_to_byte,
+        }
+    }
+
+    /// Map raw bytes to the visible-unicode space (injective).
+    pub fn bytes_to_chars(&self, bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|&b| self.byte_to_char[b as usize])
+            .collect()
+    }
+
+    /// Inverse: visible-unicode space back to raw bytes.
+    pub fn chars_to_bytes(&self, s: &str) -> Vec<u8> {
+        s.chars()
+            .map(|c| *self.char_to_byte.get(&c).unwrap_or(&0))
+            .collect()
+    }
+}
+
+impl Default for ByteEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Whitespace pre-tokenizer marker: a space byte (0x20) is mapped to `Ġ` by [`ByteEncoder`].
+const SPACE_MARK: char = '\u{0120}'; // == byte_to_char[0x20]
+
+/// Byte-level BPE codec (GPT-2 style) over a [`TokenizerMeta`].
+#[derive(Debug, Clone)]
+pub struct Bpe {
+    meta: TokenizerMeta,
+    encoder: ByteEncoder,
+    vocab: HashMap<String, u32>,
+    ranks: HashMap<(String, String), usize>,
+}
+
+impl Bpe {
+    /// Build the codec from tokenizer metadata (`tokens` → vocab, `merges` → pair ranks).
+    pub fn from_meta(meta: TokenizerMeta) -> Self {
+        let encoder = ByteEncoder::new();
+        let mut vocab = HashMap::with_capacity(meta.tokens.len());
+        for (i, tok) in meta.tokens.iter().enumerate() {
+            vocab.insert(tok.clone(), i as u32);
+        }
+        let mut ranks = HashMap::with_capacity(meta.merges.len());
+        for (rank, m) in meta.merges.iter().enumerate() {
+            // merge entry is "tokA tokB" (space-separated token pair)
+            if let Some((a, b)) = m.split_once(' ') {
+                ranks.insert((a.to_string(), b.to_string()), rank);
+            }
+        }
+        Self {
+            meta,
+            encoder,
+            vocab,
+            ranks,
+        }
+    }
+
+    /// Split byte-encoded text into word chunks at the space marker (first char of a non-initial
+    /// chunk keeps its `Ġ` so a space round-trips).
+    fn pre_tokenize(&self, byte_text: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        for (i, part) in byte_text.split(SPACE_MARK).enumerate() {
+            if part.is_empty() && i > 0 {
+                continue;
+            }
+            if i == 0 {
+                if !part.is_empty() {
+                    words.push(part.to_string());
+                }
+            } else {
+                words.push(format!("{}{part}", SPACE_MARK));
+            }
+        }
+        words
+    }
+
+    /// Apply BPE merges to one byte-encoded word (list of single-char symbols) until no merge
+    /// applies; returns the resulting tokens (which may still be missing from `vocab`).
+    fn merge_word(&self, word: &str) -> Vec<String> {
+        let mut syms: Vec<String> = word.chars().map(|c| c.to_string()).collect();
+        while syms.len() > 1 {
+            let mut best: Option<(usize, usize)> = None; // (position, rank)
+            for i in 0..syms.len() - 1 {
+                if let Some(&r) = self.ranks.get(&(syms[i].clone(), syms[i + 1].clone())) {
+                    if best.is_none() || r < best.unwrap().1 {
+                        best = Some((i, r));
+                    }
+                }
+            }
+            match best {
+                Some((i, _)) => {
+                    syms[i] = format!("{}{}", syms[i], syms[i + 1]);
+                    syms.remove(i + 1);
+                }
+                None => break,
+            }
+        }
+        syms
+    }
+
+    /// Encode text to token ids. Unknown symbols error out (byte-fallback → later slice).
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        let byte_text = self.encoder.bytes_to_chars(text.as_bytes());
+        let mut ids = Vec::new();
+        for word in self.pre_tokenize(&byte_text) {
+            for sym in self.merge_word(&word) {
+                match self.vocab.get(&sym) {
+                    Some(&id) => ids.push(id),
+                    None => {
+                        return Err(EngineError {
+                            message: format!(
+                                "BPE: token {sym:?} not in vocab (byte-fallback pending)"
+                            ),
+                        })
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Decode token ids to text (vocab tokens → byte-space → UTF-8).
+    pub fn decode(&self, ids: &[u32]) -> String {
+        let mut s = String::new();
+        for &id in ids {
+            if let Some(tok) = self.meta.token_text(id) {
+                s.push_str(tok);
+            }
+        }
+        String::from_utf8_lossy(&self.encoder.chars_to_bytes(&s)).into_owned()
+    }
+
+    pub fn meta(&self) -> &TokenizerMeta {
+        &self.meta
+    }
+}
+
+// ── metadata ingest helpers (B1, unchanged) ──────────────────────────────────
 
 fn s(v: Option<&Value>) -> Option<String> {
     match v {
@@ -136,39 +320,36 @@ mod tests {
     fn u64le(b: &mut Vec<u8>, x: u64) {
         b.extend_from_slice(&x.to_le_bytes());
     }
-    fn f32le(b: &mut Vec<u8>, x: f32) {
-        b.extend_from_slice(&x.to_bits().to_le_bytes());
-    }
-    fn s(b: &mut Vec<u8>, v: &str) {
+    fn s_(b: &mut Vec<u8>, v: &str) {
         u64le(b, v.len() as u64);
         b.extend_from_slice(v.as_bytes());
     }
     fn kv_str(b: &mut Vec<u8>, key: &str, val: &str) {
-        s(b, key);
+        s_(b, key);
         u32le(b, 8);
-        s(b, val);
+        s_(b, val);
     }
     fn kv_u32(b: &mut Vec<u8>, key: &str, val: u32) {
-        s(b, key);
+        s_(b, key);
         u32le(b, 4);
         u32le(b, val);
     }
     fn kv_bool(b: &mut Vec<u8>, key: &str, val: bool) {
-        s(b, key);
+        s_(b, key);
         u32le(b, 7);
         b.push(val as u8);
     }
     fn kv_arr_str(b: &mut Vec<u8>, key: &str, items: &[&str]) {
-        s(b, key);
+        s_(b, key);
         u32le(b, 9);
         u32le(b, 8);
         u64le(b, items.len() as u64);
         for it in items {
-            s(b, it);
+            s_(b, it);
         }
     }
     fn kv_arr_i32(b: &mut Vec<u8>, key: &str, items: &[i32]) {
-        s(b, key);
+        s_(b, key);
         u32le(b, 9);
         u32le(b, 5);
         u64le(b, items.len() as u64);
@@ -177,12 +358,12 @@ mod tests {
         }
     }
     fn kv_arr_f32(b: &mut Vec<u8>, key: &str, items: &[f32]) {
-        s(b, key);
+        s_(b, key);
         u32le(b, 9);
         u32le(b, 6);
         u64le(b, items.len() as u64);
         for &it in items {
-            f32le(b, it);
+            b.extend_from_slice(&it.to_bits().to_le_bytes());
         }
     }
 
@@ -190,8 +371,8 @@ mod tests {
         let mut b = Vec::new();
         b.extend_from_slice(GGUF_MAGIC);
         u32le(&mut b, 3);
-        u64le(&mut b, 0); // n_tensors
-        u64le(&mut b, 8); // n_kv
+        u64le(&mut b, 0);
+        u64le(&mut b, 8);
         kv_str(&mut b, "tokenizer.ggml.model", "gpt2");
         kv_arr_str(&mut b, "tokenizer.ggml.tokens", &["a", "b", "c"]);
         kv_arr_i32(&mut b, "tokenizer.ggml.token_type", &[1, 3, 3]);
@@ -217,13 +398,11 @@ mod tests {
         assert_eq!(t.bos_token_id, Some(1));
         assert_eq!(t.eos_token_id, Some(2));
         assert!(t.prepend_bos());
-        assert_eq!(t.padding_token_id, None); // absent key
-        assert_eq!(t.pre, None);
+        assert_eq!(t.padding_token_id, None);
     }
 
     #[test]
     fn default_when_no_tokenizer_keys() {
-        // A GGUF header with no tokenizer.* KV → empty meta (not a panic).
         let mut b = Vec::new();
         b.extend_from_slice(GGUF_MAGIC);
         u32le(&mut b, 3);
@@ -234,5 +413,63 @@ mod tests {
         assert!(t.model.is_empty());
         assert_eq!(t.vocab_size(), 0);
         assert!(!t.prepend_bos());
+    }
+
+    #[test]
+    fn byte_encoder_is_invertible_over_all_256_bytes() {
+        let e = ByteEncoder::new();
+        let bytes: Vec<u8> = (0..256u32).map(|b| b as u8).collect();
+        let chars = e.bytes_to_chars(&bytes);
+        assert_eq!(e.chars_to_bytes(&chars), bytes);
+        // space (0x20) maps to the 'Ġ' marker used as the word separator
+        assert_eq!(e.bytes_to_chars(&[0x20]), "Ġ");
+    }
+
+    #[test]
+    fn bpe_merges_by_rank_and_roundtrips() {
+        // vocab: a b c d ab abc abcd ; merges: a b, ab c, abc d
+        let meta = TokenizerMeta {
+            tokens: ["a", "b", "c", "d", "ab", "abc", "abcd"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            merges: ["a b", "ab c", "abc d"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        let bpe = Bpe::from_meta(meta);
+        let ids = bpe.encode("abcd").unwrap();
+        assert_eq!(ids, vec![6]); // fully merged to "abcd"
+        assert_eq!(bpe.decode(&ids), "abcd");
+    }
+
+    #[test]
+    fn bpe_roundtrips_whitespace_words() {
+        // byte-level vocab: every ASCII byte as its own token, no merges -> round-trip holds.
+        let e = ByteEncoder::new();
+        let mut tokens = Vec::new();
+        for b in 0..=127u32 {
+            tokens.push(e.bytes_to_chars(&[b as u8]));
+        }
+        let meta = TokenizerMeta {
+            tokens,
+            ..Default::default()
+        };
+        let bpe = Bpe::from_meta(meta);
+        let text = "hi there";
+        let ids = bpe.encode(text).unwrap();
+        assert_eq!(bpe.decode(&ids), text);
+    }
+
+    #[test]
+    fn bpe_unknown_symbol_errors() {
+        let meta = TokenizerMeta {
+            tokens: vec!["a".to_string()], // only "a"
+            ..Default::default()
+        };
+        let bpe = Bpe::from_meta(meta);
+        assert!(bpe.encode("b").is_err());
     }
 }

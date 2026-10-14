@@ -43,7 +43,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B1 — GGUF-чанкер (pure Rust)  **`[x]` (усі PH-101..107 done, 2026-10-14)**
+## Band B1 — GGUF-чанкер (pure Rust)  **`[x]` (PH-101..107 + 105b done, 2026-10-14)**
 
 > Мета: прочитати реальний GGUF-MoE-файл без llama.cpp. **Досягнуто** — контейнер цілком
 > в Rust. Фактаж: [`docs/research/gguf-format.md`](research/gguf-format.md) +
@@ -62,6 +62,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-103 | mmap/mlock staged loader (disk→RAM, progress) | `[x]` | `src/loader.rs` — `MmapModel::open`/`lock_pages`(unix)/`staged_read`(+progress)/`load_staged`; `memmap2`; 3 unit |
 | PH-104 | quant-блоки: sizes усіх 5 + scalar dequant Q4_0/Q8_0 (K-quant → B2) | `[x]` | `src/quant.rs` — `block_info`/`bytes_for_numel`/`dequant`+`f16_to_f32`; 6 unit |
 | PH-105 | tokenizer-metadata ingest (model/tokens/type/scores/merges/bos/eos/pre) | `[x]` | `src/tokenizer.rs` — `TokenizerMeta::from_file`; 2 unit |
+| PH-105b | byte-level **BPE encode/decode** (GPT-2 style) | `[x]` | `src/tokenizer.rs` — `ByteEncoder` (invertible 0..=255) + `Bpe` (pre-tokenize/merge-by-rank); round-trip + unknown-err (4 unit); HF-exact parity → PH-305b |
 | PH-106 | round-trip на disk (write synth GGUF → read via `parse_file`) | `[x]` | `src/gguf.rs` — `round_trips_a_real_file_via_std_io` (real `.gguf` bytes) |
 | PH-107 | CLI `rusty inspect model.gguf` | `[x]` | `src/bin/rusty.rs` — `inspect()` summary + graceful errors |
 

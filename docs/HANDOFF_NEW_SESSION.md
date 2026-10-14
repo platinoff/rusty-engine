@@ -46,7 +46,9 @@ MoE-двигун** (GGUF-first), MIT, під GSV-хабом. Рішення owne
 - `PH-101/102` `src/gguf.rs` — `parse()` header+KV (усі `GGUF_TYPE_*`, вкладені arrays) + tensor-info (`TensorEntry`/`ggml_dtype`).
 - `PH-103` `src/loader.rs` — `MmapModel::open` (zero-copy, `memmap2` — **перша не-std залежність**, регістр перевірено на старті), `lock_pages`(unix-gated), `staged_read` disk→RAM + progress, `load_staged`.
 - `PH-104` `src/quant.rs` — `f16_to_f32`; `block_info`/`bytes_for_numel` для **усіх 5** (18/34/144/176/210 B/block); scalar `dequant_q4_0` (**split-half**) + `dequant_q8_0` (signed); K-quant *dequant math* → **B2**.
-- `PH-105` `src/tokenizer.rs` — `TokenizerMeta::from_file` (model/tokens/token_type/scores/merges/bos/eos/pre + accessors); BPE-алгоритм → **B3**.
+- `PH-105` `src/tokenizer.rs` — `TokenizerMeta::from_file` (model/tokens/token_type/scores/merges/bos/eos/pre + accessors);
+  **PH-105b** — `ByteEncoder` (GPT-2 byte↔char, invertible 0..=255, 0x20→Ġ) + `Bpe` (pre-tokenize + merge-by-rank)
+  **encode/decode round-trip** (HF-exact Qwen parity → PH-305b).
 - `PH-106` disk round-trip (`parse_file` read synth `.gguf` з диска); `PH-107` `rusty inspect` CLI.
 - **PH-106-real** — парсер прогнано на **справжньому** `Qwen2.5-0.5B-Instruct Q4_K_M` (491 400 032 B,
   sha256 `74a4da8c…`, gitignored у `data/models/`): 291 tensors / 26 kv / arch `qwen2`. При цьому
@@ -76,9 +78,9 @@ reference-dequant Q4_K/Q5_K/Q6_K (`src/quant.rs` — `dequant_q{4,5,6}_k` + `get
 faithful з C: Q5_K ділить 6-bit layout, Q6_K signed `int8 scales` без таблиці, −32 bias).
 **61 тести**, clippy `-D` 0. C-ref кеш — `docs/research/ggml-blocks.md`.
 
-**Наступний крок:** тепер реальна вага матеріалізується → повний **`PH-305` dense forward**
-потребує: **BPE-decode** (алгоритм з `tokenizer.ggml.*`) + **multi-layer loop** (rmsnorm→attn
-(q/k/v/o + GQA + RoPE)→FFN ×24 + residual → `output` → logits) → golden-токен на тій самій
-Qwen2.5. Plan loop у `docs/research/gguf-tensor-offsets.md`. Паралельно — B2 залізо
-(`PH-202..204` SIMD). **66 тести** загалом, clippy `-D` 0, усі локальні (без push). Канон:
+**Наступний крок:** реальна вага матеріалізується **і** BPE-core готовий (`PH-105b` round-trip).
+Повний **`PH-305` dense forward** лишив: **multi-layer loop** (rmsnorm→attn(q/k/v/o+GQA+RoPE)→FFN
+×24 + residual → `output`→logits) + **HF-exact Qwen parity** токена (`PH-305b`: `pre`-regex,
+byte-fallback, specials). Plan loop — `docs/research/gguf-tensor-offsets.md`. Паралельно B2 залізо
+(`PH-202..204` SIMD). **70 тести** загалом, clippy `-D` 0, усі локальні (без push). Канон:
 `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
