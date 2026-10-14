@@ -55,8 +55,8 @@ fn inspect(path: &str) {
             println!("  tensors (showing {show} of {}):", f.tensors.len());
             for t in f.tensors.iter().take(10) {
                 println!(
-                    "    {:<40} {:?} ggml={} offset={}",
-                    t.name, t.dims, t.ggml_type, t.offset
+                    "    {:<40} {:?} ggml={} dtype={:?} offset={}",
+                    t.name, t.dims, t.ggml_type, t.dtype, t.offset
                 );
             }
         }

@@ -51,6 +51,9 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 > **Контекст-дисципліна:** std-only (101/102/106/107), mmap `103` (`memmap2`), `104`
 > (block-sizes усіх 5 + scalar dequant Q4_0/Q8_0) і `105` (tokenizer-metadata ingest) —
 > **B1 завершено**. K-quant dequant math → B2; BPE-алгоритм → B3.
+> **Real-file parity (2026-10-14):** парсер перевірено на справжньому
+> [`Qwen2.5-0.5B Q4_K_M`](research/real-model-inspect.md) (291 tensors / 26 kv / arch qwen2);
+> там же знайдено й виправлено `ggml_dtype` off-by-K-types (12/13/14) + регресійний тест.
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|

@@ -14,16 +14,18 @@ block-sizes+Q4_0/Q8_0 dequant→tokenizer-meta. **35 тестів**, clippy `-D`
 
 ## Наступний крок (B2 залізо: repack/SIMD, або реальна модель)
 
-Done цього сеансу: **B1 `PH-101..107`** (контейнер), **B4-core `PH-401/402/403` + `PH-406a`**
+Done цього сеансу: **B1 `PH-101..107`** (контейнер) **+ real-file parity** (`Qwen2.5-0.5B Q4_K_M`,
+баг `ggml_dtype` знайдено/виправлено + регресійний тест), **B4-core `PH-401/402/403` + `PH-406a`**
 (router/SwiGLU/shared + **повний `moe_layer_forward` шар**), **B3-primitives `PH-301..304`**
 (RMSNorm+attention+paged-KV+sampler), **B2 `PH-201`+`PH-201+`**
 (fused dot/gemv Q4_0/Q8_0 **і** скалярний reference-dequant Q4_K/Q5_K/Q6_K, faithful з C) —
-**63 тести**, clippy `-D` 0.
+**64 тести**, clippy `-D` 0. Реальна модель лежить у `data/models/` (gitignored).
 
 Наступна `agi` обирає:
-1. **B2 залізо** `PH-202/203/204` — repack + SSE/AVX/NEON dispatch + fused K-quant dequant+dot,
-   кожен з `cargo bench` проти скалярного oracle (`PH-201+` — вже еталон).
-2. **`PH-305`/`PH-406`/`PH-405`** — реальна GGUF → dense/MoE golden + числовий parity.
+1. **`PH-305` dense forward** (⭐ тепер можлива — модель під рукою): BPE-decode (алгоритм з
+   `tokenizer.ggml.*`) + multi-layer stack (rmsnorm→attn→FFN ×24, RoPE-cache) → golden-токени на
+   **цій самій** Qwen2.5-0.5B; числовий parity `PH-405`. Великий зріз (dequant real tensors + loop).
+2. **B2 залізо** `PH-202/203/204` — repack + SSE/AVX/NEON dispatch, з `cargo bench` проти oracle.
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
 

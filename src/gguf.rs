@@ -149,9 +149,9 @@ pub fn ggml_dtype(code: u32) -> Option<DType> {
         1 => DType::F16,
         2 => DType::Q4_0,
         8 => DType::Q8_0,
-        14 => DType::Q4_K,
-        15 => DType::Q5_K,
-        16 => DType::Q6_K,
+        12 => DType::Q4_K,
+        13 => DType::Q5_K,
+        14 => DType::Q6_K,
         24 => DType::BF16,
         _ => return None,
     })
@@ -409,7 +409,7 @@ mod tests {
         push_u64(&mut b, 2048);
         push_u64(&mut b, 512);
         push_u64(&mut b, 64);
-        push_u32(&mut b, 14); // ggml Q4_K
+        push_u32(&mut b, 12); // ggml Q4_K
         push_u64(&mut b, 0); // offset
         b
     }
@@ -438,9 +438,23 @@ mod tests {
         let t = &f.tensors[0];
         assert_eq!(t.name, "blk.0.ffn_gate_exps.weight");
         assert_eq!(t.dims, vec![2048, 512, 64]);
-        assert_eq!(t.ggml_type, 14);
+        assert_eq!(t.ggml_type, 12);
         assert_eq!(t.dtype, Some(DType::Q4_K));
         assert_eq!(t.offset, 0);
+    }
+
+    #[test]
+    fn ggml_dtype_maps_canonical_ggml_codes() {
+        // Canonical GGML_TYPE_* enum: Q4_K=12, Q5_K=13, Q6_K=14 (a real Qwen2.5 file
+        // proved the earlier 14/15/16 map was off by the K-types).
+        assert_eq!(ggml_dtype(12), Some(DType::Q4_K));
+        assert_eq!(ggml_dtype(13), Some(DType::Q5_K));
+        assert_eq!(ggml_dtype(14), Some(DType::Q6_K));
+        assert_eq!(ggml_dtype(0), Some(DType::F32));
+        assert_eq!(ggml_dtype(1), Some(DType::F16));
+        assert_eq!(ggml_dtype(8), Some(DType::Q8_0));
+        assert_eq!(ggml_dtype(6), None); // Q5_0 not a DType (raw ggml_type kept)
+        assert_eq!(ggml_dtype(16), None); // IQ2_XXS, later band
     }
 
     #[test]
