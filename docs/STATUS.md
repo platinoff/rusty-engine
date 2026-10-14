@@ -1,13 +1,13 @@
 # rusty-engine — PROJECT STATUS
 
-**Snapshot:** 2026-10-14 (agi-сесія «verify + save state + research») · **без push** (remote-only у B11).
+**Snapshot:** 2026-10-14 (agi-ланцюг: B0→B1 GGUF→B2 quant→B3 dense/KV/sampler/BPE→B4 MoE→B5 serve/heartbeat) · **без push** (remote-only у B11).
 
 ## Верифікований стан (zmіряно цього сеансу, не «на памʼять»)
 
 | Метрика | Значення |
 |---------|----------|
 | `git status` | **clean** (0 drift) |
-| Локальні коміти | **19** |
+| Локальні коміти | **37** (B0→B5 serve/heartbeat, без push — remote = B11) |
 | Тести | **138** (127 lib unit + 5 dense-gen + 2 text-gen + 4 integration `scaffold_contracts`), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
