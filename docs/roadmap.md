@@ -43,10 +43,12 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B1 — GGUF-чанкер (pure Rust)  **`[~]` (PH-101/102 done, 2026-10-14)**
+## Band B1 — GGUF-чанкер (pure Rust)  **`[~]` (PH-101/102/106/107 done, 2026-10-14)**
 
 > Мета: прочитати реальний GGUF-MoE-файл без llama.cpp. Тест на tiny-фікsturі.
 > Локальний фактаж формату: [`docs/research/gguf-format.md`](research/gguf-format.md).
+> **Контекст-дисципліна:** dep-free зріз (101/102/106/107) зроблено; мережеві
+> 103/104/105 (memmap2 + ggml block-sizes + BPE) — на окрему сесію з перевіркою регістру.
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
@@ -55,8 +57,8 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-103 | mmap/mlock staged loader (disk→RAM, progress) | `[ ]` | `src/gguf/staged.rs` |
 | PH-104 | quant-блоки Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 (dequant) | `[ ]` | `src/core/quant.rs` |
 | PH-105 | GGUF tokenizer metadata (BPE) міст | `[ ]` | `src/gguf/tok.rs` |
-| PH-106 | tiny-GGUF fixture + round-trip тест | `[ ]` | `tests/gguf_roundtrip.rs` |
-| PH-107 | CLI `rusty inspect model.gguf` | `[ ]` | `src/bin/rusty.rs` |
+| PH-106 | round-trip на disk (write synth GGUF → read via `parse_file`) | `[x]` | `src/gguf.rs` — `round_trips_a_real_file_via_std_io` (real `.gguf` bytes) |
+| PH-107 | CLI `rusty inspect model.gguf` | `[x]` | `src/bin/rusty.rs` — `inspect()` summary + graceful errors |
 
 ---
 

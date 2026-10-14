@@ -7,6 +7,9 @@
 //! stays offline-buildable). Validation against a real model lands with `PH-106`.
 
 use crate::core::DType;
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::Path;
 
 /// GGUF file magic ("GGUF" little-endian; versions 2 and 3).
 pub const GGUF_MAGIC: &[u8; 4] = b"GGUF";
@@ -334,6 +337,24 @@ pub fn parse(bytes: &[u8]) -> GgufResult<GgufFile> {
     })
 }
 
+/// Default `rusty inspect` read window — 16 MiB covers even very large tensor-name
+/// tables, so the whole header parses without loading multi-GB tensor data.
+pub const INSPECT_WINDOW: usize = 16 * 1024 * 1024;
+
+/// Read a GGUF **header** from a file via a bounded, **std-only** prefix (no mmap).
+///
+/// Tensor-info tables are small; we read at most `window` bytes. If the header extends
+/// past the window the parse fails on EOF — full mmap/mlock loading of tensor *data* is
+/// `PH-103`. Powers `rusty inspect` (`PH-107`) and the file round-trip (`PH-106`).
+pub fn parse_file(path: &Path, window: usize) -> io::Result<GgufFile> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    let want = len.min(window);
+    let mut buf = Vec::with_capacity(want);
+    file.take(want as u64).read_to_end(&mut buf)?;
+    parse(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +469,20 @@ mod tests {
         b[4..8].copy_from_slice(&1u32.to_le_bytes());
         let err = parse(&b).unwrap_err();
         assert!(err.message.contains("unsupported GGUF version"));
+    }
+
+    #[test]
+    fn round_trips_a_real_file_via_std_io() {
+        let bytes = synth_gguf();
+        std::fs::create_dir_all("target").unwrap();
+        let path = std::path::Path::new("target/rusty_gguf_fixture.gguf");
+        std::fs::write(path, &bytes).unwrap();
+        let f = parse_file(path, INSPECT_WINDOW).expect("parse_file reads header from disk");
+        assert_eq!(f.version, 3);
+        assert_eq!(f.n_tensors, 1);
+        assert_eq!(f.n_kv(), 3);
+        assert_eq!(f.data_offset, bytes.len());
+        assert_eq!(f.tensors[0].name, "blk.0.ffn_gate_exps.weight");
+        let _ = std::fs::remove_file(path);
     }
 }

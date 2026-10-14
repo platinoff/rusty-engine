@@ -39,13 +39,13 @@ MoE-двигун** (GGUF-first), MIT, під GSV-хабом. Рішення owne
 
 ## Наступний крок
 
-**B1 — GGUF-чанкер (частково):** `[~]` — `PH-101` header+KV (усі `GGUF_TYPE_*`, вкладені
-arrays) і `PH-102` tensor-info (`TensorEntry`+`ggml_dtype`) **закрито** (`src/gguf.rs`,
-+7 unit, round-trip synth-тест; усього **22 тести**, clippy 0). Локальний фактаж формату —
-`docs/research/gguf-format.md` (наступна сесія читає замість перезбору контексту).
+**B1 — GGUF-чанкер (частково):** `[~]` — dep-free зріз **закрито**: `PH-101` header+KV
+(усі `GGUF_TYPE_*`, вкладені arrays), `PH-102` tensor-info (`TensorEntry`+`ggml_dtype`),
+`PH-106` disk round-trip (`parse_file`: synth `.gguf` write→read), `PH-107` `rusty inspect`
+(`src/gguf.rs`/`src/bin/rusty.rs`; **23 тести**, clippy `-D` 0). Локальний фактаж формату —
+`docs/research/gguf-format.md`.
 
-Решта B1 — **open** (потребують мережевих залежностей / реального фікстуру, тож лишаємо
-обмеженим зрізом на далі): `PH-103` mmap/mlock staged loader (`memmap2`) → `PH-104`
-dequant-блоки (`ggml-common.h` block sizes) → `PH-105` BPE-токенізатор → `PH-106` **real**
-tiny-GGUF fixture round-trip → `PH-107` `rusty inspect`. Канон: `docs/roadmap.md`,
-`NEXT_SESSION_PROMPT.md`.
+Решта B1 — **open**, це **мережеві/важкі** зрізи (свідомо лишаємо на окремі сесії, з
+перевіркою cargo-регістру на старті): `PH-103` mmap/mlock staged loader (`memmap2`) →
+`PH-104` dequant-блоки (`ggml-common.h` block sizes) → `PH-105` BPE-токенізатор
+(`tokenizer.ggml.*`). Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
