@@ -179,6 +179,84 @@ pub fn route_group(
         .collect()
 }
 
+/// Exact DeepSeek-V3 / Qwen3 `noaux_tc` group routing — band B4 `PH-401b`.
+///
+/// `scores = sigmoid(logits + bias)`; each contiguous group's score is the **sum of its
+/// top-2 members** (the `noaux` heuristic — *not* the whole-group sum the simplified
+/// [`route_group`] uses, so a group of many mediocre experts can't outrank one with a
+/// dominant pair). `top_k_group` groups with the highest such score are eligible; within
+/// them the global `top_k` experts are chosen and renormalized. Ties fall to lower group /
+/// expert index (stable sort). This is what `PH-406` routes Qwen3-30B-A3B / Mixtral with.
+pub fn route_noaux_tc(
+    logits: &[f32],
+    bias: &[f32],
+    n_groups: usize,
+    top_k: usize,
+    top_k_group: Option<usize>,
+) -> Vec<ExpertScore> {
+    let n = logits.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let exp: Vec<f32> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| sigmoid(x + bias.get(i).copied().unwrap_or(0.0)))
+        .collect();
+    let ng = n_groups.max(1).min(n);
+    let group_of = |i: usize| i * ng / n;
+
+    // Group score = sum of the top-2 experts in the group (fewer if the group is tiny).
+    let mut gscore = vec![0.0f32; ng];
+    let mut top1 = vec![f32::MIN; ng];
+    let mut top2 = vec![f32::MIN; ng];
+    for (i, &e) in exp.iter().enumerate() {
+        let g = group_of(i);
+        if e >= top1[g] {
+            top2[g] = top1[g];
+            top1[g] = e;
+        } else if e > top2[g] {
+            top2[g] = e;
+        }
+    }
+    for g in 0..ng {
+        gscore[g] = top1[g] + if top2[g] == f32::MIN { 0.0 } else { top2[g] };
+    }
+
+    let allowed: Vec<bool> = match top_k_group {
+        None => vec![true; ng],
+        Some(tkg) => {
+            let mut order: Vec<usize> = (0..ng).collect();
+            order.sort_by(|&a, &b| {
+                gscore[b]
+                    .partial_cmp(&gscore[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut a = vec![false; ng];
+            for &g in order.iter().take(tkg.min(ng)) {
+                a[g] = true;
+            }
+            a
+        }
+    };
+
+    let mut cand: Vec<usize> = (0..n).filter(|&i| allowed[group_of(i)]).collect();
+    cand.sort_by(|&a, &b| {
+        exp[b]
+            .partial_cmp(&exp[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let k = top_k.min(cand.len());
+    let wsum: f32 = cand[..k].iter().map(|&i| exp[i]).sum();
+    cand[..k]
+        .iter()
+        .map(|&i| ExpertScore {
+            id: i,
+            weight: if wsum == 0.0 { 0.0 } else { exp[i] / wsum },
+        })
+        .collect()
+}
+
 /// Row-major `W[m×n]` (flat, `m*n` long) times `x[n]` → `out[m]`.
 pub fn matvec(w: &[f32], m: usize, n: usize, x: &[f32]) -> Vec<f32> {
     assert_eq!(x.len(), n, "matvec: input width mismatch");
@@ -490,6 +568,38 @@ mod tests {
         }
         let sum: f32 = s.iter().map(|x| x.weight).sum();
         assert!((sum - 1.0).abs() < EPS);
+    }
+
+    #[test]
+    fn route_noaux_tc_uses_top2_group_score_not_group_sum() {
+        // 8 experts, 2 groups of 4. group0={5,2,-9,-9} has a dominant PAIR (sigmoid
+        // 0.993+0.881=1.874) but a small total; group1={0,0,0,0} has a larger *sum* (2.0)
+        // but only top2=1.0. noaux_tc must pick group0; the all-sum route_group picks group1.
+        let logits = [5.0, 2.0, -9.0, -9.0, 0.0, 0.0, 0.0, 0.0];
+        let noaux = route_noaux_tc(&logits, &[], 2, 1, Some(1));
+        assert_eq!(noaux[0].id, 0, "noaux_tc picks the dominant-pair group");
+        assert!((noaux[0].weight - 1.0).abs() < EPS);
+        let lite = route_group(&logits, &[], 2, 1, Some(1));
+        assert!(
+            (4..=7).contains(&lite[0].id),
+            "all-sum lite version picks the other group"
+        );
+    }
+
+    #[test]
+    fn route_noaux_tc_renormalizes_top_k() {
+        let logits = [5.0, 2.0, -9.0, -9.0, 0.0, 0.0, 0.0, 0.0];
+        let s = route_noaux_tc(&logits, &[], 2, 2, Some(1));
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].id, 0);
+        assert_eq!(s[1].id, 1);
+        let sum: f32 = s.iter().map(|x| x.weight).sum();
+        assert!((sum - 1.0).abs() < EPS);
+    }
+
+    #[test]
+    fn route_noaux_tc_empty_input() {
+        assert!(route_noaux_tc(&[], &[], 2, 1, Some(1)).is_empty());
     }
 
     #[test]

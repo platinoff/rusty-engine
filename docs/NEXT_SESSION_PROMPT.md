@@ -36,7 +36,7 @@ synth round-trip). **+ B3 `PH-307` incremental decode + KV** (`forward::LayerKv`
 еквівалентність). **+ B3 `PH-304b` sampler wiring** (`GenerationOptions.repetition_penalty`,
 `infer::SeedRng` xorshift64*, `DenseRunner::generate_with` — temp/top-k/top-p/repetition,
 `temp<=0`==greedy). **+ B4 `PH-404b` MoE forward через cache** (`moe_layer_forward_cached`
-→ `get_or_load` per expert; == resident forward при детерм. loader). **+ B2 `PH-201d` fused Q5_0 dot/gemv** (closes quant matrix). **119 тести** (108 lib + 5 dense + 2 text + 4
+→ `get_or_load` per expert; == resident forward при детерм. loader). **+ B2 `PH-201d` fused Q5_0 dot/gemv** (closes quant matrix). **+ B4 `PH-401b` exact `noaux_tc` routing** (`route_noaux_tc` — group score = sum of top-2, distinguishes from `route_group`). **122 тести** (111 lib + 5 dense + 2 text + 4
 scaffold), clippy `-D` 0, ratio Rust ~96%. Модель у `data/models/` (gitignored).
 **Checkpoint:** зріз стану — `docs/STATUS.md`; порівняння рушіїв —
 `docs/research/engine-landscape-2026.md`; offset-семантика — `docs/research/`.

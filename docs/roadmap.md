@@ -115,7 +115,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B4 — MoE-ядро (ДИФЕРЕНЦІЯТОР)  **`[~]` (PH-401/402/403/404/404b/406a done, 2026-10-14)**
+## Band B4 — MoE-ядро (ДИФЕРЕНЦІЯТОР)  **`[~]` (PH-401/401b/402/403/404/404b/406a done, 2026-10-14)**
 
 > Мета: Qwen3-30B-A3B / Mixtral GGUF **нативно в Rust**, минаючи llama.cpp.
 > **Повний compute-цикл MoE-шара вже зʼєднаний і детермінований** (`moe_layer_forward`);
@@ -125,6 +125,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
 | PH-401 | top-k router: softmax-renorm + sigmoid + noaux_tc group | `[x]` | `src/moe.rs` — `route`/`top_k_sigmoid`/`route_group` (simplified; exact top-2/grp → PH-405) |
+| PH-401b | **exact `noaux_tc` group routing** (DeepSeek-V3/Qwen3) | `[x]` | `src/moe.rs` — `route_noaux_tc`: group score = **sum of top-2** (not all-sum), select `top_k_group`, global top-k renorm, stable ties; distinguishes from `route_group` (3 unit) |
 | PH-402 | expert FFN SwiGLU (`ffn_gate/up/down_exps`) | `[x]` | `src/moe.rs` — `expert_ffn`/`swiglu`/`silu`/`matvec`; 44 unit |
 | PH-403 | shared-expert merge (DeepSeek/Qwen3) | `[x]` | `src/moe.rs` — `combine` (shared=Some/None, shape-validated) |
 | PH-406a | MoE FFN **layer forward** (router→experts→shared) | `[x]` | `src/moe.rs` — `moe_layer_forward`/`ExpertWeights`; 2 integration (63 total) |
