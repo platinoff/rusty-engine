@@ -93,16 +93,16 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B4 — MoE-ядро (ДИФЕРЕНЦІЯТОР)  **`[ ]`**
+## Band B4 — MoE-ядро (ДИФЕРЕНЦІЯТОР)  **`[~]` (PH-401/402/403 done, 2026-10-14)**
 
 > Мета: Qwen3-30B-A3B / Mixtral GGUF **нативно в Rust**, минаючи llama.cpp.
 > Підлога: llama-rs Qwen3-30B-A3B ≈ 0.497 tok/s decode — ціль ≥ parity.
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
-| PH-401 | top-k router: softmax-renorm + sigmoid + noaux_tc group | `[ ]` | `src/moe/router.rs` |
-| PH-402 | expert FFN SwiGLU (`ffn_gate/up/down_exps`) | `[ ]` | `src/moe/ffn.rs` |
-| PH-403 | shared-expert merge (DeepSeek/Qwen3) | `[ ]` | `src/moe/shared.rs` |
+| PH-401 | top-k router: softmax-renorm + sigmoid + noaux_tc group | `[x]` | `src/moe.rs` — `route`/`top_k_sigmoid`/`route_group` (simplified; exact top-2/grp → PH-405) |
+| PH-402 | expert FFN SwiGLU (`ffn_gate/up/down_exps`) | `[x]` | `src/moe.rs` — `expert_ffn`/`swiglu`/`silu`/`matvec`; 44 unit |
+| PH-403 | shared-expert merge (DeepSeek/Qwen3) | `[x]` | `src/moe.rs` — `combine` (shared=Some/None, shape-validated) |
 | PH-404 | expert-cache LRU + RAM/NVMe offload + hot prefetch | `[ ]` | `src/moe/cache.rs` |
 | PH-405 | greedy-parity vs llama.cpp-референс + perplexity smoke | `[ ]` | `tests/moe_parity.rs` |
 | PH-406 | run Qwen3-30B-A3B / Mixtral GGUF pure-Rust | `[ ]` | `src/moe/forward.rs` |

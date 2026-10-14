@@ -49,6 +49,13 @@ MoE-двигун** (GGUF-first), MIT, під GSV-хабом. Рішення owne
 - `PH-105` `src/tokenizer.rs` — `TokenizerMeta::from_file` (model/tokens/token_type/scores/merges/bos/eos/pre + accessors); BPE-алгоритм → **B3**.
 - `PH-106` disk round-trip (`parse_file` read synth `.gguf` з диска); `PH-107` `rusty inspect` CLI.
 
-**Наступний крок:** B2 (`PH-201` scalar reference kernels) — або стрибок до **B4 MoE-ядро**
-(`rusty-engine-moe-core` ready: `PH-401/402/403` router/swiglu/shared-expert — pure-f32, testable
-без повного пайплайну). Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
+**B4 — MoE-ядро (частково):** `[~]` — **PH-401/402/403 done** (`src/moe.rs`, pure-f32): роутер
+`route` (softmax-renorm) + `top_k_sigmoid` (Qwen3/DeepSeek renorm) + `route_group` (noaux_tc-lite:
+group-score + top_k_group restrict); `expert_ffn` = `down(swiglu(gate,up))` (`silu`/`matvec`);
+`combine` shared-expert merge (shape-validated, shared=Some/None). **44 тести**, clippy `-D` 0.
+Фактаж — `docs/research/moe-router.md`.
+
+**Наступний крок:** B3 primitives (`PH-304` sampler: temp/top-k/top-p/repetition — pure-f32 ready;
+`PH-301` RMSNorm), потім attn/RoPE/paged-KV (`PH-302/303`, потребують real-model golden `PH-305`)
+і `PH-404..407` (expert-cache/parity/run/bench — реальної GGUF-моделі). Опційно B2 (`PH-201`
+K-quant dequant + SIMD). Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.

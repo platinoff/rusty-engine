@@ -12,12 +12,18 @@
 block-sizes+Q4_0/Q8_0 dequant→tokenizer-meta. **35 тестів**, clippy `-D` 0. Коміти локальні,
 **без push** (GitHub remote — B11 `PH-1105`).
 
-## Наступний крок (B4 MoE-ядро — марquee, std-testable)
+## Наступний крок (B3 primitives — sampler/RMSNorm, std-testable)
 
-`rusty-engine-moe-core` (ready) — `PH-401/402/403`: router (top-k/softmax/sigmoid), expert-FFN
-SwiGLU (gate/up/down + silu), shared-expert merge — усе pure-f32, unit-тестоване без повного
-пайплайну (attn/KV = B3). Фактаж роутера — з llama.cpp `qwen3moe`/`deepseek2` (explore-subagent).
-Опційно паралельно — **B2** (`PH-201` scalar kernels + K-quant dequant): вузьке місце швидкості.
+`PH-401/402/403` **done** (`src/moe.rs`: router softmax/sigmoid/group + SwiGLU `expert_ffn` +
+`combine` shared-merge; 44 tests). Далі — **B3** pure-f32 примітиви (без моделі):
+
+1. `PH-304` **sampler** (`src/infer/sample.rs`): temperature, top-k, top-p (nucleus), repetition
+   penalty, greedy argmax — unit-тести на синтетичних logits.
+2. `PH-301` **RMSNorm/SiLU/MatMul** (`src/infer/ops.rs`) — `silu`/`matvec` вже в `moe.rs`, виносяться/доповнюються.
+3. далі attn/RoPE/paged-KV (`PH-302/303`) + `PH-305` real-model golden (потребує GGUF-файл + deps).
+
+Решта B4 (`PH-404..407`: expert-cache, parity, run, bench) — реальної GGUF-моделі. Опційно B2
+(`PH-201` K-quant dequant + SIMD) — вузьке місце швидкості.
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
 
@@ -29,7 +35,7 @@ subagent-ах. Не тягну весь llama.cpp/vLLM у вікно за раз
 
 - `rusty-engine-bootstrap` (B0) — 10/10 **done** (сесія 2026-10-14).
 - `rusty-engine-gguf` (B1) — банда **завершена**: `PH-101..107` усі **done** (2026-10-14).
-- `rusty-engine-moe-core` (B4) — ready-to-hook (марquee-діференціатор: native MoE forward).
+- `rusty-engine-moe-core` (B4) — банда створена: `PH-401/402/403` **done** (router+SwiGLU+shared), `PH-404..407` **open** (потребують реальної GGUF-моделі).
 
 ## Reminder (session law)
 
