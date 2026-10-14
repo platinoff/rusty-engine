@@ -43,14 +43,15 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B1 — GGUF-чанкер (pure Rust)  **`[ ]`**
+## Band B1 — GGUF-чанкер (pure Rust)  **`[~]` (PH-101/102 done, 2026-10-14)**
 
 > Мета: прочитати реальний GGUF-MoE-файл без llama.cpp. Тест на tiny-фікsturі.
+> Локальний фактаж формату: [`docs/research/gguf-format.md`](research/gguf-format.md).
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
-| PH-101 | GGUF v3 header + KV-metadata парсер | `[ ]` | `src/gguf.rs` — read_header |
-| PH-102 | tensor-info table (name/dims/dtype/offset) | `[ ]` | `src/gguf.rs` — TensorEntry |
+| PH-101 | GGUF v3 header + KV-metadata парсер (std-only) | `[x]` | `src/gguf.rs` — `parse()`/`Value`/`ValueKind`, 7 unit |
+| PH-102 | tensor-info table (name/dims/dtype/offset) | `[x]` | `src/gguf.rs` — `TensorEntry`/`ggml_dtype`, round-trip synth |
 | PH-103 | mmap/mlock staged loader (disk→RAM, progress) | `[ ]` | `src/gguf/staged.rs` |
 | PH-104 | quant-блоки Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 (dequant) | `[ ]` | `src/core/quant.rs` |
 | PH-105 | GGUF tokenizer metadata (BPE) міст | `[ ]` | `src/gguf/tok.rs` |

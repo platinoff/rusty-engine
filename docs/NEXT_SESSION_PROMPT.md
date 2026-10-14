@@ -13,20 +13,29 @@ pure-Rust MoE-двигун (GGUF-first), MIT, під GSV-хабом. Workspace +
 `gsv.code-workspace` + ticket-сценарії. Перший локальний коміт зроблено (**без push** —
 push лише в B11 з згодою owner).
 
-## Наступний крок (B1 — GGUF-чанкер)
+## Наступний крок (B1 продовження — PH-103..107)
 
-1. `gsv_tickets_create { product:"rusty-engine", scenario_id:"rusty-engine-gguf" }` (або
-   `gsv_tickets_hook { source:"scenario", id:"rusty-engine-gguf" }`) — 7 тікетів `PH-101..107`.
-2. Drain: GGUF v3 header+KV (`src/gguf.rs`) → tensor-info table → mmap/mlock staged loader
-   → dequant-блоки Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 → tiny-GGUF fixture `tests/gguf_roundtrip.rs`
-   → `rusty inspect <model.gguf>`.
-3. Додати перші нестд-залежності (`memmap2`, опційно `half`) — тепер це легітимно (B1).
-4. `cargo xtask check` → record + один локальний коміт (без push).
+`PH-101` (header+KV) і `PH-102` (tensor-info) **done** — `src/gguf.rs` `parse()`,
+`docs/research/gguf-format.md` (кеш фактажу). Далі — зріз, що **потребує залежностей**:
+
+1. `PH-103` mmap/mlock staged loader → додати `memmap2` (перша не-std залежність;
+   тепер легітимно; перевірити, чи cargo має мережу/vendor-регістр ДО старту).
+2. `PH-104` dequant Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 → точні block-sizes з `ggml-common.h`.
+3. `PH-105` BPE-токенізер (`tokenizer.ggml.*`) · `PH-106` **real** tiny-GGUF fixture
+   round-trip (валідація проти справжнього файлу, не synth) · `PH-107` `rusty inspect`.
+4. Research → **explore-subagent** (тягне llama.cpp-семантику окремо; основний контекст не
+   засмічує) → результат дописати в `docs/research/`.
+
+## Контекст-дисципліна (кожен бенд «мільйон»)
+
+Один agi-зріз = обмежений тікетами → std-only попереду → deps-зріз окремо → HANDOFF/NEXT
+несуть стан → **один локальний коміт**. Фактаж кешуємо в `docs/research/`, ресерч — у
+subagent-ах. Не тягну весь llama.cpp/vLLM у вікно за раз.
 
 ## Тікети на дошці
 
-- `rusty-engine-bootstrap` (B0) — відкрити→done у сесії 2026-10-14.
-- `rusty-engine-gguf` (B1) — ready-to-hook.
+- `rusty-engine-bootstrap` (B0) — 10/10 **done** (сесія 2026-10-14).
+- `rusty-engine-gguf` (B1) — банда створена: `PH-101`/`PH-102` **done**, `PH-103..107` **open**.
 - `rusty-engine-moe-core` (B4) — ready-to-hook (марquee-діференціатор: native MoE forward).
 
 ## Reminder (session law)
