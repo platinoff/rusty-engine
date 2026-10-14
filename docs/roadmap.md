@@ -83,7 +83,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-201d | **fused Q5_0 dot/gemv** (closes the quant matrix) | `[x]` | `src/kernel.rs` — `dot_q5_0`(d@0/qh@2/qs@6, −16 bias, 5th-bit `qh>>j`) + `matvec_q5_0`; == `dot(dequant_q5_0, b)` / `matvec(dequant_q5_0)`; 2 unit |
 | PH-204 | **fused dequant+dot** K-quant (Q4_K/Q5_K/Q6_K, stack `[f32;256]`, no Vec) | `[x]` | `src/kernel.rs` — `dot_q{4,5,6}_k` + `matvec_q{4,5,6}_k` macro (relative-parity vs `dot(dequant_qX_k, b)`, 4 unit) |
 | PH-202 | **repack** у compute-friendly layout (contiguous scales + de-interleaved nibble planes) | `[x]` | `src/repack.rs` — `RepackedQ4_0 {d,lo,hi}` + `RepackedQ8_0 {d,v}` + `repack_q{4,5}_*` + `dot_repacked_q{4,5}_*` + `matvec_repacked_q4_0`; **exact** vs `dot_q4_0` / `dot_q8_0` / `matvec(dequant, x)` (5 unit) |
-| PH-203 | **SSE/AVX/NEON dispatch** (x86 SSE2 first) | `[~]` | `src/kernel.rs` — `dot_q4_0_sse2` (`core::arch` SSE2, split-half 4-wide, `hsum_ps_sse2` reduce, `#[target_feature]`) + `dot_q4_0_dispatch`/`matvec_q4_0_dispatch` (runtime `is_x86_feature_detected!`, scalar fallback); `#[cfg(x86_64)]` SSE2==scalar (1e-3). AVX2/NEON → далі |
+| PH-203 | **SSE/AVX/NEON dispatch** (x86 SSE2: Q4_0+Q8_0) | `[~]` | `src/kernel.rs` — `dot_q4_0_sse2` + `dot_q8_0_sse2` (`core::arch` SSE2, 4-wide, `hsum_ps_sse2`, `#[target_feature]`) + `dot/matvec_{q4,q8}_0_dispatch` (runtime `is_x86_feature_detected!`, scalar fallback); `#[cfg(x86_64)]` parity SSE2==scalar (1e-3/1e-2). AVX2/NEON → далі |
 | PH-205 | bench vs scalar (+ vs llama-rs підлога) | `[ ]` | `benches/quant.rs` |
 
 ---

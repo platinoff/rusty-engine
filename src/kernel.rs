@@ -341,6 +341,60 @@ pub fn matvec_q4_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32]) -> Vec<f32>
         .collect()
 }
 
+/// SSE2 `dot(dequant_q8_0(a), b)` — `PH-203b`. Four `i8` per lane via a `[i32;4]` gather,
+/// `_mm_cvtepi32_ps` × broadcast scale × `b`, SSE2 reduce. Mirrors [`dot_q8_0`] to 1e-2.
+///
+/// # Safety
+/// Requires SSE2 (runtime-detected or x86_64 baseline). `a.len()` multiple of 34 and
+/// `b.len() == a.len()/34*32` (both debug-asserted).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+pub unsafe fn dot_q8_0_sse2(a: &[u8], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = a.len() / 34;
+    debug_assert_eq!(a.len(), nb * 34, "dot_q8_0_sse2: partial block");
+    debug_assert_eq!(b.len(), nb * 32, "dot_q8_0_sse2: vector length mismatch");
+    let mut acc = _mm_setzero_ps();
+    for (k, blk) in a.chunks_exact(34).enumerate() {
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dv = _mm_set1_ps(d);
+        let qs = &blk[2..];
+        let bo = k * 32;
+        for jj in (0..32).step_by(4) {
+            let mut v = [0i32; 4];
+            for t in 0..4 {
+                v[t] = qs[jj + t] as i8 as i32;
+            }
+            let vv = _mm_mul_ps(dv, _mm_cvtepi32_ps(_mm_loadu_si128(v.as_ptr().cast())));
+            acc = _mm_add_ps(acc, _mm_mul_ps(vv, _mm_loadu_ps(b.as_ptr().add(bo + jj))));
+        }
+    }
+    hsum_ps_sse2(acc)
+}
+
+/// Runtime-dispatched Q8_0 dot: SSE2 when detected, else the scalar oracle.
+pub fn dot_q8_0_dispatch(a: &[u8], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("sse2") {
+            // SAFETY: gated by the runtime SSE2 check above.
+            return unsafe { dot_q8_0_sse2(a, b) };
+        }
+    }
+    dot_q8_0(a, b)
+}
+
+/// Row-major `W[m×n]` Q8_0, times `x[n]`, via the dispatched dot.
+pub fn matvec_q8_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matvec_q8_0_dispatch: n%32");
+    let row_bytes = n / 32 * 34;
+    debug_assert_eq!(w.len(), m * row_bytes, "matvec_q8_0_dispatch: weight size");
+    debug_assert_eq!(x.len(), n, "matvec_q8_0_dispatch: input width");
+    (0..m)
+        .map(|r| dot_q8_0_dispatch(&w[r * row_bytes..(r + 1) * row_bytes], x))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +516,32 @@ mod tests {
         let simd = unsafe { dot_q4_0_sse2(&a, &b) };
         let scalar = dot_q4_0(&a, &b);
         assert!((simd - scalar).abs() < 1e-3, "sse2={simd} scalar={scalar}");
+    }
+
+    #[test]
+    fn dot_q8_0_dispatch_matches_scalar() {
+        let a = q8_blocks(6);
+        let b: Vec<f32> = (0..a.len() / 34 * 32)
+            .map(|i| (i as f32) * 0.03 - 9.0)
+            .collect();
+        let d = dot_q8_0_dispatch(&a, &b);
+        let s = dot_q8_0(&a, &b);
+        assert!((d - s).abs() < 1e-2, "dispatch={d} scalar={s}");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dot_q8_0_sse2_matches_scalar() {
+        if !std::is_x86_feature_detected!("sse2") {
+            return;
+        }
+        let a = q8_blocks(5);
+        let b: Vec<f32> = (0..a.len() / 34 * 32)
+            .map(|i| (i as f32) * 0.04 - 11.0)
+            .collect();
+        let simd = unsafe { dot_q8_0_sse2(&a, &b) };
+        let scalar = dot_q8_0(&a, &b);
+        assert!((simd - scalar).abs() < 1e-2, "sse2={simd} scalar={scalar}");
     }
 
     #[test]
