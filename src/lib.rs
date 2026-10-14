@@ -24,6 +24,7 @@ pub mod moe;
 pub mod node;
 pub mod quant;
 pub mod serve;
+pub mod tokenizer;
 
 /// Crate name as reported by `rusty --version` / `banner()`.
 pub const CRATE_NAME: &str = "rusty-engine";

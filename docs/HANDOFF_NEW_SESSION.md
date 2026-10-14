@@ -39,16 +39,16 @@ MoE-двигун** (GGUF-first), MIT, під GSV-хабом. Рішення owne
 
 ## Наступний крок
 
-**B1 — GGUF-чанкер (частково):** `[~]` — **закрито** `PH-101` header+KV (усі `GGUF_TYPE_*`,
-вкладені arrays), `PH-102` tensor-info (`TensorEntry`+`ggml_dtype`), `PH-103` mmap/staged
-loader (`src/loader.rs`: `MmapModel`/`lock_pages`(unix)/`staged_read`+progress — **перша
-не-std залежність `memmap2`**, регістр перевірено на старті), `PH-106` disk round-trip,
-`PH-107` `rusty inspect`. **33 тести**, clippy `-D` 0. Фактаж — `docs/research/gguf-format.md` + `docs/research/ggml-blocks.md`.
+**B1 — GGUF-чанкер:** `[x]` **ЗАВЕРШЕНО** (усі PH-101..107) — GGUF-контейнер читається
+повністю в Rust без llama.cpp. **35 тестів**, clippy `-D` 0. Фактаж — `docs/research/gguf-format.md`
++ `docs/research/ggml-blocks.md` (cached через explore-subagent).
 
-Додав `PH-104` (`src/quant.rs`): `f16_to_f32`, `block_info`/`bytes_for_numel` для **усіх 5**
-(Q4_0/Q8_0/Q4_K/Q5_K/Q6_K = 18/34/144/176/210 B/block — offset-математика готова), скалярний
-`dequant_q4_0` (**split-half**, не 2i/2i+1) + `dequant_q8_0` (signed); K-quant *dequant math* → B2.
+- `PH-101/102` `src/gguf.rs` — `parse()` header+KV (усі `GGUF_TYPE_*`, вкладені arrays) + tensor-info (`TensorEntry`/`ggml_dtype`).
+- `PH-103` `src/loader.rs` — `MmapModel::open` (zero-copy, `memmap2` — **перша не-std залежність**, регістр перевірено на старті), `lock_pages`(unix-gated), `staged_read` disk→RAM + progress, `load_staged`.
+- `PH-104` `src/quant.rs` — `f16_to_f32`; `block_info`/`bytes_for_numel` для **усіх 5** (18/34/144/176/210 B/block); scalar `dequant_q4_0` (**split-half**) + `dequant_q8_0` (signed); K-quant *dequant math* → **B2**.
+- `PH-105` `src/tokenizer.rs` — `TokenizerMeta::from_file` (model/tokens/token_type/scores/merges/bos/eos/pre + accessors); BPE-алгоритм → **B3**.
+- `PH-106` disk round-trip (`parse_file` read synth `.gguf` з диска); `PH-107` `rusty inspect` CLI.
 
-Решта B1 — **open**: `PH-105` BPE tokenizer-metadata ingest (`tokenizer.ggml.tokens/scores/
-token_type/merges/bos/eos/...`) — ключі в `docs/research/ggml-blocks.md`. Далі глибина: **B3
-dense-forward** і **B4 MoE-ядро**. Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
+**Наступний крок:** B2 (`PH-201` scalar reference kernels) — або стрибок до **B4 MoE-ядро**
+(`rusty-engine-moe-core` ready: `PH-401/402/403` router/swiglu/shared-expert — pure-f32, testable
+без повного пайплайну). Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.

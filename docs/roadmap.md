@@ -43,14 +43,14 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B1 — GGUF-чанкер (pure Rust)  **`[~]` (PH-101/102/103/104/106/107 done, 2026-10-14)**
+## Band B1 — GGUF-чанкер (pure Rust)  **`[x]` (усі PH-101..107 done, 2026-10-14)**
 
-> Мета: прочитати реальний GGUF-MoE-файл без llama.cpp. Тест на tiny-фікsturі.
-> Локальний фактаж формату: [`docs/research/gguf-format.md`](research/gguf-format.md) +
+> Мета: прочитати реальний GGUF-MoE-файл без llama.cpp. **Досягнуто** — контейнер цілком
+> в Rust. Фактаж: [`docs/research/gguf-format.md`](research/gguf-format.md) +
 > [`docs/research/ggml-blocks.md`](research/ggml-blocks.md).
-> **Контекст-дисципліна:** std-only (101/102/106/107), mmap `103` (`memmap2`) і `104`
-> (block-sizes усіх 5 + scalar dequant Q4_0/Q8_0; K-quant dequant → B2) — зроблено.
-> Лишився `105` (BPE tokenizer-metadata ingest) — останній зріз контейнера.
+> **Контекст-дисципліна:** std-only (101/102/106/107), mmap `103` (`memmap2`), `104`
+> (block-sizes усіх 5 + scalar dequant Q4_0/Q8_0) і `105` (tokenizer-metadata ingest) —
+> **B1 завершено**. K-quant dequant math → B2; BPE-алгоритм → B3.
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
@@ -58,7 +58,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-102 | tensor-info table (name/dims/dtype/offset) | `[x]` | `src/gguf.rs` — `TensorEntry`/`ggml_dtype`, round-trip synth |
 | PH-103 | mmap/mlock staged loader (disk→RAM, progress) | `[x]` | `src/loader.rs` — `MmapModel::open`/`lock_pages`(unix)/`staged_read`(+progress)/`load_staged`; `memmap2`; 3 unit |
 | PH-104 | quant-блоки: sizes усіх 5 + scalar dequant Q4_0/Q8_0 (K-quant → B2) | `[x]` | `src/quant.rs` — `block_info`/`bytes_for_numel`/`dequant`+`f16_to_f32`; 6 unit |
-| PH-105 | GGUF tokenizer metadata (BPE) міст | `[ ]` | `src/gguf/tok.rs` |
+| PH-105 | tokenizer-metadata ingest (model/tokens/type/scores/merges/bos/eos/pre) | `[x]` | `src/tokenizer.rs` — `TokenizerMeta::from_file`; 2 unit |
 | PH-106 | round-trip на disk (write synth GGUF → read via `parse_file`) | `[x]` | `src/gguf.rs` — `round_trips_a_real_file_via_std_io` (real `.gguf` bytes) |
 | PH-107 | CLI `rusty inspect model.gguf` | `[x]` | `src/bin/rusty.rs` — `inspect()` summary + graceful errors |
 

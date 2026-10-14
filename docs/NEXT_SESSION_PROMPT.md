@@ -6,23 +6,18 @@
 
 ## Стан
 
-**B0 = `[x]`** (2026-10-14). Створено portable-plugin `S:/rust/rusty-engine`:
-pure-Rust MoE-двигун (GGUF-first), MIT, під GSV-хабом. Workspace + bin `rusty` + `xtask`
-збираються, **17 тестів green**, clippy 0. Rust-MoE `top_k`-роутер реалізовано й
-протестовано до будь-якого модельного IO. Зареєстровано в `PRODUCTS.md` +
-`gsv.code-workspace` + ticket-сценарії. Перший локальний коміт зроблено (**без push** —
-push лише в B11 з згодою owner).
+**B0 = `[x]`** (2026-10-14) — portable-plugin `S:/rust/rusty-engine`: pure-Rust MoE-двигун
+(GGUF-first), MIT, під GSV-хабом; workspace + bin `rusty` + `xtask`; Rust-MoE `top_k`-роутер.
+**B1 = `[x]`** (2026-10-14) — GGUF-чанкер завершено: header+KV→tensor-info→mmap/staged→
+block-sizes+Q4_0/Q8_0 dequant→tokenizer-meta. **35 тестів**, clippy `-D` 0. Коміти локальні,
+**без push** (GitHub remote — B11 `PH-1105`).
 
-## Наступний крок (B1 — лишився PH-105, далі B3/B4)
+## Наступний крок (B4 MoE-ядро — марquee, std-testable)
 
-Done: `PH-101/102` (`parse()`), `PH-103` (mmap+staged loaders `src/loader.rs`, `memmap2`),
-`PH-104` (quant `src/quant.rs`: block-sizes усіх 5 + scalar dequant Q4_0/Q8_0; K-quant dequant
-→ B2), `PH-106` (disk round-trip), `PH-107` (`rusty inspect`). Фактаж — `docs/research/`.
-
-1. `PH-105` tokenizer-**metadata ingest** (`tokenizer.ggml.tokens/scores/token_type/merges/bos/eos/pre`)
-   → `src/tokenizer.rs` `TokenizerMeta::from_file(&GgufFile)` (не сам BPE-алгоритм — той у B3).
-2. Далі — **B3 dense-forward** (RMSNorm/attn/RoPE/paged-KV/sampler) і **B4 MoE-ядро**
-   (`rusty-engine-moe-core` ready) — марquee-діференціатор.
+`rusty-engine-moe-core` (ready) — `PH-401/402/403`: router (top-k/softmax/sigmoid), expert-FFN
+SwiGLU (gate/up/down + silu), shared-expert merge — усе pure-f32, unit-тестоване без повного
+пайплайну (attn/KV = B3). Фактаж роутера — з llama.cpp `qwen3moe`/`deepseek2` (explore-subagent).
+Опційно паралельно — **B2** (`PH-201` scalar kernels + K-quant dequant): вузьке місце швидкості.
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
 
@@ -33,7 +28,7 @@ subagent-ах. Не тягну весь llama.cpp/vLLM у вікно за раз
 ## Тікети на дошці
 
 - `rusty-engine-bootstrap` (B0) — 10/10 **done** (сесія 2026-10-14).
-- `rusty-engine-gguf` (B1) — банда створена: `PH-101/102/103/104/106/107` **done**, `PH-105` **open**.
+- `rusty-engine-gguf` (B1) — банда **завершена**: `PH-101..107` усі **done** (2026-10-14).
 - `rusty-engine-moe-core` (B4) — ready-to-hook (марquee-діференціатор: native MoE forward).
 
 ## Reminder (session law)
