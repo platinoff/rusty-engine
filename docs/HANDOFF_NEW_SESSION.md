@@ -86,5 +86,5 @@ byte-fallback, specials). Plan loop — `docs/research/gguf-tensor-offsets.md`. 
 `ggml_dtype(6)` → **real `token_embd` (Q5_0) dequantize 136 134 656 finite → embedding розблоковано**,
 offset самозгоджений з наступним тензором. **+`PH-305c`**: `src/model.rs` `ModelConfig::from_file`
 (arch + `<arch>.*/general.*` → n_layers/d_model/heads/kv_heads/d_ff/vocab/rope_base/rms_eps/experts)
-**73 тести**, clippy `-D` 0. **+`PH-305d`**: `src/forward.rs` `block_forward` (rmsnorm→multi-head GQA attn+RoPE→residual→rmsnorm→SwiGLU FFN→residual) + `logits_from_hidden`, верифіковано toy-ораклом (residual-identity + відомий greedy-токен). **77 тести**, clippy `-D` 0.
+**73 тести**, clippy `-D` 0. **+`PH-305d`**: `src/forward.rs` `block_forward` (rmsnorm→multi-head GQA attn+RoPE→residual→rmsnorm→SwiGLU FFN→residual) + `logits_from_hidden`, верифіковано toy-ораклом (residual-identity + відомий greedy-токен). **`PH-305e`**: `ModelConfig::validate` (імʼя+dims кожного тензора vs геометрія конфігу) + CLI `rusty validate` → **real Qwen2.5 = OK (усі 24 шари dims-збіг)**; qwen2 фінальна норма = `output_norm.weight` (+ синт match/mismatch). **77 тести**, clippy `-D` 0.
 `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.

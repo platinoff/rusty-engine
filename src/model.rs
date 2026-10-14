@@ -4,6 +4,11 @@
 //! [`ModelConfig`] that the forward loop (`PH-305`) needs: layer count, widths, head
 //! counts (GQA), FFN size, RoPE base, RMSNorm eps, vocab, and MoE expert counts. Pure
 //! `std`, unit-tested on a synthetic config and validated live on a real Qwen2.5 GGUF.
+//!
+//! `PH-305e` adds [`ModelConfig::validate`]: resolves every expected tensor by name and
+//! checks its `dims` against the config-derived geometry — a genuinely verifiable gate
+//! (independent of attention numerics) that a real model exposes exactly the tensors the
+//! forward loop will read. Optional per-head norms / biases are checked only if present.
 
 use crate::core::{EngineError, Result};
 use crate::gguf::{GgufFile, Value};
@@ -99,6 +104,71 @@ impl ModelConfig {
             n_experts_used: opt_usize("expert_used_count", 0),
             eos_token_id,
         })
+    }
+
+    /// Resolve every tensor the forward loop will read and check its `dims` against the
+    /// config-derived geometry. Returns a list of problems (empty ⇒ the file exposes exactly
+    /// what the architecture promises). A verifiable name+dims gate — independent of attention
+    /// numerics — so a real model is checked before we trust a forward pass over it.
+    pub fn validate(&self, file: &GgufFile) -> Vec<String> {
+        let mut errs = Vec::new();
+        let (dm, hd) = (self.d_model, self.head_dim());
+        let (kv, nh, ff, nv) = (
+            self.n_kv_heads * self.head_dim(),
+            self.n_heads * self.head_dim(),
+            self.d_ff,
+            self.n_vocab,
+        );
+        let req = |name: &str, dims: &[usize], errs: &mut Vec<String>| match file
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+        {
+            Some(t) if t.dims == dims => {}
+            Some(t) => errs.push(format!("{name}: dims {:?} != expected {dims:?}", t.dims)),
+            None => errs.push(format!("missing required tensor '{name}'")),
+        };
+        let opt = |name: &str, dims: &[usize], errs: &mut Vec<String>| {
+            if let Some(t) = file.tensors.iter().find(|t| t.name == name) {
+                if t.dims != dims {
+                    errs.push(format!("{name}: dims {:?} != expected {dims:?}", t.dims));
+                }
+            }
+        };
+        // At least one of the names must be present with these dims (naming varies by arch:
+        // llama/qwen2 use `output_norm.weight`; others `norm.weight`).
+        let req_any = |names: &[&str], dims: &[usize], errs: &mut Vec<String>| match names
+            .iter()
+            .find_map(|n| file.tensors.iter().find(|t| &t.name == n))
+        {
+            Some(t) if t.dims == dims => {}
+            Some(t) => errs.push(format!(
+                "{}: dims {:?} != expected {dims:?}",
+                t.name, t.dims
+            )),
+            None => errs.push(format!("missing any of {names:?}")),
+        };
+        req("token_embd.weight", &[dm, nv], &mut errs);
+        req("output.weight", &[dm, nv], &mut errs);
+        req_any(&["output_norm.weight", "norm.weight"], &[dm], &mut errs);
+        for i in 0..self.n_layers {
+            let p = format!("blk.{i}.");
+            req(&format!("{p}attn_norm.weight"), &[dm], &mut errs);
+            req(&format!("{p}attn_q.weight"), &[dm, dm], &mut errs);
+            req(&format!("{p}attn_k.weight"), &[dm, kv], &mut errs);
+            req(&format!("{p}attn_v.weight"), &[dm, kv], &mut errs);
+            req(&format!("{p}attn_output.weight"), &[dm, nh], &mut errs);
+            opt(&format!("{p}attn_q_norm.weight"), &[hd], &mut errs);
+            opt(&format!("{p}attn_k_norm.weight"), &[hd], &mut errs);
+            opt(&format!("{p}attn_q.bias"), &[dm], &mut errs);
+            opt(&format!("{p}attn_k.bias"), &[kv], &mut errs);
+            opt(&format!("{p}attn_v.bias"), &[kv], &mut errs);
+            req(&format!("{p}ffn_norm.weight"), &[dm], &mut errs);
+            req(&format!("{p}ffn_gate.weight"), &[dm, ff], &mut errs);
+            req(&format!("{p}ffn_up.weight"), &[dm, ff], &mut errs);
+            req(&format!("{p}ffn_down.weight"), &[ff, dm], &mut errs);
+        }
+        errs
     }
 }
 
@@ -197,5 +267,68 @@ mod tests {
         u64le(&mut b, 0);
         let file = crate::gguf::parse(&b).unwrap();
         assert!(ModelConfig::from_file(&file).is_err());
+    }
+
+    fn tninfo(b: &mut Vec<u8>, name: &str, dims: &[usize], ggml: u32, offset: u64) {
+        put_str(b, name);
+        u32le(b, dims.len() as u32);
+        for &d in dims {
+            u64le(b, d as u64);
+        }
+        u32le(b, ggml);
+        u64le(b, offset);
+    }
+
+    /// qwen2 config (dm4, heads2, kv1 -> head2, kv_dim2, nh_dim4, ff8, vocab5) + 12 tensors.
+    fn synth_model(bad_k: bool) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(GGUF_MAGIC);
+        u32le(&mut b, 3);
+        u64le(&mut b, 12); // n_tensors
+        u64le(&mut b, 7); // n_kv
+        put_str(&mut b, "general.architecture");
+        u32le(&mut b, 8);
+        put_str(&mut b, "qwen2");
+        kv_u32(&mut b, "qwen2.embedding_length", 4);
+        kv_u32(&mut b, "qwen2.block_count", 1);
+        kv_u32(&mut b, "qwen2.attention.head_count", 2);
+        kv_u32(&mut b, "qwen2.attention.head_count_kv", 1);
+        kv_u32(&mut b, "qwen2.feed_forward_length", 8);
+        kv_u32(&mut b, "qwen2.vocab_size", 5);
+        tninfo(&mut b, "token_embd.weight", &[4, 5], 0, 0);
+        tninfo(&mut b, "output.weight", &[4, 5], 0, 0);
+        tninfo(&mut b, "norm.weight", &[4], 0, 0);
+        tninfo(&mut b, "blk.0.attn_norm.weight", &[4], 0, 0);
+        tninfo(&mut b, "blk.0.attn_q.weight", &[4, 4], 0, 0);
+        tninfo(
+            &mut b,
+            "blk.0.attn_k.weight",
+            &[4, if bad_k { 3 } else { 2 }],
+            0,
+            0,
+        );
+        tninfo(&mut b, "blk.0.attn_v.weight", &[4, 2], 0, 0);
+        tninfo(&mut b, "blk.0.attn_output.weight", &[4, 4], 0, 0);
+        tninfo(&mut b, "blk.0.ffn_norm.weight", &[4], 0, 0);
+        tninfo(&mut b, "blk.0.ffn_gate.weight", &[4, 8], 0, 0);
+        tninfo(&mut b, "blk.0.ffn_up.weight", &[4, 8], 0, 0);
+        tninfo(&mut b, "blk.0.ffn_down.weight", &[8, 4], 0, 0);
+        b
+    }
+
+    #[test]
+    fn validates_matching_tensor_geometry() {
+        let file = crate::gguf::parse(&synth_model(false)).unwrap();
+        let c = ModelConfig::from_file(&file).unwrap();
+        assert_eq!(c.validate(&file), Vec::<String>::new());
+    }
+
+    #[test]
+    fn validate_flags_dim_mismatch() {
+        let file = crate::gguf::parse(&synth_model(true)).unwrap();
+        let c = ModelConfig::from_file(&file).unwrap();
+        let errs = c.validate(&file);
+        assert_eq!(errs.len(), 1, "got {errs:?}");
+        assert!(errs[0].contains("attn_k"), "{errs:?}");
     }
 }

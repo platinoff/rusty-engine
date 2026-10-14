@@ -19,6 +19,7 @@ fn main() {
             println!("  inspect <file>            GGUF metadata summary      (PH-107)");
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  config <file>             read model hyperparameters (PH-305c)");
+            println!("  validate <file>           check tensor names/dims vs config (PH-305e)");
             println!("  run -m <model>            generate text              (band B3)");
             println!("  serve                     OpenAI-compat server       (band B5)");
             println!("  node                      Wi-Fi slave runtime        (band B7)");
@@ -42,6 +43,13 @@ fn main() {
             Some(path) => config(&path),
             None => {
                 eprintln!("usage: rusty config <model.gguf>");
+                std::process::exit(2);
+            }
+        },
+        Some("validate") => match args.next() {
+            Some(path) => validate(&path),
+            None => {
+                eprintln!("usage: rusty validate <model.gguf>");
                 std::process::exit(2);
             }
         },
@@ -181,6 +189,40 @@ fn config(path: &str) {
         },
         Err(e) => {
             eprintln!("rusty config {path}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Check that every tensor the forward loop needs is present with the right dims (PH-305e).
+fn validate(path: &str) {
+    let f =
+        match rusty_engine::gguf::parse_file(Path::new(path), rusty_engine::gguf::INSPECT_WINDOW) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("rusty validate {path}: {e}");
+                std::process::exit(1);
+            }
+        };
+    let cfg = match rusty_engine::model::ModelConfig::from_file(&f) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("rusty validate {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    match cfg.validate(&f) {
+        problems if problems.is_empty() => {
+            println!(
+                "{path}: OK — [{}] {} layers, all expected tensors present with matching dims",
+                cfg.arch, cfg.n_layers
+            );
+        }
+        problems => {
+            println!("{path}: {} problem(s):", problems.len());
+            for p in problems.iter().take(30) {
+                println!("  - {p}");
+            }
             std::process::exit(1);
         }
     }
