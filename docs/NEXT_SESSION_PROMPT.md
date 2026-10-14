@@ -36,19 +36,34 @@ synth round-trip). **+ B3 `PH-307` incremental decode + KV** (`forward::LayerKv`
 еквівалентність). **+ B3 `PH-304b` sampler wiring** (`GenerationOptions.repetition_penalty`,
 `infer::SeedRng` xorshift64*, `DenseRunner::generate_with` — temp/top-k/top-p/repetition,
 `temp<=0`==greedy). **+ B4 `PH-404b` MoE forward через cache** (`moe_layer_forward_cached`
-→ `get_or_load` per expert; == resident forward при детерм. loader). **+ B2 `PH-201d` fused Q5_0 dot/gemv** (closes quant matrix). **+ B4 `PH-401b` exact `noaux_tc` routing** (`route_noaux_tc` — group score = sum of top-2, distinguishes from `route_group`). **+ B4 `PH-403b` MoE block forward** (`attention_forward_cached` core + `moe_block_forward`; 1-expert==dense 1e-5). **+ B5 `PH-501a` std-only HTTP serve** (`src/http.rs` pure `route()` + `src/serve.rs` TcpListener pump + `rusty serve`; loopback wire-тест). **+ B5 `PH-502` SSE-стрімінг** (`sse_body` chunk-події + `[DONE]`, `route` → `text/event-stream`). **135 тести** (124 lib + 5 dense + 2 text + 4
+→ `get_or_load` per expert; == resident forward при детерм. loader). **+ B2 `PH-201d` fused Q5_0 dot/gemv** (closes quant matrix). **+ B4 `PH-401b` exact `noaux_tc` routing** (`route_noaux_tc` — group score = sum of top-2, distinguishes from `route_group`). **+ B4 `PH-403b` MoE block forward** (`attention_forward_cached` core + `moe_block_forward`; 1-expert==dense 1e-5). **+ B5 `PH-501a` std-only HTTP serve** (`src/http.rs` pure `route()` + `src/serve.rs` TcpListener pump + `rusty serve`; loopback wire-тест). **+ B5 `PH-502` SSE-стрімінг** (`sse_body` chunk-події + `[DONE]`, `route` → `text/event-stream`). **+ B5 `PH-504` keep-live heartbeat** (`hub::Heartbeat`/`is_fresh`/`write_heartbeat`; serve stamp при startup+кожне conn; CLI `rusty heartbeat`). **138 тести** (127 lib + 5 dense + 2 text + 4
 scaffold), clippy `-D` 0, ratio Rust ~96%. Модель у `data/models/` (gitignored).
 **Checkpoint:** зріз стану — `docs/STATUS.md`; порівняння рушіїв —
 `docs/research/engine-landscape-2026.md`; offset-семантика — `docs/research/`.
 
-Наступна `agi` обирає:
-1. **`PH-405` llama/HF greedy-parity** (⭐ gate): perplexity-smoke + greedy token match на
-   коротких промптах проти llama-rs (підлога вже живе) + byte-exact `tokenizer.json`
-   (qwen2 vocab/merges/pre) vs `Bpe` — чисельна + токенайзаційна довіра до `PH-305/305b`.
-3. **B2 залізо** `PH-203/205` — SSE/AVX/NEON dispatch поверх `repack` (std-testable,
-   без референсу) + `cargo bench` проти oracle. `PH-202` repack **вже done**.
-4. **B4 `PH-406`** run Qwen3-30B-A3B / Mixtral GGUF (реальна MoE-модель + expert-цикл на
-   деquant-тензорах + `PH-404` cache). `PH-405` llama/HF greedy-parity (оракул) — gate.
+## Порядок `agi` за логікою побудови (strict queue)
+
+Порядок смуг (roadmap): `фундамент → GGUF → quant → dense → MoE → **serve → build-matrix →
+docker → supervisor → dist-MoE → UI → distribs/publish**`. B1–B4 закриті (крім parity/run на
+зовнішніх даних). Черга `agi` по максимуму, кожен зріз = тікет + один локальний коміт:
+
+1. **B5 serve** — `PH-504` keep-live heartbeat `target/live/rusty_heartbeat.json` (15s tick,
+   `hub.rs`) · `PH-505` метрики tok/s·RAM·active-experts endpoint · `PH-503` prompt-slot.
+2. **B6 build-matrix** — `PH-601` `rusty.exe` gnu+msvc · `PH-602` Linux x86_64 · `PH-603`
+   aarch64 · `PH-604` Android arm64 (cargo-ndk/Termux, **no Docker**) · `PH-605`
+   `cargo xtask build-matrix` + SHA-256 · `PH-606` feature-gated backends.
+3. **B7 docker** — `PH-701` bollard client · `PH-702` образ · `PH-703` LAN/Wi-Fi expose
+   (band-233 LAN-first) · `PH-704` dry-run/`--live` gate · `PH-705` lifecycle contract.
+4. **B8 supervisor (Rust k8s-lite)** — `PH-801..807` registry/heartbeat/lease/placement/
+   watchdog + MCP `gsv://` fleet.
+5. **B9 dist-MoE** — `PH-901..906` expert-parallel sharding + cross-node KV.
+6. **B10 UI** — `PH-1001..1006` Rust-рендер `src/ui.rs` + ui-glue LOC-ratchet.
+7. **B11 distribs/publish** — `PH-1101..1106` semver/CHANGELOG · `xtask dist` · MIT
+   attribution · **GitHub push (owner згода — єдиний дозволений push)**.
+
+**Зовнішні гейти (чекають owner/підлогу, NOT pure-`agi` std-slice):** `PH-405` llama-rs
+greedy-parity (оракул) · `PH-406` real MoE `.gguf` у `data/models/` · `PH-203` SIMD
+(`core::arch`, arch-gated). Ці робляться окремими зрізами коли підлога готова.
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
 

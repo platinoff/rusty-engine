@@ -38,8 +38,17 @@ pub fn handle_conn(stream: &mut TcpStream) -> std::io::Result<()> {
 }
 
 /// Bind `addr` (typically `127.0.0.1:PORT`) and serve forever. Blocks the calling thread.
+/// Keeps the GSV hub alive mirror (`PH-504`) by stamping `rusty_heartbeat.json` at startup
+/// and after every handled connection (a busy loopback tool stays fresh; the hub's
+/// `HEARTBEAT_FRESH_SECS=60s` window tolerates idle gaps between requests).
 pub fn serve(addr: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
+    let live_dir = std::path::Path::new("target/live");
+    let start = std::time::Instant::now();
+    let _ = crate::hub::write_heartbeat(
+        live_dir,
+        &crate::hub::Heartbeat::new(start.elapsed().as_secs()),
+    );
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {
@@ -47,6 +56,10 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
                     // Fail-open: a broken client must not kill the loop (watchdog-friendly).
                     continue;
                 }
+                let _ = crate::hub::write_heartbeat(
+                    live_dir,
+                    &crate::hub::Heartbeat::new(start.elapsed().as_secs()),
+                );
             }
             Err(_) => continue,
         }

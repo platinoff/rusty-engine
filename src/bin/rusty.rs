@@ -23,6 +23,7 @@ fn main() {
             println!("  run -m <model> -p <text>  BPE text generation        (PH-306b)");
             println!("  run -m <model> -t <ids>   numeric-token greedy       (PH-306)");
             println!("  serve [--port N]          std-only OpenAI-compat HTTP (PH-501a)");
+            println!("  heartbeat                 stamp GSV keep-live file   (PH-504)");
             println!("  node                      Wi-Fi slave runtime        (band B7)");
             println!("  hub                       GSV master supervisor      (band B8)");
         }
@@ -56,6 +57,7 @@ fn main() {
         },
         Some("run") => run(args),
         Some("serve") => serve_cmd(args),
+        Some("heartbeat") => heartbeat_cmd(),
         Some(other) => {
             println!(
                 "{}: subcommand '{other}' is scaffolded (bands B1+)",
@@ -367,6 +369,26 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
     if let Err(e) = rusty_engine::serve::serve(&addr) {
         eprintln!("rusty serve {addr}: {e}");
         std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
+/// `rusty heartbeat` — write `target/live/rusty_heartbeat.json` once for the GSV keep-live
+/// hub mirror (PH-504). Uptime is 0 from a one-shot CLI; `rusty serve` keeps it current.
+fn heartbeat_cmd() -> ! {
+    match rusty_engine::hub::write_heartbeat(
+        Path::new("target/live"),
+        &rusty_engine::hub::Heartbeat::new(0),
+    ) {
+        Ok(path) => println!(
+            "{} — heartbeat -> {}",
+            rusty_engine::banner(),
+            path.display()
+        ),
+        Err(e) => {
+            eprintln!("rusty heartbeat: {e}");
+            std::process::exit(1);
+        }
     }
     std::process::exit(0);
 }
