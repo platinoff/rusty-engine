@@ -73,6 +73,63 @@ pub fn write_heartbeat(
     Ok(path)
 }
 
+/// Runtime metrics exposed at `GET /metrics` (PH-505). Pure counters the serve loop
+/// accumulates; `tok_per_sec` is derived and zero-guarded so it never divides by 0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Metrics {
+    pub calls: u64,
+    pub generated_tokens: u64,
+    pub decode_secs: f64,
+    pub active_experts: u64,
+    pub peak_experts: u64,
+}
+
+impl Metrics {
+    pub const fn zero() -> Self {
+        Self {
+            calls: 0,
+            generated_tokens: 0,
+            decode_secs: 0.0,
+            active_experts: 0,
+            peak_experts: 0,
+        }
+    }
+
+    /// Record one completion: `tokens` generated over `secs` of decode, `active_experts`
+    /// materialized in the top layer.
+    pub fn record(&mut self, tokens: u64, secs: f64, active_experts: u64) {
+        self.calls += 1;
+        self.generated_tokens += tokens;
+        self.decode_secs += secs;
+        self.active_experts = active_experts;
+        if active_experts > self.peak_experts {
+            self.peak_experts = active_experts;
+        }
+    }
+
+    /// Tokens per second, 0.0 when no decode time observed.
+    pub fn tok_per_sec(&self) -> f64 {
+        if self.decode_secs <= 0.0 {
+            0.0
+        } else {
+            self.generated_tokens as f64 / self.decode_secs
+        }
+    }
+
+    /// JSON (hand-built, std-only).
+    pub fn to_json(&self) -> String {
+        format!(
+            r#"{{"calls":{},"generated_tokens":{},"decode_secs":{},"tok_per_sec":{},"active_experts":{},"peak_experts":{}}}"#,
+            self.calls,
+            self.generated_tokens,
+            self.decode_secs,
+            self.tok_per_sec(),
+            self.active_experts,
+            self.peak_experts
+        )
+    }
+}
+
 // Compile-time invariant: a worker is only "fresh" over a window at least as
 // wide as its own tick.
 const _: () = assert!(HEARTBEAT_FRESH_SECS >= HEARTBEAT_TICK_SECS);
@@ -120,5 +177,33 @@ mod tests {
         let s = std::fs::read_to_string(&path).expect("read");
         assert!(s.contains("\"alive\":true"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn metrics_zero_never_divides() {
+        assert_eq!(Metrics::zero().tok_per_sec(), 0.0);
+        assert_eq!(Metrics::zero().calls, 0);
+    }
+
+    #[test]
+    fn metrics_record_tracks_rate_and_peak() {
+        let mut m = Metrics::zero();
+        m.record(30, 1.0, 8);
+        m.record(20, 1.0, 4);
+        assert_eq!(m.calls, 2);
+        assert_eq!(m.generated_tokens, 50);
+        assert!((m.tok_per_sec() - 25.0).abs() < 1e-9);
+        assert_eq!(m.active_experts, 4, "last call's active count");
+        assert_eq!(m.peak_experts, 8, "peak retained");
+    }
+
+    #[test]
+    fn metrics_json_shape() {
+        let mut m = Metrics::zero();
+        m.record(1, 0.0, 1);
+        let j = m.to_json();
+        assert!(j.starts_with('{') && j.ends_with('}'));
+        assert!(j.contains("\"generated_tokens\":1"));
+        assert!(j.contains("\"tok_per_sec\":0"));
     }
 }

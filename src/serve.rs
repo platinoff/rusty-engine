@@ -11,14 +11,19 @@ pub const PATH_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 /// Cap on bytes read per request (headers only in the `PH-501a` slice).
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 
-/// Accept, serve and close exactly one connection — the unit `serve` loops over.
-pub fn serve_one(listener: &TcpListener) -> std::io::Result<()> {
+/// Accept, serve and close exactly one connection — the unit `serve` loops over. `metrics`
+/// accumulates across the process lifetime (PH-505 counters).
+pub fn serve_one(listener: &TcpListener, metrics: &mut crate::hub::Metrics) -> std::io::Result<()> {
     let (mut stream, _peer) = listener.accept()?;
-    handle_conn(&mut stream)
+    handle_conn(&mut stream, metrics)
 }
 
-/// Read one request from `stream`, route it (pure, `crate::http`), write the response.
-pub fn handle_conn(stream: &mut TcpStream) -> std::io::Result<()> {
+/// Read one request from `stream`, route it against the live `metrics`, write the response.
+/// A POST to the completions path records a call (0 tokens until real generation is wired).
+pub fn handle_conn(
+    stream: &mut TcpStream,
+    metrics: &mut crate::hub::Metrics,
+) -> std::io::Result<()> {
     let mut buf = vec![0u8; MAX_REQUEST_BYTES];
     let mut filled = 0usize;
     // Read until the header terminator or the cap, so the request line is always present.
@@ -32,7 +37,14 @@ pub fn handle_conn(stream: &mut TcpStream) -> std::io::Result<()> {
             break;
         }
     }
-    let resp = crate::http::route(&buf[..filled]);
+    let resp = crate::http::route_with(&buf[..filled], metrics);
+    if resp.status == 200 && resp.content_type == "application/json" {
+        // Count completions handled (both stream + JSON paths are chat endpoints).
+        let first_line = String::from_utf8_lossy(&buf[..filled]);
+        if first_line.starts_with("POST ") {
+            metrics.record(0, 0.0, 0);
+        }
+    }
     stream.write_all(&resp.to_http_bytes())?;
     stream.flush()
 }
@@ -45,6 +57,7 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     let live_dir = std::path::Path::new("target/live");
     let start = std::time::Instant::now();
+    let mut metrics = crate::hub::Metrics::zero();
     let _ = crate::hub::write_heartbeat(
         live_dir,
         &crate::hub::Heartbeat::new(start.elapsed().as_secs()),
@@ -52,7 +65,7 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {
-                if handle_conn(&mut s).is_err() {
+                if handle_conn(&mut s, &mut metrics).is_err() {
                     // Fail-open: a broken client must not kill the loop (watchdog-friendly).
                     continue;
                 }
@@ -79,7 +92,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
         let addr = listener.local_addr().expect("local_addr");
         let th = std::thread::spawn(move || {
-            serve_one(&listener).expect("serve_one");
+            let mut m = crate::hub::Metrics::zero();
+            serve_one(&listener, &mut m).expect("serve_one");
         });
         let mut client = TcpStream::connect(addr).expect("connect");
         client
@@ -98,7 +112,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
         let addr = listener.local_addr().expect("local_addr");
         let th = std::thread::spawn(move || {
-            serve_one(&listener).expect("serve_one");
+            let mut m = crate::hub::Metrics::zero();
+            serve_one(&listener, &mut m).expect("serve_one");
         });
         let mut client = TcpStream::connect(addr).expect("connect");
         client

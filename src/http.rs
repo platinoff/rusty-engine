@@ -96,9 +96,8 @@ pub fn sse_body(id: &str, model: &str, deltas: &[&str]) -> String {
     out
 }
 
-/// Route a raw HTTP request (only the request line + method are needed) to a [`Response`].
-/// Pure and side-effect-free — the whole wire contract lives here.
-pub fn route(request: &[u8]) -> Response {
+/// Route with an explicit live metrics snapshot (PH-505). `GET /metrics` renders `m`.
+pub fn route_with(request: &[u8], m: &crate::hub::Metrics) -> Response {
     let text = match std::str::from_utf8(request) {
         Ok(t) => t,
         Err(_) => return Response::json(400, r#"{"error":"invalid utf-8"}"#.to_string()),
@@ -118,6 +117,7 @@ pub fn route(request: &[u8]) -> Response {
                 crate::VERSION
             ),
         ),
+        ("GET", "/metrics") => Response::json(200, m.to_json()),
         ("GET", crate::serve::PATH_MODELS) => Response::json(
             200,
             r#"{"object":"list","data":[{"id":"rusty-engine","object":"model","owned_by":"platinoff"}]}"#
@@ -147,8 +147,14 @@ pub fn route(request: &[u8]) -> Response {
         ("GET", _) | ("POST", _) => {
             Response::json(404, format!(r#"{{"error":"no route {path}"}}"#))
         }
-        (m, _) => Response::json(405, format!(r#"{{"error":"unsupported method {m}"}}"#)),
+        (mth, _) => Response::json(405, format!(r#"{{"error":"unsupported method {mth}"}}"#)),
     }
+}
+
+/// Route a raw HTTP request against zero-valued metrics (the pure slice used in unit tests
+/// that don't care about counters). Live serve calls [`route_with`].
+pub fn route(request: &[u8]) -> Response {
+    route_with(request, &crate::hub::Metrics::zero())
 }
 
 #[cfg(test)]
@@ -215,6 +221,18 @@ mod tests {
             Some(("POST", "/v1/chat/completions"))
         );
         assert!(parse_request_line("onlyone").is_none());
+    }
+
+    #[test]
+    fn metrics_endpoint_renders_snapshot() {
+        let mut m = crate::hub::Metrics::zero();
+        m.record(10, 2.0, 3);
+        let r = route_with(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n", &m);
+        assert_eq!(r.status, 200);
+        assert_eq!(r.content_type, "application/json");
+        assert!(r.body.contains("\"generated_tokens\":10"));
+        assert!(r.body.contains("\"active_experts\":3"));
+        assert!(r.body.contains("\"peak_experts\":3"));
     }
 
     #[test]
