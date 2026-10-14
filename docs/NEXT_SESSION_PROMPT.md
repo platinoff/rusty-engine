@@ -26,14 +26,16 @@ final rmsnorm → `output` → logits. `quant::dequant` додав **F32/F16** �
 [--max-tokens N]` (PH-306, numeric tokens). **+ B2 `PH-204` fused K-quant dot/gemv** —
 `dot_q{4,5,6}_k`+`matvec_q{4,5,6}_k` per-block stack `[f32;256]`, relative-parity vs
 `dot(dequant_qX_k, b)`. **+ B4 `PH-404` expert-cache LRU** (`src/cache.rs` — budgeted
-LRU + pin + prefetch, oversized→uncached, 7 unit). **95 тести** (89 lib + 2 dense + 4
+LRU + pin + prefetch, oversized→uncached, 7 unit). **+ B3 `PH-305b` BPE byte-fallback + atomic specials**
+(`src/tokenizer.rs`: unseen merges split to byte tokens; `token_type≥3` `<|…|>` matched
+longest-first → atomic ids). **97 тести** (91 lib + 2 dense + 4
 scaffold), clippy `-D` 0, ratio Rust ~96%. Модель у `data/models/` (gitignored).
 **Checkpoint:** зріз стану — `docs/STATUS.md`; порівняння рушіїв —
 `docs/research/engine-landscape-2026.md`; offset-семантика — `docs/research/`.
 
 Наступна `agi` обирає:
-1. **`PH-305b` HF-exact Qwen BPE** (⭐ читабельний текст): qwen2 `pre`-regex, byte-fallback,
-   specials → `rusty run` друкує слова, не id.
+1. **`PH-305b` qwen2 pre-regex parity** (⭐ gate): точний HF `qwen2` pre-tokenizer regex
+   (byte-fallback + specials вже landed) — для bitwise-parity токенизації з HF.
 2. **`PH-405` llama/HF greedy-parity** (⭐ gate): perplexity-smoke + greedy token match на
    коротких промптах проти llama-rs (підлога вже живе) — чисельна довіра до `PH-305`.
 3. **B2 залізо** `PH-202/203/205` — repack + SSE/AVX/NEON dispatch, `cargo bench` проти oracle

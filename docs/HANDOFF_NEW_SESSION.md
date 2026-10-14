@@ -100,6 +100,6 @@ per-row SwiGLU + residual → final rmsnorm → `output` → logits). `quant::de
 **84 тести** (78 lib + 2 dense + 4 scaffold), clippy `-D` 0, ratio ~96%. Real-Qwen `#[ignore]`-smoke:
 prefill `[151644, 872, 198]` → **151 936 finite logits** (усі 24 шари pure-Rust).
 
-**Наступний крок:** `PH-305b` HF-exact BPE (читабельний текст у CLI) **або** `PH-405`
-llama/HF greedy-parity gate (чисельна довіра) **або** B2 `PH-202..204` (repack/SIMD).
+**Наступний крок:** `PH-305b` qwen2 pre-regex parity (bytes-fallback + specials вже landed)
+**або** `PH-405` llama/HF greedy-parity gate (чисельна довіра) **або** B2 `PH-202/203` (repack/SIMD).
 План — `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.

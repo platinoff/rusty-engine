@@ -62,7 +62,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-103 | mmap/mlock staged loader (disk→RAM, progress) | `[x]` | `src/loader.rs` — `MmapModel::open`/`lock_pages`(unix)/`staged_read`(+progress)/`load_staged`; `memmap2`; 3 unit |
 | PH-104 | quant-блоки: sizes усіх 5 + scalar dequant Q4_0/Q8_0 (K-quant → B2) | `[x]` | `src/quant.rs` — `block_info`/`bytes_for_numel`/`dequant`+`f16_to_f32`; 6 unit |
 | PH-105 | tokenizer-metadata ingest (model/tokens/type/scores/merges/bos/eos/pre) | `[x]` | `src/tokenizer.rs` — `TokenizerMeta::from_file`; 2 unit |
-| PH-105b | byte-level **BPE encode/decode** (GPT-2 style) | `[x]` | `src/tokenizer.rs` — `ByteEncoder` (invertible 0..=255) + `Bpe` (pre-tokenize/merge-by-rank); round-trip + unknown-err (4 unit); HF-exact parity → PH-305b |
+| PH-105b | byte-level **BPE encode/decode** (GPT-2 style) | `[x]` | `src/tokenizer.rs` — `ByteEncoder` (invertible 0..=255) + `Bpe` (pre-tokenize/merge-by-rank); round-trip + **byte-fallback** unseen merges + **atomic specials** (token_type≥3, `<|…|>` split) via `special_tokens()`/`split_on_specials` (PH-305b); HF-exact regex parity → later |
 | PH-106 | round-trip на disk (write synth GGUF → read via `parse_file`) | `[x]` | `src/gguf.rs` — `round_trips_a_real_file_via_std_io` (real `.gguf` bytes) |
 | PH-107 | CLI `rusty inspect model.gguf` | `[x]` | `src/bin/rusty.rs` — `inspect()` summary + graceful errors |
 
@@ -107,6 +107,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-305e | **tensor-geometry validation** (name+dims vs config) | `[x]` | `src/model.rs` — `ModelConfig::validate` (token_embd/output/output_norm + per-block attn/ffn req, qk_norm/bias opt); CLI `rusty validate`; real Qwen2.5 24-layer OK; synth match+mismatch tests |
 | PH-305 | **end-to-end dense forward** (multi-layer loop, real GGUF), greedy | `[x]` | `src/runner.rs` `DenseRunner::from_model/prefill_logits/greedy/generate` + `forward::block_forward_seq`/`last_logits` (causal GQA+RoPE, per-row FFN, residual); quant `F32`/`F16` dequant branches (norms/small tensors); `tests/dense_gen.rs` synth 2-layer greedy=token4 + `#[ignore]` real Qwen2.5 24-layer prefill 151 936 logits finite |
 | PH-306 | CLI `rusty run -m <model> -t "ids" [--max-tokens N]` | `[x]` | `src/bin/rusty.rs` — `run()` numeric-token greedy (BPE HF-parity → `PH-305b`) |
+| PH-305b | BPE **byte-fallback + specials** (readable text) | `[x]` | `src/tokenizer.rs` — unseen merges split to byte tokens; `token_type≥3` specials atomic via `split_on_specials` (longest-match `<|…|>`); 2 unit. Остаток `qwen2` HF pre-regex parity → окремий gate |
 
 ---
 

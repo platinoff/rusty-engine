@@ -62,6 +62,17 @@ impl TokenizerMeta {
     pub fn prepend_bos(&self) -> bool {
         self.add_bos_token.unwrap_or(false)
     }
+
+    /// Special/control tokens: `token_type >= CONTROL (3)` and registered in the vocab.
+    /// llama.cpp marks CONTROL=3, USER_DEFINED=4 — those must be atomic in encoding.
+    pub fn special_tokens(&self) -> Vec<(String, u32)> {
+        self.tokens
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.token_type.get(*i).copied().unwrap_or(0) >= 3)
+            .map(|(i, t)| (t.clone(), i as u32))
+            .collect()
+    }
 }
 
 /// GPT-2 byte→visible-unicode table (the classic reversible mapping so any byte survives BPE).
@@ -141,6 +152,8 @@ pub struct Bpe {
     encoder: ByteEncoder,
     vocab: HashMap<String, u32>,
     ranks: HashMap<(String, String), usize>,
+    /// Atomic special/control tokens (`token_type >= 3`), matched before BPE.
+    specials: HashMap<String, u32>,
 }
 
 impl Bpe {
@@ -158,11 +171,17 @@ impl Bpe {
                 ranks.insert((a.to_string(), b.to_string()), rank);
             }
         }
+        let specials = meta
+            .special_tokens()
+            .into_iter()
+            .filter(|(t, _)| t.contains("<|") || t.contains("|>"))
+            .collect();
         Self {
             meta,
             encoder,
             vocab,
             ranks,
+            specials,
         }
     }
 
@@ -209,20 +228,43 @@ impl Bpe {
         syms
     }
 
-    /// Encode text to token ids. Unknown symbols error out (byte-fallback → later slice).
+    /// Emit the byte ids of a merged symbol: exact vocab hit → one id; otherwise
+    /// **byte-fallback** — split into single chars (each a ByteEncoder output that is a
+    /// vocab byte-token). Errors only if even a single byte char is missing.
+    fn encode_symbol(&self, sym: &str, ids: &mut Vec<u32>) -> Result<()> {
+        if let Some(&id) = self.vocab.get(sym) {
+            ids.push(id);
+            return Ok(());
+        }
+        // byte-fallback: the symbol came from pre_tokenize over byte-mapped chars, so its
+        // constituent chars are all in the byte-token vocab.
+        for c in sym.chars() {
+            let one = c.to_string();
+            match self.vocab.get(&one) {
+                Some(&id) => ids.push(id),
+                None => {
+                    return Err(EngineError {
+                        message: format!("BPE: byte-fallback char {one:?} not in vocab"),
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode text to token ids. Special/control tokens (`token_type >= 3`) are atomic;
+    /// between them the byte-level BPE runs with byte-fallback for unseen merges.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let byte_text = self.encoder.bytes_to_chars(text.as_bytes());
         let mut ids = Vec::new();
-        for word in self.pre_tokenize(&byte_text) {
-            for sym in self.merge_word(&word) {
-                match self.vocab.get(&sym) {
-                    Some(&id) => ids.push(id),
-                    None => {
-                        return Err(EngineError {
-                            message: format!(
-                                "BPE: token {sym:?} not in vocab (byte-fallback pending)"
-                            ),
-                        })
+        for segment in split_on_specials(text, &self.specials) {
+            match segment {
+                Segment::Special(s) => ids.push(self.specials[&s]),
+                Segment::Text(s) => {
+                    let byte_text = self.encoder.bytes_to_chars(s.as_bytes());
+                    for word in self.pre_tokenize(&byte_text) {
+                        for sym in self.merge_word(&word) {
+                            self.encode_symbol(&sym, &mut ids)?;
+                        }
                     }
                 }
             }
@@ -244,6 +286,49 @@ impl Bpe {
     pub fn meta(&self) -> &TokenizerMeta {
         &self.meta
     }
+}
+
+// ── special-token splitter (B3 `PH-305b`) ─────────────────────────────────────
+
+/// A piece of a decoded prompt: either an atomic special token or ordinary BPE text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Segment {
+    Special(String),
+    Text(String),
+}
+
+/// Split `text` into [`Segment`]s on registered special tokens (longest match wins).
+/// Without specials this is a single `Text` segment.
+fn split_on_specials(text: &str, specials: &HashMap<String, u32>) -> Vec<Segment> {
+    if specials.is_empty() {
+        return vec![Segment::Text(text.to_string())];
+    }
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.starts_with("<|") {
+            let hit = specials
+                .keys()
+                .filter(|s| rest.starts_with(s.as_str()))
+                .max_by_key(|s| s.len());
+            if let Some(sp) = hit {
+                if !buf.is_empty() {
+                    out.push(Segment::Text(std::mem::take(&mut buf)));
+                }
+                out.push(Segment::Special(sp.clone()));
+                rest = &rest[sp.len()..];
+                continue;
+            }
+        }
+        let c = rest.chars().next().unwrap();
+        buf.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    if !buf.is_empty() {
+        out.push(Segment::Text(buf));
+    }
+    out
 }
 
 // ── metadata ingest helpers (B1, unchanged) ──────────────────────────────────
@@ -465,11 +550,48 @@ mod tests {
 
     #[test]
     fn bpe_unknown_symbol_errors() {
+        // only "a" in vocab; "b" cannot merge and its single-byte token is absent too.
         let meta = TokenizerMeta {
             tokens: vec!["a".to_string()], // only "a"
             ..Default::default()
         };
         let bpe = Bpe::from_meta(meta);
         assert!(bpe.encode("b").is_err());
+    }
+
+    #[test]
+    fn bpe_byte_fallback_handles_unseen_merge() {
+        // vocab a,b,c,ab ; merge "a b" makes "ab" a token. "ba" is not in vocab and has no
+        // merge -> byte-falls-back to the single-byte tokens [b,a].
+        let meta = TokenizerMeta {
+            tokens: ["a", "b", "c", "ab"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            merges: ["a b"].iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let bpe = Bpe::from_meta(meta);
+        assert_eq!(bpe.encode("ab").unwrap(), vec![3]);
+        assert_eq!(bpe.encode("ba").unwrap(), vec![1, 0]);
+        assert_eq!(bpe.decode(&bpe.encode("abba").unwrap()), "abba");
+    }
+
+    #[test]
+    fn specials_are_atomic_and_split() {
+        let mut meta = TokenizerMeta {
+            tokens: ["a", "b", "c", "<|x|>"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            token_type: vec![1, 1, 1, 3],
+            ..Default::default()
+        };
+        meta.merges.clear();
+        let bpe = Bpe::from_meta(meta);
+        // "<|x|>" is special (atomic id 3); "ab"/"c" are byte tokens 0/1/2.
+        let ids = bpe.encode("a<|x|>c").unwrap();
+        assert_eq!(ids, vec![0, 3, 2]);
+        assert_eq!(bpe.decode(&ids), "a<|x|>c");
     }
 }
