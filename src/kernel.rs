@@ -261,6 +261,86 @@ kmatvec!(
     "matvec_q6_k: n must be a multiple of 256"
 );
 
+// ── `PH-203` SSE2 fused Q4_0 dot (x86_64) ────────────────────────────────────
+
+/// Horizontal sum of a `__m128` (SSE2-only: movehl + shuffle + add_ss).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn hsum_ps_sse2(v: std::arch::x86_64::__m128) -> f32 {
+    use std::arch::x86_64::*;
+    let t = _mm_add_ps(v, _mm_movehl_ps(v, v));
+    let t = _mm_add_ss(t, _mm_shuffle_ps(t, t, 0x55));
+    _mm_cvtss_f32(t)
+}
+
+/// SSE2 `dot(dequant_q4_0(a), b)`. Processes the split-half nibbles four elements at a
+/// time (four lo + four hi lanes), scale broadcast via `_mm_set1_ps`, and reduces with
+/// SSE2 shuffles. Parity with the scalar [`dot_q4_0`] oracle is asserted to 1e-3 (fused
+/// accumulation order differs from the sequential reference, so bit-exactness isn't the
+/// contract — the value is 4-wide throughput).
+///
+/// # Safety
+/// Requires SSE2 (`is_x86_feature_detected!("sse2")` or an x86_64 baseline target). The
+/// caller must guarantee `a.len()` is a multiple of 18 and `b.len() == a.len()/18*32`
+/// (both debug-asserted); the `*_loadu_*` intrinsics read exactly `b`'s window per block.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+pub unsafe fn dot_q4_0_sse2(a: &[u8], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = a.len() / 18;
+    debug_assert_eq!(a.len(), nb * 18, "dot_q4_0_sse2: partial block");
+    debug_assert_eq!(b.len(), nb * 32, "dot_q4_0_sse2: vector length mismatch");
+    let mut acc_lo = _mm_setzero_ps();
+    let mut acc_hi = _mm_setzero_ps();
+    for (k, blk) in a.chunks_exact(18).enumerate() {
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dv = _mm_set1_ps(d);
+        let qs = &blk[2..];
+        let bo = k * 32;
+        for jj in (0..16).step_by(4) {
+            let mut lo = [0i32; 4];
+            let mut hi = [0i32; 4];
+            for t in 0..4 {
+                let q = qs[jj + t];
+                lo[t] = (q & 0x0F) as i32 - 8;
+                hi[t] = (q >> 4) as i32 - 8;
+            }
+            let lv = _mm_mul_ps(dv, _mm_cvtepi32_ps(_mm_loadu_si128(lo.as_ptr().cast())));
+            let hv = _mm_mul_ps(dv, _mm_cvtepi32_ps(_mm_loadu_si128(hi.as_ptr().cast())));
+            let bl = _mm_loadu_ps(b.as_ptr().add(bo + jj));
+            let bh = _mm_loadu_ps(b.as_ptr().add(bo + 16 + jj));
+            acc_lo = _mm_add_ps(acc_lo, _mm_mul_ps(lv, bl));
+            acc_hi = _mm_add_ps(acc_hi, _mm_mul_ps(hv, bh));
+        }
+    }
+    hsum_ps_sse2(acc_lo) + hsum_ps_sse2(acc_hi)
+}
+
+/// Runtime-dispatched Q4_0 dot: SSE2 when the CPU reports support, else the scalar
+/// oracle. `backend::select()` reports the compiled feature tier; this adds the dynamic
+/// guard so the same binary is safe on any x86_64 host.
+pub fn dot_q4_0_dispatch(a: &[u8], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("sse2") {
+            // SAFETY: gated by the runtime SSE2 check above.
+            return unsafe { dot_q4_0_sse2(a, b) };
+        }
+    }
+    dot_q4_0(a, b)
+}
+
+/// Row-major `W[m×n]` Q4_0, times `x[n]`, via the dispatched dot.
+pub fn matvec_q4_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matvec_q4_0_dispatch: n%32");
+    let row_bytes = n / 32 * 18;
+    debug_assert_eq!(w.len(), m * row_bytes, "matvec_q4_0_dispatch: weight size");
+    debug_assert_eq!(x.len(), n, "matvec_q4_0_dispatch: input width");
+    (0..m)
+        .map(|r| dot_q4_0_dispatch(&w[r * row_bytes..(r + 1) * row_bytes], x))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +429,39 @@ mod tests {
             (fused - reference).abs() < 1e-3,
             "fused={fused} ref={reference}"
         );
+    }
+
+    #[test]
+    fn dot_q4_0_dispatch_matches_scalar() {
+        // Dispatch must be numerically equivalent to the scalar oracle within tolerance
+        // (SSE2 path on x86_64; scalar elsewhere / no-feature fallback).
+        let a = q4_blocks(6);
+        let b: Vec<f32> = (0..a.len() / 18 * 32)
+            .map(|i| (i as f32) * 0.07 - 21.0)
+            .collect();
+        let d = dot_q4_0_dispatch(&a, &b);
+        let s = dot_q4_0(&a, &b);
+        assert!((d - s).abs() < 1e-3, "dispatch={d} scalar={s}");
+        let mv = matvec_q4_0_dispatch(&a, 3, 64, &b[..64]);
+        let ms = matvec_q4_0(&a, 3, 64, &b[..64]);
+        for (x, y) in mv.iter().zip(&ms) {
+            assert!((x - y).abs() < 1e-3);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dot_q4_0_sse2_matches_scalar() {
+        if !std::is_x86_feature_detected!("sse2") {
+            return; // SSE2 is x86_64 baseline; skip only on exotic hosts.
+        }
+        let a = q4_blocks(5);
+        let b: Vec<f32> = (0..a.len() / 18 * 32)
+            .map(|i| (i as f32) * 0.05 - 12.0)
+            .collect();
+        let simd = unsafe { dot_q4_0_sse2(&a, &b) };
+        let scalar = dot_q4_0(&a, &b);
+        assert!((simd - scalar).abs() < 1e-3, "sse2={simd} scalar={scalar}");
     }
 
     #[test]
