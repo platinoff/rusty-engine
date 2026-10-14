@@ -12,18 +12,17 @@
 block-sizes+Q4_0/Q8_0 dequant→tokenizer-meta. **35 тестів**, clippy `-D` 0. Коміти локальні,
 **без push** (GitHub remote — B11 `PH-1105`).
 
-## Наступний крок (B3 primitives — sampler/RMSNorm, std-testable)
+## Наступний крок (B3 attention/KV primitives — std, далі модель)
 
-`PH-401/402/403` **done** (`src/moe.rs`: router softmax/sigmoid/group + SwiGLU `expert_ffn` +
-`combine` shared-merge; 44 tests). Далі — **B3** pure-f32 примітиви (без моделі):
+Done цього сеансу: **B1 `PH-101..107`** (GGUF-контейнер, завершено), **B4-core `PH-401/402/403`**
+(router/SwiGLU/shared), **B3-primitives `PH-301/304`** (RMSNorm + sampler) — **50 тестів**, clippy `-D` 0.
 
-1. `PH-304` **sampler** (`src/infer/sample.rs`): temperature, top-k, top-p (nucleus), repetition
-   penalty, greedy argmax — unit-тести на синтетичних logits.
-2. `PH-301` **RMSNorm/SiLU/MatMul** (`src/infer/ops.rs`) — `silu`/`matvec` вже в `moe.rs`, виносяться/доповнюються.
-3. далі attn/RoPE/paged-KV (`PH-302/303`) + `PH-305` real-model golden (потребує GGUF-файл + deps).
-
-Решта B4 (`PH-404..407`: expert-cache, parity, run, bench) — реальної GGUF-моделі. Опційно B2
-(`PH-201` K-quant dequant + SIMD) — вузьке місце швидкості.
+Наступний std-testable зріз (без моделі):
+1. `PH-302` **attention primitives** (`src/infer/attn.rs`): causal-mask, GQA/MQA broadcast, RoPE —
+   unit на синтетичних Q/K/V.
+2. `PH-303` **paged KV-cache** (`src/infer/kvcache.rs`): slab alloc + round-trip.
+Далі залежне від моделі/dep: `PH-305` dense golden (+`PH-306` `rusty run`), B2 `PH-201`
+(K-quant dequant + SIMD), B4 `PH-404..407` (expert-cache/parity/run/bench — реальна GGUF-модель).
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
 

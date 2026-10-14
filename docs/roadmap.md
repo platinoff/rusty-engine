@@ -78,16 +78,16 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B3 — Dense forward (control path)  **`[ ]`**
+## Band B3 — Dense forward (control path)  **`[~]` (PH-301/304 done, 2026-10-14)**
 
 > Мета: згенерувати текст на DENSE-моделі як контроль перед MoE.
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
-| PH-301 | RMSNorm / SiLU / MatMul | `[ ]` | `src/infer/ops.rs` |
+| PH-301 | RMSNorm (+ SiLU/MatMul — уже в `moe.rs`) | `[x]` | `src/infer.rs` — `rmsnorm`; 50 tests |
 | PH-302 | causal attention GQA/MQA + RoPE | `[ ]` | `src/infer/attn.rs` |
 | PH-303 | paged KV-cache (slab alloc, vLLM-ідея) | `[ ]` | `src/infer/kvcache.rs` |
-| PH-304 | sampler chain (temp/top-k/top-p/repetition/grammar hook) | `[ ]` | `src/infer/sample.rs` |
+| PH-304 | sampler chain (temp/top-k/top-p/repetition/argmax) | `[x]` | `src/infer.rs` — `sample`/`mask_top_k`/`mask_top_p`/`apply_repetition_penalty`/`argmax` (grammar →later) |
 | PH-305 | end-to-end dense-генерація (TinyLlama/Qwen2 GGUF), golden tokens | `[ ]` | `tests/dense_gen.rs` |
 | PH-306 | CLI `rusty run -m model.gguf -p "..."` | `[ ]` | `src/bin/rusty.rs` |
 
