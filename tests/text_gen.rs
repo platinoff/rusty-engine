@@ -202,3 +202,48 @@ fn text_pipeline_roundtrips_symbol_text() {
     drop(model);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn serve_with_model_completes_over_the_wire() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    // PH-501b end-to-end: bind the real TextRunner into serve_one, POST a chat body over
+    // loopback, and assert an OpenAI completion with the generated assistant text.
+    let bytes = synth_text_gguf();
+    std::fs::create_dir_all("target").unwrap();
+    let path = Path::new("target/text_gen_serve.gguf");
+    std::fs::write(path, &bytes).unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let fp = path.to_path_buf();
+    let th = std::thread::spawn(move || {
+        let model = unsafe { MmapModel::open(&fp) }.expect("open in server");
+        let tr = TextRunner::from_model(&model).expect("TextRunner in server");
+        let mut m = rusty_engine::hub::Metrics::zero();
+        rusty_engine::serve::serve_one(&listener, &mut m, Some(&tr)).expect("serve_one+model");
+    });
+
+    let mut client = TcpStream::connect(addr).expect("connect");
+    client
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+        )
+        .expect("write");
+    client.flush().expect("flush");
+    let mut resp = String::new();
+    client.read_to_string(&mut resp).expect("read");
+    th.join().expect("server thread");
+
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+    assert!(resp.contains("chat.completion"));
+    // monotone synth model generates '~' (token 126) greedily after "hi"
+    assert!(
+        resp.contains("\"content\":\"~~~"),
+        "generated text present: {resp}"
+    );
+    assert!(resp.contains("\"finish_reason\":\"stop\""));
+    assert!(resp.contains("\"usage\""));
+
+    let _ = std::fs::remove_file(path);
+}

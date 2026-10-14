@@ -345,6 +345,7 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
 /// Loopback-only by default (dry-run posture); blocks serving one connection per request.
 fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
     let mut port = 8090u16;
+    let mut model_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" | "-p" => {
@@ -355,6 +356,7 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
                     })
                 })
             }
+            "--model" | "-m" => model_path = args.next(),
             other => {
                 eprintln!("rusty serve: unknown arg '{other}'");
                 std::process::exit(2);
@@ -366,7 +368,27 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
         "{} — serving loopback on http://{addr} (Ctrl-C to stop)",
         rusty_engine::banner()
     );
-    if let Err(e) = rusty_engine::serve::serve(&addr) {
+    // With a model, wire real BPE→generate→decode (PH-501b); else the stub route.
+    let result = match &model_path {
+        Some(p) => match unsafe { rusty_engine::loader::MmapModel::open(Path::new(p)) } {
+            Ok(m) => match rusty_engine::textgen::TextRunner::from_model(&m) {
+                Ok(tr) => {
+                    println!("  model: {p} ({} layers)", tr.runner.n_layers);
+                    rusty_engine::serve::serve_with_model(&addr, &tr)
+                }
+                Err(e) => {
+                    eprintln!("rusty serve: model load: {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("rusty serve: open {p}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => rusty_engine::serve::serve(&addr),
+    };
+    if let Err(e) = result {
         eprintln!("rusty serve {addr}: {e}");
         std::process::exit(1);
     }

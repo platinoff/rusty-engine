@@ -12,17 +12,23 @@ pub const PATH_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 
 /// Accept, serve and close exactly one connection — the unit `serve` loops over. `metrics`
-/// accumulates across the process lifetime (PH-505 counters).
-pub fn serve_one(listener: &TcpListener, metrics: &mut crate::hub::Metrics) -> std::io::Result<()> {
+/// accumulates across the process lifetime (PH-505 counters); `model` wires real generation.
+pub fn serve_one(
+    listener: &TcpListener,
+    metrics: &mut crate::hub::Metrics,
+    model: Option<&crate::textgen::TextRunner>,
+) -> std::io::Result<()> {
     let (mut stream, _peer) = listener.accept()?;
-    handle_conn(&mut stream, metrics)
+    handle_conn(&mut stream, metrics, model)
 }
 
-/// Read one request from `stream`, route it against the live `metrics`, write the response.
-/// A POST to the completions path records a call (0 tokens until real generation is wired).
+/// Read one request from `stream`, route it against `metrics` (+ optional real `model`),
+/// write the response. With a model, POST /v1/chat/completions runs BPE→generate→decode
+/// (PH-501b); otherwise the pure `route_with` stub answers.
 pub fn handle_conn(
     stream: &mut TcpStream,
     metrics: &mut crate::hub::Metrics,
+    model: Option<&crate::textgen::TextRunner>,
 ) -> std::io::Result<()> {
     let mut buf = vec![0u8; MAX_REQUEST_BYTES];
     let mut filled = 0usize;
@@ -37,24 +43,46 @@ pub fn handle_conn(
             break;
         }
     }
-    let resp = crate::http::route_with(&buf[..filled], metrics);
-    if resp.status == 200 && resp.content_type == "application/json" {
-        // Count completions handled (both stream + JSON paths are chat endpoints).
-        let first_line = String::from_utf8_lossy(&buf[..filled]);
-        if first_line.starts_with("POST ") {
+    let text = String::from_utf8_lossy(&buf[..filled]).into_owned();
+    let head = text.lines().next().unwrap_or("");
+    let is_chat = head.starts_with("POST ") && head.contains(PATH_CHAT_COMPLETIONS);
+    let resp = match model {
+        Some(tr) if is_chat => {
+            let r = crate::textgen::chat_response(tr, crate::http::body_of(&text), 8);
             metrics.record(0, 0.0, 0);
+            r
         }
-    }
+        _ => {
+            let r = crate::http::route_with(&buf[..filled], metrics);
+            if is_chat && r.status == 200 {
+                metrics.record(0, 0.0, 0);
+            }
+            r
+        }
+    };
     stream.write_all(&resp.to_http_bytes())?;
     stream.flush()
 }
 
-/// Bind `addr` (typically `127.0.0.1:PORT`) and serve forever. Blocks the calling thread.
-/// Keeps the GSV hub alive mirror (`PH-504`) by stamping `rusty_heartbeat.json` at startup
-/// and after every handled connection (a busy loopback tool stays fresh; the hub's
-/// `HEARTBEAT_FRESH_SECS=60s` window tolerates idle gaps between requests).
+/// Bind `addr` (typically `127.0.0.1:PORT`) and serve forever (stub completions). Blocks.
 pub fn serve(addr: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
+    accept_loop(&listener, None)
+}
+
+/// PH-501b: serve with a real [`crate::textgen::TextRunner`] bound — POST /v1/chat/completions
+/// runs BPE→generate→decode over the loaded GGUF instead of the empty stub.
+pub fn serve_with_model(addr: &str, model: &crate::textgen::TextRunner) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr)?;
+    accept_loop(&listener, Some(model))
+}
+
+/// Shared accept loop: keep-live stamping (PH-504) + per-connection routing (PH-505 counters,
+/// PH-501b model). Fail-open per connection so a broken client never kills the loop.
+fn accept_loop(
+    listener: &TcpListener,
+    model: Option<&crate::textgen::TextRunner>,
+) -> std::io::Result<()> {
     let live_dir = std::path::Path::new("target/live");
     let start = std::time::Instant::now();
     let mut metrics = crate::hub::Metrics::zero();
@@ -65,8 +93,7 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {
-                if handle_conn(&mut s, &mut metrics).is_err() {
-                    // Fail-open: a broken client must not kill the loop (watchdog-friendly).
+                if handle_conn(&mut s, &mut metrics, model).is_err() {
                     continue;
                 }
                 let _ = crate::hub::write_heartbeat(
@@ -93,7 +120,7 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         let th = std::thread::spawn(move || {
             let mut m = crate::hub::Metrics::zero();
-            serve_one(&listener, &mut m).expect("serve_one");
+            serve_one(&listener, &mut m, None).expect("serve_one");
         });
         let mut client = TcpStream::connect(addr).expect("connect");
         client
@@ -113,7 +140,7 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         let th = std::thread::spawn(move || {
             let mut m = crate::hub::Metrics::zero();
-            serve_one(&listener, &mut m).expect("serve_one");
+            serve_one(&listener, &mut m, None).expect("serve_one");
         });
         let mut client = TcpStream::connect(addr).expect("connect");
         client

@@ -147,6 +147,8 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
 | PH-501a | **std-only HTTP layer** (pure `route()` + TcpListener pump) | `[x]` | `src/http.rs` — `Response::to_http_bytes`(Content-Length exact)/`parse_request_line`/`route`: GET /health, GET /v1/models, POST /v1/chat/completions (OpenAI stub), 404/405/400; `src/serve.rs` — `serve_one/handle_conn/serve` (loopback, fail-open); CLI `rusty serve [--port N]`; 7 http unit + 1 wire test |
+| PH-501b | **real TextRunner у HTTP handler** (end-to-end) | `[x]` | `textgen.rs`: `extract_message_content` (std JSON reader, escape) + `TextRunner::complete` + `chat_response`; `serve_with_model`/`handle_conn(_,_,Some(&tr))` POST→BPE→generate→decode; CLI `rusty serve -m <gguf>`. Test `serve_with_model_completes_over_the_wire` (synth GGUF, loopback, `"content":"~~~"` + usage). |
+| PH-501 | HTTP server (tokio+axum) — `/v1/models`,`/v1/chat/completions` | `[ ]` | `src/serve/http.rs` |
 | PH-501 | HTTP server (tokio+axum) — `/v1/models`,`/v1/chat/completions` | `[ ]` | `src/serve/http.rs` |
 | PH-502 | **SSE-стрімінг токенів, stop-tokens, usage** | `[~]` | `src/http.rs` — `sse_body` (OpenAI `chat.completion.chunk` + `finish_reason:stop` + `data:[DONE]`, event-framed) + `body_of`/`wants_stream`; `route` → `text/event-stream`; serve.rs wire-тест `[DONE]`. Інкрементні socket-writes + usage → далі |
 | PH-503 | prompt-cache / multi-slot | `[ ]` | `src/serve/slot.rs` |
