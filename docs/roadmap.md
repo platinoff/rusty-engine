@@ -107,7 +107,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-305e | **tensor-geometry validation** (name+dims vs config) | `[x]` | `src/model.rs` — `ModelConfig::validate` (token_embd/output/output_norm + per-block attn/ffn req, qk_norm/bias opt); CLI `rusty validate`; real Qwen2.5 24-layer OK; synth match+mismatch tests |
 | PH-305 | **end-to-end dense forward** (multi-layer loop, real GGUF), greedy | `[x]` | `src/runner.rs` `DenseRunner::from_model/prefill_logits/greedy/generate` + `forward::block_forward_seq`/`last_logits` (causal GQA+RoPE, per-row FFN, residual); quant `F32`/`F16` dequant branches (norms/small tensors); `tests/dense_gen.rs` synth 2-layer greedy=token4 + `#[ignore]` real Qwen2.5 24-layer prefill 151 936 logits finite |
 | PH-306 | CLI `rusty run -m <model> -t "ids" [--max-tokens N]` | `[x]` | `src/bin/rusty.rs` — `run()` numeric-token greedy (BPE HF-parity → `PH-305b`) |
-| PH-305b | BPE **byte-fallback + specials** (readable text) | `[x]` | `src/tokenizer.rs` — unseen merges split to byte tokens; `token_type≥3` specials atomic via `split_on_specials` (longest-match `<|…|>`); 2 unit. Остаток `qwen2` HF pre-regex parity → окремий gate |
+| PH-305b | BPE **byte-fallback + specials + HF pre-regex** (readable text) | `[x]` | `src/tokenizer.rs` — unseen merges split to byte tokens; `token_type≥3` specials atomic via `split_on_specials`; **`src/gpt2.rs`** std-only GPT-2/Qwen2 pre-tokenizer (`gpt2_pre_split`: contractions, `[^…]L+`, `N{1,3}`, symbol+`\r\n`, `\s*[\r\n]+`, `\s+`) wired into `Bpe::encode`; 6 gpt2 + 3 tokenizer unit. Byte-exact HF `tokenizer.json` parity → `PH-405` gate |
 
 ---
 

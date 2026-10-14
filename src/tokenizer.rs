@@ -142,9 +142,6 @@ impl Default for ByteEncoder {
     }
 }
 
-/// Whitespace pre-tokenizer marker: a space byte (0x20) is mapped to `Ġ` by [`ByteEncoder`].
-const SPACE_MARK: char = '\u{0120}'; // == byte_to_char[0x20]
-
 /// Byte-level BPE codec (GPT-2 style) over a [`TokenizerMeta`].
 #[derive(Debug, Clone)]
 pub struct Bpe {
@@ -183,25 +180,6 @@ impl Bpe {
             ranks,
             specials,
         }
-    }
-
-    /// Split byte-encoded text into word chunks at the space marker (first char of a non-initial
-    /// chunk keeps its `Ġ` so a space round-trips).
-    fn pre_tokenize(&self, byte_text: &str) -> Vec<String> {
-        let mut words = Vec::new();
-        for (i, part) in byte_text.split(SPACE_MARK).enumerate() {
-            if part.is_empty() && i > 0 {
-                continue;
-            }
-            if i == 0 {
-                if !part.is_empty() {
-                    words.push(part.to_string());
-                }
-            } else {
-                words.push(format!("{}{part}", SPACE_MARK));
-            }
-        }
-        words
     }
 
     /// Apply BPE merges to one byte-encoded word (list of single-char symbols) until no merge
@@ -260,9 +238,9 @@ impl Bpe {
             match segment {
                 Segment::Special(s) => ids.push(self.specials[&s]),
                 Segment::Text(s) => {
-                    let byte_text = self.encoder.bytes_to_chars(s.as_bytes());
-                    for word in self.pre_tokenize(&byte_text) {
-                        for sym in self.merge_word(&word) {
+                    for piece in crate::gpt2::gpt2_pre_split(&s) {
+                        let byte_text = self.encoder.bytes_to_chars(piece.as_bytes());
+                        for sym in self.merge_word(&byte_text) {
                             self.encode_symbol(&sym, &mut ids)?;
                         }
                     }

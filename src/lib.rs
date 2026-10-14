@@ -15,6 +15,8 @@
 //! - [`forward`] — single-block transformer composition (PH-305d) + seq prefill (PH-305)
 //! - [`model`] — GGUF model-config + tensor-geometry validation (PH-305c/e)
 //! - [`runner`] — dense end-to-end generation on a real GGUF (PH-305)
+//! - [`tokenizer`] — GGUF tokenizer metadata + byte-level BPE (fallback + specials)
+//! - [`gpt2`] — HF GPT-2/Qwen2 pre-tokenizer regex splitter (std-only, PH-305b)
 //! - [`serve`] — OpenAI-compat HTTP server (B5)
 //! - [`node`]  — slave/worker runtime over local Wi-Fi (B7/B8)
 //! - [`hub`]   — GSV-native master supervisor (Rust k8s-lite, B8)
@@ -23,6 +25,7 @@ pub mod cache;
 pub mod core;
 pub mod forward;
 pub mod gguf;
+pub mod gpt2;
 pub mod hub;
 pub mod infer;
 pub mod kernel;
