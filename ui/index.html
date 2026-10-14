@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>rusty-engine — MoE control</title>
+  <link rel="stylesheet" href="/ui/css/style.css" />
+</head>
+<body>
+  <nav id="sidebar" aria-label="primary">
+    <div class="brand"><span class="dot"></span> rusty-engine</div>
+    <button id="nav-toggle" aria-expanded="true" aria-controls="sidebar">≡</button>
+    <ul class="nav">
+      <li><a href="/page/dashboard" data-hotkey="d"><kbd>d</kbd> Dashboard</a></li>
+      <li><a href="/page/models" data-hotkey="m"><kbd>m</kbd> Models</a></li>
+      <li><a href="/page/inference" data-hotkey="i"><kbd>i</kbd> Inference</a></li>
+      <li><a href="/page/tuning" data-hotkey="k"><kbd>k</kbd> Tuning</a></li>
+      <li><a href="/page/nodes" data-hotkey="f"><kbd>f</kbd> Nodes</a></li>
+      <li><a href="/page/orchestration" data-hotkey="o"><kbd>o</kbd> Orchestration</a></li>
+      <li><a href="/page/settings" data-hotkey="s"><kbd>s</kbd> Settings</a></li>
+      <li><a href="/page/logs" data-hotkey="l"><kbd>l</kbd> Logs</a></li>
+    </ul>
+  </nav>
+
+  <main id="content" class="workspace">
+    <!-- B0 placeholder: pages are rendered by Rust (src/ui.rs) starting band B10. -->
+    <section class="panel">
+      <h1>rusty-engine</h1>
+      <p class="muted">Pure-Rust MoE inference engine (GGUF-first) · orchestrated by a
+        GSV-native master/slave supervisor. UI pages ship in band <code>B10</code>.</p>
+      <p class="muted">Press <kbd>?</kbd> for hotkeys.</p>
+    </section>
+  </main>
+
+  <button id="theme-btn" title="cycle theme">◐</button>
+  <script src="/ui/js/app.js"></script>
+</body>
+</html>

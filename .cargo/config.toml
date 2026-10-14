@@ -1,0 +1,5 @@
+[alias]
+xtask = ["run", "--package", "xtask", "--"]
+
+# Cross-target link flags (aarch64, android/ndk, msvc) land in band B6.
+# Kept empty in B0 so the host `x86_64-pc-windows-gnu` build stays deterministic.

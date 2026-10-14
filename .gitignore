@@ -1,0 +1,10 @@
+/target
+data/*
+!data/.gitkeep
+*.exe
+*.dll
+*.so
+*.dylib
+*.apk
+*.ttf.tmp
+.DS_Store

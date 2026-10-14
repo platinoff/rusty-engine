@@ -1,0 +1,31 @@
+[workspace]
+members = ["xtask"]
+resolver = "2"
+
+[package]
+name = "rusty-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+authors = ["platinoff"]
+repository = "https://github.com/platinoff/rusty-engine"
+homepage = "https://github.com/platinoff/rusty-engine"
+description = "Pure-Rust Mixture-of-Experts inference engine (GGUF-first), orchestrated by a GSV-native master/slave supervisor; cross-compiled to exe/bin/apk."
+readme = "README.md"
+keywords = ["moe", "llm", "gguf", "inference", "rust"]
+categories = ["science", "command-line-utilities"]
+
+[[bin]]
+name = "rusty"
+path = "src/bin/rusty.rs"
+
+# No external deps in B0 (std-only scaffold). Runtime deps (tokio/axum/memmap2/
+# bollard/half) are introduced band-by-band in B1..B9 so `cargo build` stays offline-green.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
