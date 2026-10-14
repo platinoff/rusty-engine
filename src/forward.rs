@@ -117,6 +117,113 @@ pub fn logits_from_hidden(x: &[f32], out_w: &[f32], g: &Geometry, n_vocab: usize
     matvec(out_w, n_vocab, g.d_model, x)
 }
 
+/// Multi-position prefill: one transformer block over a `seq × d_model` row-major buffer.
+/// Attention is causal + GQA + RoPE (head-major); FFN is applied per row. Returns a
+/// `seq × d_model` buffer. `pos_start` is the absolute position of row 0 (so prompts
+/// continue RoPE from the previous context on decode steps).
+pub fn block_forward_seq(
+    x_seq: &[f32],
+    w: &BlockWeights,
+    g: &Geometry,
+    pos_start: usize,
+) -> Vec<f32> {
+    let seq = x_seq.len() / g.d_model;
+    assert_eq!(
+        seq * g.d_model,
+        x_seq.len(),
+        "block_forward_seq: seq × d_model"
+    );
+
+    // Attention: rmsnorm(x) per row → q/k/v projection per row → head-major causal
+    // attention over [0..=i] at position `pos_start + i`, RoPE on q/k → per-row concat.
+    let kv_dim = g.n_kv_heads * g.head_dim;
+    let q_dim = g.n_heads * g.head_dim;
+    let mut x_norm = vec![0.0f32; seq * g.d_model];
+    let mut q_all = vec![0.0f32; seq * q_dim];
+    let mut k_all = vec![0.0f32; seq * kv_dim];
+    let mut v_all = vec![0.0f32; seq * kv_dim];
+    for (i, row) in x_seq.chunks_exact(g.d_model).enumerate() {
+        let n = rmsnorm(row, &w.attn_norm, g.rms_eps);
+        x_norm[i * g.d_model..(i + 1) * g.d_model].copy_from_slice(&n);
+        q_all[i * q_dim..(i + 1) * q_dim].copy_from_slice(&matvec(&w.q, q_dim, g.d_model, &n));
+        k_all[i * kv_dim..(i + 1) * kv_dim].copy_from_slice(&matvec(&w.k, kv_dim, g.d_model, &n));
+        v_all[i * kv_dim..(i + 1) * kv_dim].copy_from_slice(&matvec(&w.v, kv_dim, g.d_model, &n));
+    }
+    let scale = 1.0 / (g.head_dim as f32).sqrt();
+    let mut attn_ctx = vec![0.0f32; seq * q_dim];
+    for h in 0..g.n_heads {
+        let hs = h * g.head_dim;
+        let kv_h = (h * g.n_kv_heads / g.n_heads) * g.head_dim;
+        // Pre-rotate K once per head; V needs no rotation.
+        let mut k_rot: Vec<Vec<f32>> = Vec::with_capacity(seq);
+        for j in 0..seq {
+            let k_raw = &k_all[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
+            k_rot.push(rope(k_raw, pos_start + j, g.rope_freq_base));
+        }
+        for i in 0..seq {
+            let q_raw = &q_all[i * q_dim + hs..i * q_dim + hs + g.head_dim];
+            let q_r = rope(q_raw, pos_start + i, g.rope_freq_base);
+            // Causal scores over 0..=i, softmax, then weighted sum of v-rows.
+            let scores: Vec<f32> = (0..=i)
+                .map(|j| q_r.iter().zip(&k_rot[j]).map(|(a, b)| a * b).sum::<f32>() * scale)
+                .collect();
+            let probs = softmax(&scores);
+            for d in 0..g.head_dim {
+                let mut acc = 0.0f32;
+                for (j, p) in probs.iter().enumerate() {
+                    acc += *p * v_all[j * kv_dim + kv_h + d];
+                }
+                attn_ctx[i * q_dim + hs + d] = acc;
+            }
+        }
+    }
+    // Output projection per row + residual.
+    let mut y = vec![0.0f32; seq * g.d_model];
+    for i in 0..seq {
+        let o_row = matvec(
+            &w.o,
+            g.d_model,
+            g.n_heads * g.head_dim,
+            &attn_ctx[i * q_dim..(i + 1) * q_dim],
+        );
+        for d in 0..g.d_model {
+            y[i * g.d_model + d] = x_seq[i * g.d_model + d] + o_row[d];
+        }
+    }
+    // FFN per row (SwiGLU): rmsnorm → gate/up/down, add residual.
+    let mut z = vec![0.0f32; seq * g.d_model];
+    for i in 0..seq {
+        let row = &y[i * g.d_model..(i + 1) * g.d_model];
+        let ffn = expert_ffn(
+            &rmsnorm(row, &w.ffn_norm, g.rms_eps),
+            &w.ffn_gate,
+            &w.ffn_up,
+            &w.ffn_down,
+            g.d_model,
+            g.d_ff,
+        );
+        for d in 0..g.d_model {
+            z[i * g.d_model + d] = row[d] + ffn[d];
+        }
+    }
+    z
+}
+
+/// Final RMS-norm over the last row, then project to logits.
+pub fn last_logits(
+    hidden_seq: &[f32],
+    g: &Geometry,
+    out_norm: &[f32],
+    out_w: &[f32],
+    n_vocab: usize,
+) -> Vec<f32> {
+    let seq = hidden_seq.len() / g.d_model;
+    assert!(seq >= 1, "last_logits: at least one row");
+    let last = &hidden_seq[(seq - 1) * g.d_model..seq * g.d_model];
+    let normed = rmsnorm(last, out_norm, g.rms_eps);
+    logits_from_hidden(&normed, out_w, g, n_vocab)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

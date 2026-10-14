@@ -2,34 +2,41 @@
 
 ## Owner product pick: `rusty-engine`
 
-> Unknown pick = AskQuestion; інакше продовжувати з `docs/HANDOFF_NEW_SESSION.md`.
+> Unknown pick = AskQuestion; iнакше продовжувати з `docs/HANDOFF_NEW_SESSION.md`.
 
 ## Стан
 
 **B0 = `[x]`** (2026-10-14) — portable-plugin `S:/rust/rusty-engine`: pure-Rust MoE-двигун
 (GGUF-first), MIT, під GSV-хабом; workspace + bin `rusty` + `xtask`; Rust-MoE `top_k`-роутер.
 **B1 = `[x]`** (2026-10-14) — GGUF-чанкер завершено: header+KV→tensor-info→mmap/staged→
-block-sizes+Q4_0/Q8_0 dequant→tokenizer-meta. **35 тестів**, clippy `-D` 0. Коміти локальні,
+block-sizes+Q4_0/Q8_0 dequant→tokenizer-meta. clippy `-D` 0. Коміти локальні,
 **без push** (GitHub remote — B11 `PH-1105`).
 
-## Наступний крок (B2 залізо: repack/SIMD, або реальна модель)
+## Наступний крок
 
-Done цього сеансу: **B1 `PH-101..107` + `PH-105b`** (контейнер + real-file parity + **byte-level BPE
-encode/decode**), баг `ggml_dtype` знайдено/виправлено + регресійний тест; **B4-core `PH-401/402/403`
-+ `PH-406a`** (router/SwiGLU/shared + **`moe_layer_forward` шар**); **B3-primitives `PH-301..304`**
-(RMSNorm+attention+paged-KV+sampler) + **`PH-305a`** (mmap→byte-range→**real Q6_K dequant 4.36M finite**);
-**B2 `PH-201`+`PH-201+`+`PH-201c`** (fused dot/gemv Q4_0/Q8_0 + скалярний reference-dequant Q4_K/Q5_K/Q6_K **+ Q5_0** —
-real `token_embd` dequantize 136M finite → **embedding розблоковано**) —
-**79 тести**, clippy `-D` 0, ratio Rust 96%. Модель у `data/models/` (gitignored).
-**Checkpoint «verify+research»:** зріз стану — [`docs/STATUS.md`](STATUS.md); порівняння рушіїв —
-[`docs/research/engine-landscape-2026.md`](research/engine-landscape-2026.md); offset-семантика +
-GGML-кеш — `docs/research/`.
+Done цього сеансу: **B1** (контейнер + real-file parity + **byte-level BPE encode/decode**),
+баг `ggml_dtype` знайдено/виправлено; **B4-core** (`PH-401/402/403/406a` router/SwiGLU/shared
++ `moe_layer_forward`); **B3-primitives** `PH-301..304` + `PH-305a/c/d/e` (RMSNorm/attention/
+paged-KV/sampler + real mmap→Q6_K dequant + `ModelConfig` + `block_forward` + `validate`).
+**B3 `PH-305`/`PH-306` ЗАВЕРШЕНО** — `src/runner.rs` `DenseRunner` = повний multi-layer forward
+на справжній Qwen2.5: `block_forward_seq` (causal-GQA + RoPE, per-row SwiGLU + residual) →
+final rmsnorm → `output` → logits. `quant::dequant` додав **F32/F16** гілки (норми реальних
+моделей). `tests/dense_gen.rs`: synth 2-layer greedy→token 4 + `#[ignore]` real-Qwen prefill
+→ **151 936 finite logits** (усі 24 шари, pure-Rust). CLI `rusty run -m <model> -t "ids"
+[--max-tokens N]` (PH-306, numeric tokens). **84 тести** (78 lib + 2 dense + 4 scaffold),
+clippy `-D` 0, ratio Rust ~96%. Модель у `data/models/` (gitignored).
+**Checkpoint:** зріз стану — `docs/STATUS.md`; порівняння рушіїв —
+`docs/research/engine-landscape-2026.md`; offset-семантика — `docs/research/`.
 
 Наступна `agi` обирає:
-1. **`PH-305` dense forward** (⭐ embedding тепер деquantizeʼться — Q5_0 готовий): лишилось
-   **multi-layer loop** (embed→rmsnorm→attn q/k/v/o GQA+RoPE→FFN ×24 + residual → `output`→logits)
-   + **HF-exact Qwen parity** (`PH-305b`: `pre`-regex, byte-fallback, specials) → golden-токен.
-2. **B2 залізо** `PH-202/203/204` — repack + SSE/AVX/NEON dispatch, `cargo bench` проти oracle.
+1. **`PH-305b` HF-exact Qwen BPE** (⭐ читабельний текст): qwen2 `pre`-regex, byte-fallback,
+   specials → `rusty run` друкує слова, не id.
+2. **`PH-405` llama/HF greedy-parity** (⭐ gate): perplexity-smoke + greedy token match на
+   коротких промптах проти llama-rs (підлога вже живе) — чисельна довіра до `PH-305`.
+3. **B2 залізо** `PH-202/203/204` — repack + SSE/AVX/NEON dispatch, `cargo bench` проти oracle
+   (std-testable, без референсу).
+4. **B4 `PH-406`** run Qwen3-30B-A3B / Mixtral GGUF (реальна MoE-модель + expert-цикл на
+   деquant-тензорах; потребує `PH-305`-подібного runner для MoE-шарів).
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
 
@@ -41,9 +48,10 @@ subagent-ах. Не тягну весь llama.cpp/vLLM у вікно за раз
 
 - `rusty-engine-bootstrap` (B0) — 10/10 **done** (сесія 2026-10-14).
 - `rusty-engine-gguf` (B1) — банда **завершена**: `PH-101..107` + **`PH-105b`** (BPE) **done** (2026-10-14).
-- `rusty-engine-moe-core` (B4) — `PH-401/402/403` **done** (router+SwiGLU+shared) + **`PH-406a` `moe_layer_forward`** (повний цикл шару, детермін.), `PH-404/405/406/407` **open** (потребують реальної GGUF-моделі).
-- B3 primitives (`PH-301..304`) + **`PH-305a`** (real mmap→dequant) + **`PH-305c`** (`ModelConfig`) + **`PH-305d`** (`forward::block_forward`) + **`PH-305e`** (`validate`, CLI `rusty validate`) — **done**; real Qwen2.5 **geometry-validated OK (24 layers, dims match)**. `PH-305` (multi-layer loop over real tensors + KV cache)/`PH-306`/`PH-305b`/`PH-405` (llama parity) **open**.
-- B2 — `PH-201` + `PH-201+` + **`PH-201c` (Q5_0)** **done** (fused dot Q4_0/Q8_0 + K-quant + Q5_0 scalar reference); `PH-202..204` **open** (repack/SIMD/fused-gemv).
+- `rusty-engine-moe-core` (B4) — `PH-401/402/403` + `PH-406a` **done**; `PH-404/405/406/407` **open**.
+- B3 primitives + **`PH-305a/c/d/e`** + **`PH-305`/`PH-306`** **done** (real Qwen2.5 24-layer
+  dense forward OK, CLI `rusty run`). `PH-305b` (HF BPE) + `PH-405` (llama-parity) **open**.
+- B2 — `PH-201` + `PH-201+` + **`PH-201c` (Q5_0)** + **F32/F16 dequant** **done**; `PH-202..204` **open**.
 
 ## Reminder (session law)
 

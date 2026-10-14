@@ -86,13 +86,13 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B3 — Dense forward (control path)  **`[~]` (PH-301..304 + PH-305a/c/d/e done, 2026-10-14)**
+## Band B3 — Dense forward (control path)  **`[x]` (PH-301..306 done, 2026-10-14)**
 
-> Мета: згенерувати текст на DENSE-моделі як контроль перед MoE. Примітиви готові;
-> **реальна вага матеріалізується** (`PH-305a`: mmap→byte-range→Q6_K dequant, 4.36M finite)
-> **і конфіг зчитано** (`PH-305c`: qwen2 24·896·14·GQA-2·4864, CLI `rusty config`).
-> Лишилось для `PH-305/306`: **single-block real forward** + **multi-layer loop** +
-> **HF-exact Qwen parity** (`PH-305b`: BPE pre-regex/byte-fallback/specials).
+> Мета: згенерувати текст на DENSE-моделі як контроль перед MoE. **Досягнуто** —
+> `DenseRunner` веде повний multi-layer forward (embed→24×block_forward_seq→rmsnorm→
+> output→argmax) на **справжній** Qwen2.5-0.5B GGUF; CLI `rusty run` генерує greedy
+> за числовими id. Числова parity з llama.cpp/HF (`PH-405`) + HF-exact BPE
+> (`PH-305b`: `pre`-regex/byte-fallback/specials) → окремі смуги.
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
@@ -104,8 +104,8 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-305c | GGUF **model config reader** (forward-loop geometry) | `[x]` | `src/model.rs` — `ModelConfig::from_file`/`head_dim`/`is_moe`; CLI `rusty config`; real qwen2 24/896/14/2/4864; synth+missing-arch tests |
 | PH-305d | **transformer decode-step forward** (attn+FFN+residual) | `[x]` | `src/forward.rs` — `block_forward`/`attention_decode`/`logits_from_hidden`/`Geometry`/`BlockWeights`; toy-oracle: residual-identity + known greedy token + GQA; llama-parity → PH-405 |
 | PH-305e | **tensor-geometry validation** (name+dims vs config) | `[x]` | `src/model.rs` — `ModelConfig::validate` (token_embd/output/output_norm + per-block attn/ffn req, qk_norm/bias opt); CLI `rusty validate`; real Qwen2.5 24-layer OK; synth match+mismatch tests |
-| PH-305 | end-to-end dense-генерація (TinyLlama/Qwen2 GGUF), golden tokens | `[ ]` | `tests/dense_gen.rs` |
-| PH-306 | CLI `rusty run -m model.gguf -p "..."` | `[ ]` | `src/bin/rusty.rs` |
+| PH-305 | **end-to-end dense forward** (multi-layer loop, real GGUF), greedy | `[x]` | `src/runner.rs` `DenseRunner::from_model/prefill_logits/greedy/generate` + `forward::block_forward_seq`/`last_logits` (causal GQA+RoPE, per-row FFN, residual); quant `F32`/`F16` dequant branches (norms/small tensors); `tests/dense_gen.rs` synth 2-layer greedy=token4 + `#[ignore]` real Qwen2.5 24-layer prefill 151 936 logits finite |
+| PH-306 | CLI `rusty run -m <model> -t "ids" [--max-tokens N]` | `[x]` | `src/bin/rusty.rs` — `run()` numeric-token greedy (BPE HF-parity → `PH-305b`) |
 
 ---
 

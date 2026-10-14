@@ -20,7 +20,7 @@ fn main() {
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  config <file>             read model hyperparameters (PH-305c)");
             println!("  validate <file>           check tensor names/dims vs config (PH-305e)");
-            println!("  run -m <model>            generate text              (band B3)");
+            println!("  run -m <model> -t <ids>  dense greedy generation (PH-306)");
             println!("  serve                     OpenAI-compat server       (band B5)");
             println!("  node                      Wi-Fi slave runtime        (band B7)");
             println!("  hub                       GSV master supervisor      (band B8)");
@@ -53,6 +53,7 @@ fn main() {
                 std::process::exit(2);
             }
         },
+        Some("run") => run(args),
         Some(other) => {
             println!(
                 "{}: subcommand '{other}' is scaffolded (bands B1+)",
@@ -226,4 +227,90 @@ fn validate(path: &str) {
             std::process::exit(1);
         }
     }
+}
+
+/// `rusty run -m <model.gguf> -t "0,1,2" [--max-tokens N]` — dense greedy generation
+/// (PH-306). Tokens are numeric ids (BPE HF-parity is PH-305b, a separate band).
+fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
+    let mut model_path: Option<String> = None;
+    let mut tokens: Vec<u32> = Vec::new();
+    let mut max_new = 8usize;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-m" | "--model" => model_path = args.next(),
+            "-t" | "--tokens" => {
+                if let Some(spec) = args.next() {
+                    tokens = spec
+                        .split(',')
+                        .map(|x| x.trim())
+                        .filter(|x| !x.is_empty())
+                        .map(|x| {
+                            x.parse::<u32>().unwrap_or_else(|_| {
+                                eprintln!("rusty run: bad token id '{x}'");
+                                std::process::exit(2)
+                            })
+                        })
+                        .collect();
+                }
+            }
+            "--max-tokens" => {
+                max_new = args.next().map_or(8, |v| {
+                    v.parse::<usize>().unwrap_or_else(|_| {
+                        eprintln!("rusty run: bad --max-tokens");
+                        std::process::exit(2)
+                    })
+                })
+            }
+            other => {
+                eprintln!("rusty run: unknown arg '{other}'");
+                std::process::exit(2);
+            }
+        }
+    }
+    let path = match model_path {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            eprintln!("usage: rusty run -m <model.gguf> -t \"0,1,2\" [--max-tokens N]");
+            std::process::exit(2);
+        }
+    };
+    if tokens.is_empty() {
+        eprintln!("rusty run: no prompt tokens (use -t \"id,id,...\")");
+        std::process::exit(2);
+    }
+    let model = match unsafe { rusty_engine::loader::MmapModel::open(Path::new(&path)) } {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("rusty run {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let cfg = match rusty_engine::model::ModelConfig::from_file(model.header()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("rusty run {path}: config: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(prob) = cfg.validate(model.header()).first() {
+        eprintln!("rusty run {path}: geometry invalid: {prob}");
+        std::process::exit(1);
+    }
+    let runner = match rusty_engine::runner::DenseRunner::from_model(&model, &cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("rusty run {path}: runner: {e}");
+            std::process::exit(1);
+        }
+    };
+    let out = runner.generate(&tokens, max_new);
+    let ids: Vec<String> = out.iter().map(|t| t.to_string()).collect();
+    println!(
+        "[{}] {} layers — prompt {:?} -> {}",
+        cfg.arch,
+        cfg.n_layers,
+        tokens,
+        ids.join(",")
+    );
+    std::process::exit(0);
 }

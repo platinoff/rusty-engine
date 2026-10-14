@@ -85,13 +85,15 @@ reference-dequant Q4_K/Q5_K/Q6_K (`src/quant.rs` — `dequant_q{4,5,6}_k` + `get
 faithful з C: Q5_K ділить 6-bit layout, Q6_K signed `int8 scales` без таблиці, −32 bias).
 **61 тести**, clippy `-D` 0. C-ref кеш — `docs/research/ggml-blocks.md`.
 
-**Наступний крок:** реальна вага матеріалізується **і** BPE-core готовий (`PH-105b` round-trip).
-Повний **`PH-305` dense forward** лишив: **multi-layer loop** (rmsnorm→attn(q/k/v/o+GQA+RoPE)→FFN
-×24 + residual → `output`→logits) + **HF-exact Qwen parity** токена (`PH-305b`: `pre`-regex,
-byte-fallback, specials). Plan loop — `docs/research/gguf-tensor-offsets.md`. Паралельно B2 залізо
-**70 тести** загалом → **+`PH-201c` Q5_0**: `dequant_q5_0` (22B `{d,qh,qs}`, bias −16) + `DType::Q5_0` +
-`ggml_dtype(6)` → **real `token_embd` (Q5_0) dequantize 136 134 656 finite → embedding розблоковано**,
-offset самозгоджений з наступним тензором. **+`PH-305c`**: `src/model.rs` `ModelConfig::from_file`
-(arch + `<arch>.*/general.*` → n_layers/d_model/heads/kv_heads/d_ff/vocab/rope_base/rms_eps/experts)
-**73 тести**, clippy `-D` 0. **+`PH-305d`**: `src/forward.rs` `block_forward` (rmsnorm→multi-head GQA attn+RoPE→residual→rmsnorm→SwiGLU FFN→residual) + `logits_from_hidden`, верифіковано toy-ораклом (residual-identity + відомий greedy-токен). **`PH-305e`**: `ModelConfig::validate` (імʼя+dims кожного тензора vs геометрія конфігу) + CLI `rusty validate` → **real Qwen2.5 = OK (усі 24 шари dims-збіг)**; qwen2 фінальна норма = `output_norm.weight` (+ синт match/mismatch). **77 тести**, clippy `-D` 0.
-`docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
+**B3 — Dense forward (control path):** `[x]` — **PH-301/302/303/304 + PH-305a/c/d/e + PH-305 + PH-306 done** (2026-10-14):
+повний **multi-layer dense forward** на справжній Qwen2.5-0.5B (`src/runner.rs` `DenseRunner::
+from_model/prefill_logits/greedy/generate` + `forward::block_forward_seq` causal-GQA + RoPE +
+per-row SwiGLU + residual → final rmsnorm → `output` → logits). `quant::dequant` додав **F32/F16**
+гілки (норми реальних моделей → 78 lib tests). CLI `rusty run -m <model> -t "ids" [--max-tokens N]`
+(PH-306) — greedy на числових id; HF-exact BPE (`PH-305b`) та llama-parity (`PH-405`) → окремі смуги.
+**84 тести** (78 lib + 2 dense + 4 scaffold), clippy `-D` 0, ratio ~96%. Real-Qwen `#[ignore]`-smoke:
+prefill `[151644, 872, 198]` → **151 936 finite logits** (усі 24 шари pure-Rust).
+
+**Наступний крок:** `PH-305b` HF-exact BPE (читабельний текст у CLI) **або** `PH-405`
+llama/HF greedy-parity gate (чисельна довіра) **або** B2 `PH-202..204` (repack/SIMD).
+План — `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.

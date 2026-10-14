@@ -232,10 +232,34 @@ pub fn dequant_q6_k(data: &[u8]) -> Vec<f32> {
     out
 }
 
-/// Dispatch scalar dequant by `GGML_TYPE_*` for all supported formats
-/// (F32/F16 are `PH-104`-not-applicable here; Q4_0/Q8_0/Q4_K/Q5_K/Q6_K handled).
+/// Dispatch scalar dequant by `GGML_TYPE_*` for all supported formats.
+/// F32/F16 are read directly (they carry no quantization — norms and small tensors
+/// stay in these types on real Q4_K_M models). Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K use the
+/// block oracles above.
 pub fn dequant(ggml_type: u32, data: &[u8]) -> Result<Vec<f32>> {
     match ggml_type {
+        0 => {
+            if data.len() % 4 != 0 {
+                return Err(EngineError {
+                    message: format!("F32 data len {} not a multiple of 4", data.len()),
+                });
+            }
+            Ok(data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+        1 => {
+            if data.len() % 2 != 0 {
+                return Err(EngineError {
+                    message: format!("F16 data len {} not a multiple of 2", data.len()),
+                });
+            }
+            Ok(data
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect())
+        }
         2 => {
             if data.len() % 18 != 0 {
                 return Err(EngineError {
@@ -481,5 +505,33 @@ mod tests {
         let out = dequant_q6_k(&b);
         assert_eq!(out.len(), 256);
         assert!(out.iter().all(|&v| (v + 32.0).abs() < 1e-5));
+    }
+
+    #[test]
+    fn dequant_f32_roundtrips_le_bytes() {
+        // 3 f32 values little-endian.
+        let mut bytes = Vec::new();
+        for v in [1.5f32, -2.0, 0.125] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let out = dequant(0, &bytes).expect("F32 dequant");
+        assert_eq!(out, vec![1.5, -2.0, 0.125]);
+    }
+
+    #[test]
+    fn dequant_f16_uses_f16_to_f32() {
+        // 0x3C00 = 1.0, 0x4000 = 2.0, 0xCC00 = -16.0 (sign=1, exp=19-15=4, frac=0).
+        let bytes: Vec<u8> = [0x3C00u16, 0x4000, 0xCC00]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let out = dequant(1, &bytes).expect("F16 dequant");
+        assert_eq!(out, vec![1.0, 2.0, -16.0]);
+    }
+
+    #[test]
+    fn dequant_f32_rejects_partial_word() {
+        let err = dequant(0, &[0u8; 3]).expect_err("F32 length must be multiple of 4");
+        assert!(err.message.contains("F32"), "{err:?}");
     }
 }
