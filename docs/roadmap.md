@@ -151,7 +151,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-501 | HTTP server (tokio+axum) — `/v1/models`,`/v1/chat/completions` | `[ ]` | `src/serve/http.rs` |
 | PH-501 | HTTP server (tokio+axum) — `/v1/models`,`/v1/chat/completions` | `[ ]` | `src/serve/http.rs` |
 | PH-502 | **SSE-стрімінг токенів, stop-tokens, usage** | `[~]` | `src/http.rs` — `sse_body` (OpenAI `chat.completion.chunk` + `finish_reason:stop` + `data:[DONE]`, event-framed) + `body_of`/`wants_stream`; `route` → `text/event-stream`; serve.rs wire-тест `[DONE]`. Інкрементні socket-writes + usage → далі |
-| PH-503 | prompt-cache / multi-slot | `[ ]` | `src/serve/slot.rs` |
+| PH-503 | prompt-cache / multi-slot | `[x]` | `src/slot.rs` — `Slot`/`SlotTable` (capacity LRU, `open`/`get`/`append`/`close`/`prompt_cached` + hits/misses/evictions); KV per-slot → `DenseDecoder`. 6 unit (evict/open-preserves/append/prefix-cache/close) |
 | PH-504 | **GSV keep-live `target/live/rusty_heartbeat.json`** | `[x]` | `src/hub.rs` — `Heartbeat` (`to_json` без serde) + `is_fresh` (saturating, clock-skew-safe) + `write_heartbeat`; serve stamp при startup+кожне зʼєднання (15s/60s cadence з `hub.rs`); CLI `rusty heartbeat`. 3 hub unit |
 | PH-505 | метрики tok/s·RAM·active-experts endpoint | `[~]` | `src/hub.rs` — `Metrics` (`zero`/`record`/`tok_per_sec` zero-guard/`to_json`) + `GET /metrics` (`http::route_with`); serve рахує calls per-conn. RAM + tok/s на реальних токенах → B5 далі |
 | PH-506 | integration test + smoke curl | `[ ]` | `tests/serve.rs` |
