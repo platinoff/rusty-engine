@@ -35,7 +35,8 @@ synth round-trip). **+ B3 `PH-307` incremental decode + KV** (`forward::LayerKv`
 `block_forward_cached`, `runner::DenseDecoder` — O(1)/крок, `full == incremental`
 еквівалентність). **+ B3 `PH-304b` sampler wiring** (`GenerationOptions.repetition_penalty`,
 `infer::SeedRng` xorshift64*, `DenseRunner::generate_with` — temp/top-k/top-p/repetition,
-`temp<=0`==greedy). **115 тести** (104 lib + 5 dense + 2 text + 4
+`temp<=0`==greedy). **+ B4 `PH-404b` MoE forward через cache** (`moe_layer_forward_cached`
+→ `get_or_load` per expert; == resident forward при детерм. loader). **117 тести** (106 lib + 5 dense + 2 text + 4
 scaffold), clippy `-D` 0, ratio Rust ~96%. Модель у `data/models/` (gitignored).
 **Checkpoint:** зріз стану — `docs/STATUS.md`; порівняння рушіїв —
 `docs/research/engine-landscape-2026.md`; offset-семантика — `docs/research/`.
@@ -59,7 +60,7 @@ subagent-ах. Не тягну весь llama.cpp/vLLM у вікно за раз
 
 - `rusty-engine-bootstrap` (B0) — 10/10 **done** (сесія 2026-10-14).
 - `rusty-engine-gguf` (B1) — банда **завершена**: `PH-101..107` + **`PH-105b`** (BPE) **done** (2026-10-14).
-- `rusty-engine-moe-core` (B4) — `PH-401/402/403` + `PH-406a` + **`PH-404` expert-cache LRU** **done**; `PH-405/406/407` **open** (реальна MoE GGUF + llama-rs-оракул).
+- `rusty-engine-moe-core` (B4) — `PH-401/402/403` + `PH-406a` + **`PH-404` expert-cache LRU** + **`PH-404b` MoE forward через cache** **done**; `PH-405/406/407` **open** (реальна MoE GGUF + llama-rs-оракул).
 - B3 primitives + **`PH-305a/c/d/e`** + **`PH-305`/`PH-306`** **done** (real Qwen2.5 24-layer
   dense forward OK, CLI `rusty run`). `PH-305b` (HF BPE) + `PH-405` (llama-parity) **open**.
 - B2 — `PH-201` + `PH-201+` + **`PH-201c` (Q5_0)** + **F32/F16 dequant** **done**; `PH-202..204` **open**.
