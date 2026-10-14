@@ -14,15 +14,13 @@ block-sizes+Q4_0/Q8_0 dequant→tokenizer-meta. **35 тестів**, clippy `-D`
 
 ## Наступний крок (B3 attention/KV primitives — std, далі модель)
 
-Done цього сеансу: **B1 `PH-101..107`** (GGUF-контейнер, завершено), **B4-core `PH-401/402/403`**
-(router/SwiGLU/shared), **B3-primitives `PH-301/304`** (RMSNorm + sampler) — **50 тестів**, clippy `-D` 0.
+Done цього сеансу: **B1 `PH-101..107`** (GGUF-контейнер завершено), **B4-core `PH-401/402/403`**
+(router/SwiGLU/shared), **B3-primitives `PH-301/302/303/304`** (RMSNorm + attention `rope`/
+`apply_causal_mask`/`attention_causal`/`gqa_repeat_kv` + `PagedKvCache` + sampler) — **53 тести**, clippy `-D` 0.
 
-Наступний std-testable зріз (без моделі):
-1. `PH-302` **attention primitives** (`src/infer/attn.rs`): causal-mask, GQA/MQA broadcast, RoPE —
-   unit на синтетичних Q/K/V.
-2. `PH-303` **paged KV-cache** (`src/infer/kvcache.rs`): slab alloc + round-trip.
-Далі залежне від моделі/dep: `PH-305` dense golden (+`PH-306` `rusty run`), B2 `PH-201`
-(K-quant dequant + SIMD), B4 `PH-404..407` (expert-cache/parity/run/bench — реальна GGUF-модель).
+Чистих **std-зрізів без моделі** в B1/B3/B4 більше не лишилось. Наступна `agi` — на вибір:
+1. **B2 `PH-201`** scalar K-quant dequant + SIMD — ще possible «без моделі» (ручні block-вектори).
+2. **`PH-305`/`PH-406`** dense+MoE forward golden — потребує завантажити Tiny/real GGUF + deps.
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
 
@@ -35,6 +33,7 @@ subagent-ах. Не тягну весь llama.cpp/vLLM у вікно за раз
 - `rusty-engine-bootstrap` (B0) — 10/10 **done** (сесія 2026-10-14).
 - `rusty-engine-gguf` (B1) — банда **завершена**: `PH-101..107` усі **done** (2026-10-14).
 - `rusty-engine-moe-core` (B4) — банда створена: `PH-401/402/403` **done** (router+SwiGLU+shared), `PH-404..407` **open** (потребують реальної GGUF-моделі).
+- B3 primitives (standalone тікети `PH-301/302/303/304`) — **done**; `PH-305/306` **open** (модель).
 
 ## Reminder (session law)
 

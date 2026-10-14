@@ -55,11 +55,12 @@ group-score + top_k_group restrict); `expert_ffn` = `down(swiglu(gate,up))` (`si
 `combine` shared-expert merge (shape-validated, shared=Some/None). **44 тести**, clippy `-D` 0.
 Фактаж — `docs/research/moe-router.md`.
 
-**B3 — Dense forward (частково):** `[~]` — **PH-301 + PH-304 done** (`src/infer.rs`, pure-f32):
-`rmsnorm`; sampler chain `sample`/`apply_temperature`/`mask_top_k`/`mask_top_p`/`apply_repetition_penalty`/`argmax`
-(детермінований `r`). **50 тести** загалом, clippy `-D` 0.
+**B3 — Dense forward (частково):** `[~]` — **PH-301/302/303/304 done** (`src/infer.rs`, pure-f32):
+`rmsnorm`; attention primitives `rope`/`apply_causal_mask`/`attention_causal`/`gqa_repeat_kv`;
+`PagedKvCache` (append/get across pages); sampler chain `sample`/`apply_temperature`/`mask_top_k`/
+`mask_top_p`/`apply_repetition_penalty`/`argmax` (детермінований `r`). **53 тести**, clippy `-D` 0.
 
-**Наступний крок:** B3 `PH-302` attn primitives (causal/GQA/RoPE) + `PH-303` paged-KV (обидва
-std-testable, без моделі) → потім `PH-305` dense golden (реальний GGUF + deps) і B4 `PH-404..407`
-(expert-cache/parity/run/bench — теж потребують моделі). Опційно B2 (`PH-201` K-quant dequant+SIMD).
-Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
+**Наступний крок (стеліть «мільйон-контекст»):** далі **потрібна реальна GGUF-модель** —
+`PH-305` dense golden (multi-head loop + RoPE-cache + forward → токени), `PH-306` `rusty run`,
+B4 `PH-404..407` (expert-cache/parity/run/bench). Або **B2** (`PH-201` K-quant dequant + SIMD,
+std-testable) як наступний чистий зріз без моделі. Канон: `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
