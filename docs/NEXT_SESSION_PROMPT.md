@@ -29,7 +29,9 @@ final rmsnorm → `output` → logits. `quant::dequant` додав **F32/F16** �
 LRU + pin + prefetch, longest-first → atomic ids); **`src/gpt2.rs`** std-only GPT-2/Qwen2 pre-tokenizer
 (`gpt2_pre_split`, wired into `Bpe::encode`). **+ B2 `PH-202` repack** (`src/repack.rs`,
 `RepackedQ4_0`/`Q8_0` — contiguous scales + de-interleaved nibbles, **exact** vs the
-fused kernels). **108 тести** (102 lib + 2 dense + 4
+fused kernels). **+ B3 `PH-306b` text pipeline** (`src/textgen.rs` `TextRunner`
+= Bpe + DenseRunner; `rusty run -p "text"` prints generated text; `tests/text_gen.rs`
+synth round-trip). **110 тести** (102 lib + 2 dense + 2 text + 4
 scaffold), clippy `-D` 0, ratio Rust ~96%. Модель у `data/models/` (gitignored).
 **Checkpoint:** зріз стану — `docs/STATUS.md`; порівняння рушіїв —
 `docs/research/engine-landscape-2026.md`; offset-семантика — `docs/research/`.

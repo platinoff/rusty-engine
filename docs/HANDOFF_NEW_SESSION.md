@@ -91,15 +91,17 @@ relative tol). Реальна Qwen2.5 вага — Q4_K_M мікс: attn/ffn Q4_
 ядра дадуть ~10× менше памʼяті під forward (B4 expert-cache). Лишилось repack (`PH-202`)
 + SIMD dispatch (`PH-203`) + bench (`PH-205`).
 
-**B3 — Dense forward (control path):** `[x]` — **PH-301/302/303/304 + PH-305a/c/d/e + PH-305 + PH-306 done** (2026-10-14):
+**B3 — Dense forward (control path):** `[x]` — **PH-301..306 + PH-305a/c/d/e/b + PH-305 + PH-306b done** (2026-10-14):
 повний **multi-layer dense forward** на справжній Qwen2.5-0.5B (`src/runner.rs` `DenseRunner::
 from_model/prefill_logits/greedy/generate` + `forward::block_forward_seq` causal-GQA + RoPE +
 per-row SwiGLU + residual → final rmsnorm → `output` → logits). `quant::dequant` додав **F32/F16**
-гілки (норми реальних моделей → 78 lib tests). CLI `rusty run -m <model> -t "ids" [--max-tokens N]`
-(PH-306) — greedy на числових id; HF-exact BPE (`PH-305b`) та llama-parity (`PH-405`) → окремі смуги.
-**84 тести** (78 lib + 2 dense + 4 scaffold), clippy `-D` 0, ratio ~96%. Real-Qwen `#[ignore]`-smoke:
-prefill `[151644, 872, 198]` → **151 936 finite logits** (усі 24 шари pure-Rust).
+гілки. **`PH-305b`** — BPE **byte-fallback + atomic specials** (`src/tokenizer.rs`) + std-only
+**GPT-2/Qwen2 pre-regex** (`src/gpt2.rs`, wired into `Bpe::encode`). **`PH-306b`** — **text
+pipeline** `src/textgen.rs` `TextRunner` (Bpe + DenseRunner) + `rusty run -p "text"`. CLI
+`rusty run -m <model> -t "ids" | -p "text" [--max-tokens N]` — greedy на числових id / тексті.
+**110 тестів** (102 lib + 2 dense + 2 text + 4 scaffold), clippy `-D` 0, ratio ~96%. Real-Qwen
+`#[ignore]`-smoke: prefill `[151644, 872, 198]` → **151 936 finite logits** (усі 24 шари pure-Rust).
 
-**Наступний крок:** `PH-305b` qwen2 pre-regex parity (bytes-fallback + specials вже landed)
-**або** `PH-405` llama/HF greedy-parity gate (чисельна довіра) **або** B2 `PH-202/203` (repack/SIMD).
+**Наступний крок:** `PH-405` llama/HF greedy + tokenizer.json byte-exact parity gate (чисельна
+довіра) **або** B2 `PH-203/205` (SIMD поверх repack-planes / bench) **або** B4 `PH-406` real MoE GGUF.
 План — `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.

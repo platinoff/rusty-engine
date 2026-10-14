@@ -20,7 +20,8 @@ fn main() {
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  config <file>             read model hyperparameters (PH-305c)");
             println!("  validate <file>           check tensor names/dims vs config (PH-305e)");
-            println!("  run -m <model> -t <ids>  dense greedy generation (PH-306)");
+            println!("  run -m <model> -p <text>  BPE text generation        (PH-306b)");
+            println!("  run -m <model> -t <ids>   numeric-token greedy       (PH-306)");
             println!("  serve                     OpenAI-compat server       (band B5)");
             println!("  node                      Wi-Fi slave runtime        (band B7)");
             println!("  hub                       GSV master supervisor      (band B8)");
@@ -229,15 +230,17 @@ fn validate(path: &str) {
     }
 }
 
-/// `rusty run -m <model.gguf> -t "0,1,2" [--max-tokens N]` — dense greedy generation
-/// (PH-306). Tokens are numeric ids (BPE HF-parity is PH-305b, a separate band).
+/// `rusty run -m <model.gguf> (-p "text" | -t "0,1,2") [--max-tokens N]` — dense greedy
+/// generation. `-p` runs the BPE text pipeline (PH-306b); `-t` uses numeric token ids (PH-306).
 fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
     let mut model_path: Option<String> = None;
     let mut tokens: Vec<u32> = Vec::new();
+    let mut prompt: Option<String> = None;
     let mut max_new = 8usize;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-m" | "--model" => model_path = args.next(),
+            "-p" | "--prompt" => prompt = args.next(),
             "-t" | "--tokens" => {
                 if let Some(spec) = args.next() {
                     tokens = spec
@@ -270,14 +273,12 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
     let path = match model_path {
         Some(p) if !p.is_empty() => p,
         _ => {
-            eprintln!("usage: rusty run -m <model.gguf> -t \"0,1,2\" [--max-tokens N]");
+            eprintln!(
+                "usage: rusty run -m <model.gguf> (-p \"text\" | -t \"0,1,2\") [--max-tokens N]"
+            );
             std::process::exit(2);
         }
     };
-    if tokens.is_empty() {
-        eprintln!("rusty run: no prompt tokens (use -t \"id,id,...\")");
-        std::process::exit(2);
-    }
     let model = match unsafe { rusty_engine::loader::MmapModel::open(Path::new(&path)) } {
         Ok(m) => m,
         Err(e) => {
@@ -285,6 +286,28 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
             std::process::exit(1);
         }
     };
+    // Text pipeline (PH-306b): needs tokenizer.ggml.* meta.
+    if let Some(text) = prompt {
+        let tr = match rusty_engine::textgen::TextRunner::from_model(&model) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("rusty run {path}: {e}");
+                std::process::exit(1);
+            }
+        };
+        match tr.run_text(&text, max_new) {
+            Ok(got) => println!("[{}] {}", tr.runner.n_layers, got),
+            Err(e) => {
+                eprintln!("rusty run {path}: {e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+    if tokens.is_empty() {
+        eprintln!("rusty run: no prompt (use -p \"text\" or -t \"id,id,...\")");
+        std::process::exit(2);
+    }
     let cfg = match rusty_engine::model::ModelConfig::from_file(model.header()) {
         Ok(c) => c,
         Err(e) => {
