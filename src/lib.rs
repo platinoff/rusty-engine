@@ -26,7 +26,9 @@
 //! - [`http`] — std-only request→response layer, pure `route()` (B5 `PH-501a`)
 //! - [`node`]  — slave/worker runtime over local Wi-Fi (B7/B8)
 //! - [`hub`]   — GSV-native master supervisor (Rust k8s-lite, B8)
+//! - [`backend`] — compile-time SIMD backend selection (sse/avx/neon, B6 `PH-606`)
 
+pub mod backend;
 pub mod cache;
 pub mod core;
 pub mod forward;

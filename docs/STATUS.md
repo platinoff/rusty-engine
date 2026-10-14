@@ -8,7 +8,7 @@
 |---------|----------|
 | `git status` | **clean** (0 drift) |
 | Локальні коміти | **37** (B0→B5 serve/heartbeat, без push — remote = B11) |
-| Тести | **154** (140 lib + 5 dense-gen + 3 text-gen + 4 integration + 2 xtask), 0 failed |
+| Тести | **157** (143 lib unit + 5 dense-gen + 3 text-gen + 4 integration + 2 xtask), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
 | Rust LOC | **3909** (`src`+`tests`+`xtask`) |

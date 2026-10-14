@@ -20,8 +20,16 @@ categories = ["science", "command-line-utilities"]
 name = "rusty"
 path = "src/bin/rusty.rs"
 
-# No external deps in B0 (std-only scaffold). Runtime deps (tokio/axum/memmap2/
-# bollard/half) are introduced band-by-band in B1..B9 so `cargo build` stays offline-green.
+[features]
+# SIMD-backend markers for `PH-203` dispatch (`src/backend.rs`); all off by default so the
+# portable scalar oracle is the baseline build. `select()` picks the strongest enabled one.
+default = []
+sse = []
+avx = []
+neon = []
+
+# std-only scaffold; the single non-std runtime dep is `memmap2` (B1 PH-103). Further deps
+# (tokio/axum/half/bollard) land band-by-band so `cargo build` stays offline-green.
 [dependencies]
 memmap2 = "0.9.11"
 

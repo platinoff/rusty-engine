@@ -169,7 +169,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-603 | Linux aarch64 `rusty` (Pi-class) | `[ ]` | matrix |
 | PH-604 | Android arm64 `rusty.apk`/`.so` (cargo-ndk/Termux, **no Docker**) | `[ ]` | `.cargo/config` + ndk |
 | PH-605 | **`cargo xtask build-matrix`** + SHA-256 артефактів | `[x]` | `xtask/src/main.rs` — `TARGETS` matrix (win-gnu/msvc, linux-x86_64/aarch64, android-arm64 no-Docker) + `sha256_hex` (pure `std`, FIPS 180-4, multi-block) + `build-matrix` рендер з хешем наявних бінарників; 2 unit (NIST vectors + coverage). Фікс `main` argv `skip(2)`→`skip(1)` |
-| PH-606 | feature-gated backends (neon/sse/avx, mmap) single-binary | `[ ]` | `Cargo.toml [features]` |
+| PH-606 | **feature-gated backends** (sse/avx/neon single-binary) | `[x]` | `Cargo.toml [features] sse/avx/neon` (default none) + `src/backend.rs` `Backend`/`from_flags`/`compile_backends`/`select` (найсильніший ввімкнений, Scalar-fallback); `cfg(test)`-обмежені під кожен feature-набір. Dispatch-substrate для `PH-203` |
 
 ---
 
