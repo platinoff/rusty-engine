@@ -22,7 +22,9 @@ fn main() {
             println!("  validate <file>           check tensor names/dims vs config (PH-305e)");
             println!("  run -m <model> -p <text>  BPE text generation        (PH-306b)");
             println!("  run -m <model> -t <ids>   numeric-token greedy       (PH-306)");
-            println!("  serve [--port N]          std-only OpenAI-compat HTTP (PH-501a)");
+            println!(
+                "  serve [--port N] [--host H]  OpenAI-compat HTTP, LAN-first :8090 (PH-501a/507)"
+            );
             println!("  heartbeat                 stamp GSV keep-live file   (PH-504)");
             println!("  node                      Wi-Fi slave runtime        (band B7)");
             println!("  hub                       GSV master supervisor      (band B8)");
@@ -341,10 +343,14 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
     std::process::exit(0);
 }
 
-/// `rusty serve [--port N]` — bind loopback and pump `crate::http::route` (PH-501a).
-/// Loopback-only by default (dry-run posture); blocks serving one connection per request.
+/// `rusty serve [--port N] [--host H]` — pump `crate::http::route` (PH-501a).
+/// Band 233 (PH-507): LAN-first — binds `0.0.0.0` by default like `llama_serve`,
+/// so the GSV hub and Wi-Fi/edge peers address it by the machine's local address;
+/// `--host 127.0.0.1` keeps the old loopback-only posture. Serves one connection
+/// per request.
 fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
     let mut port = 8090u16;
+    let mut host = "0.0.0.0".to_string();
     let mut model_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -356,6 +362,7 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
                     })
                 })
             }
+            "--host" => host = args.next().unwrap_or_else(|| "0.0.0.0".to_string()),
             "--model" | "-m" => model_path = args.next(),
             other => {
                 eprintln!("rusty serve: unknown arg '{other}'");
@@ -363,9 +370,9 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
             }
         }
     }
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("{host}:{port}");
     println!(
-        "{} — serving loopback on http://{addr} (Ctrl-C to stop)",
+        "{} — serving on http://{addr} (Ctrl-C to stop)",
         rusty_engine::banner()
     );
     // With a model, wire real BPE→generate→decode (PH-501b); else the stub route.

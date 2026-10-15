@@ -148,10 +148,7 @@ pub fn chat_response(
 ) -> crate::http::Response {
     match runner.complete(json_body, max_new) {
         Ok(text) => {
-            let escaped = text
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n");
+            let escaped = escape_json_text(&text);
             let prompt_len = runner
                 .bpe
                 .encode(&extract_message_content(json_body))
@@ -166,6 +163,37 @@ pub fn chat_response(
         }
         Err(e) => crate::http::Response::json(400, format!(r#"{{"error":"{}"}}"#, e.message)),
     }
+}
+
+/// PH-507: SSE variant of [`chat_response`] — the completion is emitted as one
+/// `chat.completion.chunk` delta event plus the terminating `[DONE]`, the same
+/// minimal streaming contract `llama_serve` (bunke-rock) exposes. The hub can
+/// hold `text/event-stream` against the engine without a client-visible gap.
+pub fn chat_stream_response(
+    runner: &TextRunner,
+    json_body: &str,
+    max_new: usize,
+) -> crate::http::Response {
+    match runner.complete(json_body, max_new) {
+        Ok(text) => {
+            let escaped = escape_json_text(&text);
+            let body = crate::http::sse_body("cmpl-0", "rusty-engine", &[&escaped]);
+            crate::http::Response {
+                status: 200,
+                reason: "OK",
+                content_type: "text/event-stream",
+                body,
+            }
+        }
+        Err(e) => crate::http::Response::json(400, format!(r#"{{"error":"{}"}}"#, e.message)),
+    }
+}
+
+/// JSON-escape a completion for embedding in a response body (PH-501b/507).
+fn escape_json_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[cfg(test)]

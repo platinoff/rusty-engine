@@ -1,7 +1,9 @@
 //! OpenAI-compatible HTTP surface (PH-501, band B5). B0 pins the route constants
 //! so the server, client and UI agree on paths; `PH-501a` adds a **std-only** request→
-//! response layer (`crate::http::route`) and this thin `std::net` pump over it. Loopback
-//! by default (dry-run posture); streaming/multi-slot and real-model wiring land later in B5.
+//! response layer (`crate::http::route`) and this thin `std::net` pump over it. PH-507
+//! moves the bind to LAN-first (band 233): `rusty serve` defaults to `0.0.0.0`,
+//! `--host` overrides. Model chat streams SSE on `stream:true` (PH-507, bunke-rock
+//! contract); full streaming/multi-slot wiring stays in B5.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -48,7 +50,11 @@ pub fn handle_conn(
     let is_chat = head.starts_with("POST ") && head.contains(PATH_CHAT_COMPLETIONS);
     let resp = match model {
         Some(tr) if is_chat => {
-            let r = crate::textgen::chat_response(tr, crate::http::body_of(&text), 8);
+            let r = if crate::http::wants_stream(&text) {
+                crate::textgen::chat_stream_response(tr, crate::http::body_of(&text), 8)
+            } else {
+                crate::textgen::chat_response(tr, crate::http::body_of(&text), 8)
+            };
             metrics.record(0, 0.0, 0);
             r
         }

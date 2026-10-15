@@ -247,3 +247,50 @@ fn serve_with_model_completes_over_the_wire() {
 
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn serve_with_model_streams_sse_over_the_wire() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    // PH-507: stream:true on the real-model path returns text/event-stream with a
+    // chat.completion.chunk delta and the terminating [DONE] — the bunke-rock
+    // streaming contract the GSV hub can mirror for rusty/*.
+    let bytes = synth_text_gguf();
+    std::fs::create_dir_all("target").unwrap();
+    let path = Path::new("target/text_gen_serve_sse.gguf");
+    std::fs::write(path, &bytes).unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let fp = path.to_path_buf();
+    let th = std::thread::spawn(move || {
+        let model = unsafe { MmapModel::open(&fp) }.expect("open in server");
+        let tr = TextRunner::from_model(&model).expect("TextRunner in server");
+        let mut m = rusty_engine::hub::Metrics::zero();
+        rusty_engine::serve::serve_one(&listener, &mut m, Some(&tr)).expect("serve_one+model");
+    });
+
+    let mut client = TcpStream::connect(addr).expect("connect");
+    client
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}",
+        )
+        .expect("write");
+    client.flush().expect("flush");
+    let mut resp = String::new();
+    client.read_to_string(&mut resp).expect("read");
+    th.join().expect("server thread");
+
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+    assert!(
+        resp.contains("Content-Type: text/event-stream\r\n"),
+        "event-stream content type: {resp}"
+    );
+    assert!(resp.contains("chat.completion.chunk"));
+    assert!(
+        resp.ends_with("data: [DONE]\n\n"),
+        "terminated by DONE: {resp}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
