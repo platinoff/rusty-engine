@@ -4,6 +4,16 @@
 
 > Unknown pick = AskQuestion; iнакше продовжувати з `docs/HANDOFF_NEW_SESSION.md`.
 
+## AUTO-DIRECTIVE (owner, 2026-10-15) — на наступне `agi`
+
+Наступного `agi`: **НЕ питати вибору бенду** — одразу брати з черги й **automatically**
+робити **`PH-405b` llama-rs semantic greedy-parity** (live llama-rs as reference oracle):
+greedy token-stream рушія vs llama-rs decode на коротких промптах для тієї ж Qwen2.5-0.5B,
++ `tokenizer.json` byte-exact pre-regex перевірка `Bpe`/`gpt2` проти HF-векторів. Product =
+`rusty-engine`, той же ticket-цикл create→claim→drain→done, один локальний коміт, **без push**
+(B11). Тікети/keep-live за `agi`-скіллом; hub-оракул llama-rs перевірити через `gsv_keep_live`
+перед parity-зрізом. Деталі запуску оракула — у секції «llama-rs parity» нижче.
+
 ## Стан
 
 **B0 = `[x]`** (2026-10-14) — portable-plugin `S:/rust/rusty-engine`: pure-Rust MoE-двигун
@@ -64,6 +74,21 @@ docker → supervisor → dist-MoE → UI → distribs/publish**`. B1–B4 за�
 **Зовнішні гейти (чекають owner/підлогу, NOT pure-`agi` std-slice):** `PH-405` llama-rs
 greedy-parity (оракул) · `PH-406` real MoE `.gguf` у `data/models/` · `PH-203` SIMD
 (`core::arch`, arch-gated). Ці робляться окремими зрізами коли підлога готова.
+
+## llama-rs parity (`PH-405b`) — як робити
+
+1. `gsv_keep_live` → підтвердити `llama_rs` alive (heartbeat `llama-rs/target/live/…`). Якщо
+   ні — не вигадувати оракул: зупинитись і повідомити owner (це єдиний випадок, коли `agi`
+   ставить питання/паузу, бо зовнішня підлога відсутня).
+2. Спільний вхід: **той самий** `data/models/qwen2.5-0.5b-q4_k_m.gguf`.
+3. Еталон: greedy decode N токенів у llama-rs (його heartbeat/API-контракт) на фіксованих
+   prompt-ids → записати `docs/research/llama-rs-parity.md` (фактаж).
+4. `rusty-engine`: `DenseRunner.generate` (greedy, `temp<=0`) тими ж ids → порівняти перші
+   збіжні префікси; допустити розбіжність після першої дивергенції (float accumulation
+   відмінна), **голо=префікс-збіг** + `finish_reason`. Тест: `tests/moe_parity.rs`.
+5. Токенайзація: взяти HF `qwen2` `tokenizer.json` (додати в `data/`, gitignored) → golden
+   вектори pre-split/merges → `gpt2_pre_split`/`Bpe` byte-exact unit-тести (`PH-305b` gate).
+6. Один локальний коміт, без push.
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
 
