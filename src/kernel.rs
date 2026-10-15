@@ -372,10 +372,55 @@ pub unsafe fn dot_q8_0_sse2(a: &[u8], b: &[f32]) -> f32 {
     hsum_ps_sse2(acc)
 }
 
-/// Runtime-dispatched Q8_0 dot: SSE2 when detected, else the scalar oracle.
+/// AVX2 `dot(dequant_q8_0(a), b)` — `PH-203c`. Eight `i8` per lane via an `[i32;8]`
+/// gather (four lanes wide is the AVX2 sweet spot), `_mm256_cvtepi32_ps` × broadcast
+/// scale × `b`, reduced with a `_mm256` fold into SSE2's `hsum_ps_sse2`.
+///
+/// # Safety
+/// Requires AVX2 (runtime-detected via [`dot_q8_0_dispatch`]). `a.len()` multiple of 34
+/// and `b.len() == a.len()/34*32` (both debug-asserted).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn dot_q8_0_avx2(a: &[u8], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = a.len() / 34;
+    debug_assert_eq!(a.len(), nb * 34, "dot_q8_0_avx2: partial block");
+    debug_assert_eq!(b.len(), nb * 32, "dot_q8_0_avx2: vector length mismatch");
+    let mut acc = _mm256_setzero_ps();
+    for (k, blk) in a.chunks_exact(34).enumerate() {
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dv = _mm256_set1_ps(d);
+        let qs = &blk[2..];
+        let bo = k * 32;
+        for jj in (0..32).step_by(8) {
+            let mut v = [0i32; 8];
+            for t in 0..8 {
+                v[t] = qs[jj + t] as i8 as i32;
+            }
+            let vv = _mm256_mul_ps(
+                dv,
+                _mm256_cvtepi32_ps(_mm256_loadu_si256(v.as_ptr().cast())),
+            );
+            acc = _mm256_add_ps(
+                acc,
+                _mm256_mul_ps(vv, _mm256_loadu_ps(b.as_ptr().add(bo + jj))),
+            );
+        }
+    }
+    // Reduce 256-bit lanes to 128-bit, then SSE2 horizontal sum.
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    hsum_ps_sse2(_mm_add_ps(lo, hi))
+}
+
+/// Runtime-dispatched Q8_0 dot: AVX2 → SSE2 → scalar, in that order.
 pub fn dot_q8_0_dispatch(a: &[u8], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: gated by the runtime AVX2 check above.
+            return unsafe { dot_q8_0_avx2(a, b) };
+        }
         if std::is_x86_feature_detected!("sse2") {
             // SAFETY: gated by the runtime SSE2 check above.
             return unsafe { dot_q8_0_sse2(a, b) };
@@ -542,6 +587,22 @@ mod tests {
         let simd = unsafe { dot_q8_0_sse2(&a, &b) };
         let scalar = dot_q8_0(&a, &b);
         assert!((simd - scalar).abs() < 1e-2, "sse2={simd} scalar={scalar}");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dot_q8_0_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("PH-203c: AVX2 absent on this host; skipping explicit avx2 check");
+            return;
+        }
+        let a = q8_blocks(5);
+        let b: Vec<f32> = (0..a.len() / 34 * 32)
+            .map(|i| (i as f32) * 0.045 - 13.0)
+            .collect();
+        let simd = unsafe { dot_q8_0_avx2(&a, &b) };
+        let scalar = dot_q8_0(&a, &b);
+        assert!((simd - scalar).abs() < 1e-2, "avx2={simd} scalar={scalar}");
     }
 
     #[test]
