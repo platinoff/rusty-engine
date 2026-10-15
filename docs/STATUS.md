@@ -36,8 +36,9 @@ block_forward → sampler → BPE` — і реальна геометрія Qwen
 
 ## Поточна межа (чому не «далі сліпо»)
 
-1. Реальний `PH-305` multi-layer forward верифікується **тільки проти референсу** (row/col-major,
-   RoPE-scaling, qk-norm, GQA-мапа) → gate **`PH-405`**; `llama-rs` живий → кандидат на оракул.
+1. **`PH-405` числовий regression-gate готовий** (`tests/numeric_parity.rs` + golden на
+   справжній Qwen2.5) — guard реґресій forward/quant/KV/sampler. Semantic llama-rs parity —
+   окремий зріз.
 2. HF-exact Qwen BPE (`PH-305b`: `qwen2` pre-regex, byte-fallback, specials) — для читабельного тексту.
 3. Далі — важкі/інфра-бенди (SIMD, axum-server, fleet/docker, build-matrix/apk) — кожен окремий великий зріз.
 
