@@ -4,8 +4,9 @@
 //! `docs/research/ggml-blocks.md`). `PH-105b` adds [`Bpe`]: a GPT-2-style byte-level
 //! BPE encoder/decoder (byte↔char table, whitespace pre-tokenizer, merge-by-rank). It is
 //! verified by round-trip tests on synthetic vocab — the *algorithm* is correct; matching a
-//! specific model's HF tokenizer (Qwen `pre`-regex + byte-fallback + specials) is a separate
-//! parity slice (`PH-305b`). Ingest-only fields (`model/tokens/scores/…`) come from B1.
+//! specific model's HF tokenizer (Qwen `pre`-regex + byte-fallback + specials) landed as
+//! `PH-405b`: `encode` picks the splitter from `tokenizer.ggml.pre`, and
+//! `tests/moe_parity.rs` gates vocab/merges byte-exactly against HF `tokenizer.json`.
 
 use crate::core::{EngineError, Result};
 use crate::gguf::{GgufFile, Value, ValueKind};
@@ -232,13 +233,22 @@ impl Bpe {
 
     /// Encode text to token ids. Special/control tokens (`token_type >= 3`) are atomic;
     /// between them the byte-level BPE runs with byte-fallback for unseen merges.
+    /// The pre-tokenizer variant follows GGUF `tokenizer.ggml.pre`: `qwen2` uses the
+    /// HF single-digit `\p{N}` split (`PH-405b` byte-exact gate), everything else the
+    /// classic GPT-2 `\p{N}{1,3}` splitter.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let mut ids = Vec::new();
+        let qwen2 = self.meta.pre.as_deref() == Some("qwen2");
         for segment in split_on_specials(text, &self.specials) {
             match segment {
                 Segment::Special(s) => ids.push(self.specials[&s]),
                 Segment::Text(s) => {
-                    for piece in crate::gpt2::gpt2_pre_split(&s) {
+                    let pieces = if qwen2 {
+                        crate::gpt2::qwen2_pre_split(&s)
+                    } else {
+                        crate::gpt2::gpt2_pre_split(&s)
+                    };
+                    for piece in pieces {
                         let byte_text = self.encoder.bytes_to_chars(piece.as_bytes());
                         for sym in self.merge_word(&byte_text) {
                             self.encode_symbol(&sym, &mut ids)?;

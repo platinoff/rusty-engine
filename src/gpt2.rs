@@ -13,7 +13,9 @@
 //! ```
 //!
 //! Implemented with `std` only (no `regex`/dep): `is_alphabetic`≈`\p{L}`,
-//! `is_numeric`≈`\p{N}`, `is_whitespace`≈`\s`. Qwen2 reuses the exact GPT-2 pattern.
+//! `is_numeric`≈`\p{N}`, `is_whitespace`≈`\s`. Qwen2 reuses the GPT-2 pattern
+//! **except the digits alternative**: HF `qwen2` `tokenizer.json` pins `\p{N}`
+//! (one digit per piece), not `\p{N}{1,3}` — see [`qwen2_pre_split`].
 //! Byte-encoding (`ByteEncoder`) is applied by the caller **after** this split, so
 //! a leading single space attaches to the following word — the whole point of the
 //! pattern. The matcher backtracks across alternatives exactly as the regex engine
@@ -93,8 +95,20 @@ fn letters_with_optional_prefix(cs: &[char], i: usize) -> usize {
     0
 }
 
-/// Split `text` into the pieces the GPT-2 pre-tokenizer would hand to BPE.
+/// Split `text` into the pieces the **GPT-2** pre-tokenizer would hand to BPE
+/// (digits grouped in runs of up to three: `\p{N}{1,3}`).
 pub fn gpt2_pre_split(text: &str) -> Vec<String> {
+    pre_split(text, 3)
+}
+
+/// Split `text` into the pieces the HF **qwen2** pre-tokenizer would hand to
+/// BPE: same alternation as GPT-2 but `\p{N}` — every digit is its own piece.
+pub fn qwen2_pre_split(text: &str) -> Vec<String> {
+    pre_split(text, 1)
+}
+
+/// Shared splitter; `digit_max` is the `\p{N}` repetition cap (3 = GPT-2, 1 = Qwen2).
+fn pre_split(text: &str, digit_max: usize) -> Vec<String> {
     let cs: Vec<char> = text.chars().collect();
     let n = cs.len();
     let mut out = Vec::new();
@@ -114,9 +128,9 @@ pub fn gpt2_pre_split(text: &str) -> Vec<String> {
             i += len;
             continue;
         }
-        // C: N{1,3}
+        // C: N{1,digit_max}
         if cs[i].is_numeric() {
-            let end = (i + 3).min(n);
+            let end = (i + digit_max).min(n);
             let mut j = i;
             while j < end && cs[j].is_numeric() {
                 j += 1;
@@ -196,6 +210,21 @@ mod tests {
     fn digits_grouped_in_threes() {
         assert_eq!(gpt2_pre_split("1234567"), vec!["123", "456", "7"]);
         assert_eq!(gpt2_pre_split("a12b"), vec!["a", "12", "b"]);
+    }
+
+    #[test]
+    fn qwen2_splits_each_digit_alone() {
+        // HF qwen2 tokenizer.json pins the digits alternative to \p{N} (no {1,3}).
+        assert_eq!(
+            qwen2_pre_split("1234567"),
+            vec!["1", "2", "3", "4", "5", "6", "7"]
+        );
+        assert_eq!(qwen2_pre_split("a12b"), vec!["a", "1", "2", "b"]);
+        assert_eq!(
+            qwen2_pre_split("2+2="),
+            vec!["2", "+", "2", "="],
+            "digit runs never join across punctuation in either split"
+        );
     }
 
     #[test]
