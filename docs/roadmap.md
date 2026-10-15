@@ -155,6 +155,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-504 | **GSV keep-live `target/live/rusty_heartbeat.json`** | `[x]` | `src/hub.rs` — `Heartbeat` (`to_json` без serde) + `is_fresh` (saturating, clock-skew-safe) + `write_heartbeat`; serve stamp при startup+кожне зʼєднання (15s/60s cadence з `hub.rs`); CLI `rusty heartbeat`. 3 hub unit |
 | PH-505 | метрики tok/s·RAM·active-experts endpoint | `[~]` | `src/hub.rs` — `Metrics` (`zero`/`record`/`tok_per_sec` zero-guard/`to_json`) + `GET /metrics` (`http::route_with`); serve рахує calls per-conn. RAM + tok/s на реальних токенах → B5 далі |
 | PH-506 | integration test + smoke curl | `[ ]` | `tests/serve.rs` |
+| PH-507 | **GSV hub provider-row (зразок `bunke-rock`):** `rusty serve` як `kind:local` рядок у hub-каталозі — `host_ready`-гейт на `target/live/rusty_heartbeat.json` + gguf-файл, авто-перемикання local↔cloud у `GET /api/omni/route` (offline-first, cooldown), SSE через hub, WiFi multi-host (LAN-first band 233). Чат-тести: provider `rusty/*` у OpenCode/Cursor тими ж рутинами, що `gsv/lama-*` | `[ ]` | GSV `src/boxes/omni/catalog.rs` (+ heartbeat-read) · engine `src/serve.rs`/`hub.rs` (serve-addr + heartbeat already done) |
 
 ---
 

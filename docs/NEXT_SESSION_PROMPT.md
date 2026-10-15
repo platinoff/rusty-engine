@@ -13,6 +13,8 @@ greedy token-stream рушія vs llama-rs decode на коротких пром
 `rusty-engine`, той же ticket-цикл create→claim→drain→done, один локальний коміт, **без push**
 (B11). Тікети/keep-live за `agi`-скіллом; hub-оракул llama-rs перевірити через `gsv_keep_live`
 перед parity-зрізом. Деталі запуску оракула — у секції «llama-rs parity» нижче.
+Одразу після `PH-405b` — зріз **`PH-507`** (owner-директива 2026-10-15, bunke-rock-подібний
+provider-row у hub-каталозі; § «Session wire» нижче).
 
 ## Session wire (виправлено 2026-10-15, owner-згода на push налаштувань)
 
@@ -27,11 +29,25 @@ greedy token-stream рушія vs llama-rs decode на коротких пром
   stdio `S:/rust/GSV/target/live/gsv-mcp.exe --repo-root S:/rust/GSV` (тікети/keep-live/board),
   instructions = GSV `AGENTS.md` + локальний `AGENTS.md` + цей NEXT. Тобто `agi` у цьому
   вікні = той самий дрain-контур, що у GSV/poolAI.
-- **Модель-сервери (перевірено 2026-10-15: HTTP 200 + SSE):** hub omni
-  `http://127.0.0.1:9999/api/omni/v1` (у глобальному `~/.config/opencode/opencode.jsonc`
-  як provider `gsv`: `lama-2.8` deep :8080, `lama-1.5` fast :8082) · llama-rs fast
-  `http://127.0.0.1:8082/v1` · дефолт хмари — `opencode-go`. OmniRoute `:20128` —
-  **policy-down**, не піднімати з `agi` (canon).
+- **Модель-сервери / routing (перевірено 2026-10-15: HTTP 200 + SSE, hub-route Ok):**
+  чат-тести йдуть **через hub omni** `http://127.0.0.1:9999/api/omni/v1` — provider `gsv`
+  у глобальному `~/.config/opencode/opencode.jsonc` з **обома локальними тієрами**
+  (`lama-2.8` deep, `lama-1.5` fast). Hub сам перемикає ланку: живі локальні моделі →
+  локальний лейн, хмара-фолбек з cooldown-скіпом мертвих хостів (offline-first, `data/omni_quota.json`).
+  Прямі fallback-провайдери без хаба: `llama-deep` = `:8080/v1` (довгенні генерації — напряму
+  швидше), `llama-fast` = `:8082/v1`. **Дев-сесії `agi` — на `opencode-go`** (дефолт; хмара,
+  завжди жива; `small_model` теж `qwen3.8-flash`, бо muse-spark рядки блокує Privacy-політика
+  Go — звідси й «ламалося» вчора на тайтлах). Ручне перемикання в OpenCode — вибір моделі;
+  у Cursor — Settings → Models → **Override OpenAI Base URL** → `http://127.0.0.1:9999/api/omni/v1`
+  + custom-моделі з `GET /v1/models` (canon `GSV_OMNI_CATALOG.md`). OmniRoute `:20128` —
+  **policy-down**, не піднімати з `agi`.
+- **Owner-директива (2026-10-15) — `PH-507` після `PH-405b`:** зареєструвати `rusty serve`
+  як **локальний provider-row у GSV hub-каталозі за зразком `bunke-rock`** (`catalog::host_ready`
+  гейт на heartbeat `target/live/rusty_heartbeat.json` + модельний файл, kind `local`, fail-open):
+  OpenAI-compat поверх B5-serve, WiFi **multi-host** (LAN-first band 233, `0.0.0.0`-bind через
+  hub), авто-перемикання local↔cloud у `GET /api/omni/route`, SSE-стрімінг. Тест-чат чіпає
+  `rusty/*` так само, як нині `gsv/lama-*`. Код хаба — окремий зріз у `S:/rust/GSV`
+  (`src/boxes/omni/catalog.rs`), код двигуна — у `S:/rust/rusty-engine`.
 - **Push-згода owner (2026-10-15):** створено GitHub-remote `platinoff/rusty-engine` —
   **private**. MIT-публікація та загальний push-контур коду залишаються за B11 (`PH-1105`);
   коміти продукту далі — локальні, без push, дозвіл only owner-згодою.
