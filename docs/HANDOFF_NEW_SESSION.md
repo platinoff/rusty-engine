@@ -88,8 +88,14 @@ reference-dequant Q4_K/Q5_K/Q6_K (`src/quant.rs`) **+ PH-204 fused K-quant dot/g
 (`dot_q{4,5,6}_k` + `matvec_q{4,5,6}_k` macro — per-block dequantize into a stack `[f32;256]`
 and fold into the dot without materializing the full f32 row; parity vs `dot(dequant_qX_k, b)`
 relative tol). Реальна Qwen2.5 вага — Q4_K_M мікс: attn/ffn Q4_K + ffn_down Q6_K — саме ці
-ядра дадуть ~10× менше памʼяті під forward (B4 expert-cache). Лишилось repack (`PH-202`)
-+ SIMD dispatch (`PH-203`) + bench (`PH-205`).
+ядра дадуть ~10× менше памʼяті під forward (B4 expert-cache). **`PH-202` repack** (`src/repack.rs`,
+compute-friendly layout, exact vs kernel) + **`PH-203/203b` SSE2 dispatch** (`dot_q{4,8}_0_sse2`
+`core::arch` + runtime-detect `dot_*_dispatch`, scalar fallback) — **done**. Лишилось: AVX2/NEON
+(`PH-203c`) + bench (`PH-205`).
+
+**Числовий gate B4:** **`PH-405`** (`tests/numeric_parity.rs` + `tests/data/qwen25_golden.txt`) —
+детермінований greedy-відбиток повного 24-шарового `DenseRunner.generate` на справжній Qwen2.5;
+`#[ignore]` release-job (~60s), CI без gitignored-моделі skip. Guard реґресій quant/forward/KV/sampler.
 
 **B3 — Dense forward (control path):** `[x]` — **PH-301..306 + PH-305a/c/d/e/b + PH-305 + PH-306b done** (2026-10-14):
 повний **multi-layer dense forward** на справжній Qwen2.5-0.5B (`src/runner.rs` `DenseRunner::
@@ -99,9 +105,11 @@ per-row SwiGLU + residual → final rmsnorm → `output` → logits). `quant::de
 **GPT-2/Qwen2 pre-regex** (`src/gpt2.rs`, wired into `Bpe::encode`). **`PH-306b`** — **text
 pipeline** `src/textgen.rs` `TextRunner` (Bpe + DenseRunner) + `rusty run -p "text"`. CLI
 `rusty run -m <model> -t "ids" | -p "text" [--max-tokens N]` — greedy на числових id / тексті.
-**110 тестів** (102 lib + 2 dense + 2 text + 4 scaffold), clippy `-D` 0, ratio ~96%. Real-Qwen
+**161 тестів** (147 lib + 5 dense + 3 text + 4 scaffold + 2 xtask; +1 ignored numeric parity), clippy `-D` 0, ratio ~96%. Real-Qwen
 `#[ignore]`-smoke: prefill `[151644, 872, 198]` → **151 936 finite logits** (усі 24 шари pure-Rust).
+**Milestone (22 agi-бендів, B0→B6):** рушій числово закріплений `PH-405` golden-gate проти реального 491 MB Qwen2.5.
 
-**Наступний крок:** `PH-405` llama/HF greedy + tokenizer.json byte-exact parity gate (чисельна
-довіра) **або** B2 `PH-203/205` (SIMD поверх repack-planes / bench) **або** B4 `PH-406` real MoE GGUF.
+**Наступний крок (черга):** B2 `PH-203c` AVX2 (x86 runtime-detect) поверх SSE2-dispatch **або** B6
+cross-builds (`PH-601..604`, потрібні `rustup target add` msvc/aarch64 + NDK) **або** llama-rs
+**semantic** parity (зовнішній оракул) **або** B7 `PH-701` docker-slave. `PH-405` numeric gate — **done**.
 План — `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
