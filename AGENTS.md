@@ -17,6 +17,11 @@ of llama-rs/poolAI. GSV is the **mother hub / master**. Canon сесії:
 ## Product profile
 
 - **id** `rusty-engine` · **Root** `S:/rust/rusty-engine` · **Kind** rust · **Role** plugin
+- **Session wire:** відкривати **тільки** `S:/rust/rusty-engine` (або `gsv.code-workspace`,
+  GSV-first) — проєктний `opencode.json` тягне kit-skills із `S:/rust/GSV/.agents/skills` і
+  hub-MCP stdio `S:/rust/GSV/target/live/gsv-mcp.exe`; фантомний Desktop-проєкт
+  `CoreBoard_Labs_shop\rusty-engine(moe)` видалити з recents (неіснуючий шлях). Деталі —
+  `docs/NEXT_SESSION_PROMPT.md` § «Session wire».
 - **Concept/Arch/Roadmap** — `docs/concept.md`, `docs/ARCHITECTURE.md`, `docs/roadmap.md` (bands B0–B11, `PH-<band><seq>`).
 - **License** MIT (`LICENSE`, `Copyright (c) 2026 platinoff / Madevinc`) — публікований MIT-двигун.
 - Tests: `cargo xtask check` (→ `cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` → `cargo test`).

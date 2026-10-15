@@ -14,6 +14,28 @@ greedy token-stream рушія vs llama-rs decode на коротких пром
 (B11). Тікети/keep-live за `agi`-скіллом; hub-оракул llama-rs перевірити через `gsv_keep_live`
 перед parity-зрізом. Деталі запуску оракула — у секції «llama-rs parity» нижче.
 
+## Session wire (виправлено 2026-10-15, owner-згода на push налаштувань)
+
+- **Проєктна папка — тільки `S:/rust/rusty-engine`.** Причина вчорашнього збою: OpenCode
+  Desktop зберіг проєкт `rusty-engine(moe)` під неіснуючим шляхом
+  `S:/rust/CoreBoard_Labs_shop/rusty-engine(moe)` (у лозі — `ENOENT` + сесійні `Aborted`),
+  тому повідомлення «з’їдалися», а модель-сервер виглядав мертвим. Видаліть той запис із
+  recents Desktop-а; відкривайте або `S:/rust/rusty-engine`, або `S:/rust/GSV/gsv.code-workspace`
+  (GSV-first) — папка rusty-engine там уже є.
+- **`opencode.json`** (корінь проєкту) вмикає в будь-якому вікні: skills = GSV-кит
+  (`S:/rust/GSV/.agents/skills`, не копіюємо сюди за `GSV_AGI_PATH`), MCP `gsv_mcp_openbot` =
+  stdio `S:/rust/GSV/target/live/gsv-mcp.exe --repo-root S:/rust/GSV` (тікети/keep-live/board),
+  instructions = GSV `AGENTS.md` + локальний `AGENTS.md` + цей NEXT. Тобто `agi` у цьому
+  вікні = той самий дрain-контур, що у GSV/poolAI.
+- **Модель-сервери (перевірено 2026-10-15: HTTP 200 + SSE):** hub omni
+  `http://127.0.0.1:9999/api/omni/v1` (у глобальному `~/.config/opencode/opencode.jsonc`
+  як provider `gsv`: `lama-2.8` deep :8080, `lama-1.5` fast :8082) · llama-rs fast
+  `http://127.0.0.1:8082/v1` · дефолт хмари — `opencode-go`. OmniRoute `:20128` —
+  **policy-down**, не піднімати з `agi` (canon).
+- **Push-згода owner (2026-10-15):** створено GitHub-remote `platinoff/rusty-engine` —
+  **private**. MIT-публікація та загальний push-контур коду залишаються за B11 (`PH-1105`);
+  коміти продукту далі — локальні, без push, дозвіл only owner-згодою.
+
 ## Стан
 
 **B0 = `[x]`** (2026-10-14) — portable-plugin `S:/rust/rusty-engine`: pure-Rust MoE-двигун

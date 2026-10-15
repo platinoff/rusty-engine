@@ -113,3 +113,12 @@ pipeline** `src/textgen.rs` `TextRunner` (Bpe + DenseRunner) + `rusty run -p "te
 cross-builds (`PH-601..604`, потрібні `rustup target add` msvc/aarch64 + NDK) **або** llama-rs
 **semantic** parity (зовнішній оракул) **або** B7 `PH-701` docker-slave. `PH-405` numeric gate — **done**.
 План — `docs/roadmap.md`, `NEXT_SESSION_PROMPT.md`.
+
+**Session-wire fix (2026-10-15):** вчорашнє «agi не працює» = фантомний проєкт OpenCode
+Desktop `rusty-engine(moe)` → неіснуючий шлях `CoreBoard_Labs_shop\rusty-engine(moe)`
+(ENOENT/Aborted у лозі), а не помилка коду. Додано проєктний `opencode.json` (kit-skills →
+GSV `.agents/skills`, hub-MCP stdio `target/live/gsv-mcp.exe`, instructions GSV+local+NEXT);
+ендпоінти підтверджив: hub omni `:9999/api/omni/v1` 200+SSE, llama-rs `:8080/:8082` 200;
+OmniRoute `:20128` policy-down. Owner-згодою створено **private** GitHub-remote
+`platinoff/rusty-engine` і запушено цей fix-comit; MIT-публікація коду — далі за B11.
+Деталі — `NEXT_SESSION_PROMPT.md` § «Session wire».
