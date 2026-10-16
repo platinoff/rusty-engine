@@ -12,6 +12,10 @@ pub const PATH_MODELS: &str = "/v1/models";
 pub const PATH_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 /// Cap on bytes read per request (headers only in the `PH-501a` slice).
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
+/// Generated-token cap when the request carries no usable `max_tokens`.
+const DEFAULT_MAX_NEW: usize = 8;
+/// Hard ceiling on `max_tokens` accepted from a client (guards a runaway request).
+const MAX_NEW_CAP: usize = 512;
 
 /// Accept, serve and close exactly one connection — the unit `serve` loops over. `metrics`
 /// accumulates across the process lifetime (PH-505 counters); `model` wires real generation.
@@ -50,10 +54,16 @@ pub fn handle_conn(
     let is_chat = head.starts_with("POST ") && head.contains(PATH_CHAT_COMPLETIONS);
     let resp = match model {
         Some(tr) if is_chat => {
+            // PH-501c: honour the client's max_tokens (clamped) instead of a fixed cap —
+            // a 1-token request must not pay for 8 decode steps.
+            let body = crate::http::body_of(&text);
+            let max_new = crate::http::max_tokens_of(body)
+                .unwrap_or(DEFAULT_MAX_NEW)
+                .clamp(1, MAX_NEW_CAP);
             let r = if crate::http::wants_stream(&text) {
-                crate::textgen::chat_stream_response(tr, crate::http::body_of(&text), 8)
+                crate::textgen::chat_stream_response(tr, body, max_new)
             } else {
-                crate::textgen::chat_response(tr, crate::http::body_of(&text), 8)
+                crate::textgen::chat_response(tr, body, max_new)
             };
             metrics.record(0, 0.0, 0);
             r

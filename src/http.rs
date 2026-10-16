@@ -71,6 +71,29 @@ pub fn wants_stream(body: &str) -> bool {
     b.contains("\"stream\":true")
 }
 
+/// `"max_tokens": N` (or `max_completion_tokens`) from a JSON body, when present and `> 0`.
+/// Lets the serve loop honour the client cap instead of a fixed default (PH-501c).
+pub fn max_tokens_of(body: &str) -> Option<usize> {
+    for key in ["\"max_tokens\"", "\"max_completion_tokens\""] {
+        if let Some(i) = body.find(key) {
+            let rest = body[i + key.len()..].trim_start();
+            if let Some(rest) = rest.strip_prefix(':') {
+                let digits: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = digits.parse::<usize>() {
+                    if n > 0 {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Build an OpenAI-style `text/event-stream` body from completion deltas, terminated by
 /// `data: [DONE]`. Each event is a `chat.completion.chunk` with an incremental assistant
 /// fragment. `PH-502` builds the whole stream then writes it (Content-Length known); true
@@ -255,6 +278,19 @@ mod tests {
         assert!(wants_stream(r#"{"stream":true,"max_tokens":4}"#));
         assert!(!wants_stream(r#"{"stream":false}"#));
         assert_eq!(body_of("GET /health HTTP/1.1\r\n\r\n"), "");
+    }
+
+    #[test]
+    fn max_tokens_parsed_and_zero_ignored() {
+        assert_eq!(max_tokens_of(r#"{"max_tokens":16}"#), Some(16));
+        assert_eq!(
+            max_tokens_of(r#"{"stream":false,"max_tokens": 4}"#),
+            Some(4)
+        );
+        assert_eq!(max_tokens_of(r#"{"max_completion_tokens":3}"#), Some(3));
+        assert_eq!(max_tokens_of(r#"{"max_tokens":0}"#), None);
+        assert_eq!(max_tokens_of(r#"{"messages":[]}"#), None);
+        assert_eq!(max_tokens_of(""), None);
     }
 
     #[test]
