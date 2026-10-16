@@ -96,16 +96,22 @@ fn accept_loop(
         live_dir,
         &crate::hub::Heartbeat::new(start.elapsed().as_secs()),
     );
+    // PH-504: keep-live must re-stamp on a fixed tick regardless of traffic — the hub's
+    // freshness window is 60s, so an idle provider that only wrote at startup +
+    // per-connection fell out of host-readiness. A dedicated thread stamps every tick.
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(
+            crate::hub::HEARTBEAT_TICK_SECS,
+        ));
+        let _ = crate::hub::write_heartbeat(
+            live_dir,
+            &crate::hub::Heartbeat::new(start.elapsed().as_secs()),
+        );
+    });
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {
-                if handle_conn(&mut s, &mut metrics, model).is_err() {
-                    continue;
-                }
-                let _ = crate::hub::write_heartbeat(
-                    live_dir,
-                    &crate::hub::Heartbeat::new(start.elapsed().as_secs()),
-                );
+                let _ = handle_conn(&mut s, &mut metrics, model);
             }
             Err(_) => continue,
         }
