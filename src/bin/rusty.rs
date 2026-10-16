@@ -28,6 +28,9 @@ fn main() {
             println!("  heartbeat                 stamp GSV keep-live file   (PH-504)");
             println!("  node                      Wi-Fi slave runtime        (band B7)");
             println!("  hub                       GSV master supervisor      (band B8)");
+            println!(
+                "  worker [--live]           hub-edge worker/APK role (dry-run default, 2026-10-16)"
+            );
         }
         Some("inspect") => match args.next() {
             Some(path) => inspect(&path),
@@ -60,6 +63,7 @@ fn main() {
         Some("run") => run(args),
         Some("serve") => serve_cmd(args),
         Some("heartbeat") => heartbeat_cmd(),
+        Some("worker") => worker_cmd(args),
         Some(other) => {
             println!(
                 "{}: subcommand '{other}' is scaffolded (bands B1+)",
@@ -400,6 +404,91 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
         std::process::exit(1);
     }
     std::process::exit(0);
+}
+
+/// `rusty worker [--live] [--peer-id ID] [--hub URL] [--serve URL] [--model ID]
+/// [--token-env VAR] [--memory-mb N]` — the hub-edge worker/APK role (2026-10-16).
+/// Dry-run by default: prints the register/join/heartbeat/poll plan (token masked) with
+/// no socket. `--live` runs the blocking register → join → heartbeat/poll loop against the
+/// GSV hub `/api/edge` (which fronts poolAI `/api/v1`; never `:8091` off-box).
+fn worker_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
+    let mut live = false;
+    let mut peer_id = "rusty-01".to_string();
+    let mut hub: Option<String> = None;
+    let mut serve_url: Option<String> = None;
+    let mut model = "rusty-05".to_string();
+    let mut token_env = "GSV_EDGE_TOKEN".to_string();
+    let mut mem_mb = 0usize;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--live" => live = true,
+            "--peer-id" => peer_id = args.next().unwrap_or(peer_id),
+            "--hub" => hub = args.next(),
+            "--serve" => serve_url = args.next(),
+            "--model" | "-m" => model = args.next().unwrap_or(model),
+            "--token-env" => token_env = args.next().unwrap_or(token_env),
+            "--memory-mb" => mem_mb = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            other => {
+                eprintln!("rusty worker: unknown arg '{other}'");
+                std::process::exit(2);
+            }
+        }
+    }
+    let token = env::var(&token_env).unwrap_or_default();
+    let mut cfg = rusty_engine::worker::WorkerConfig::local(peer_id, token);
+    if let Some(h) = hub {
+        cfg.hub = h;
+    }
+    if let Some(s) = serve_url {
+        cfg.serve_url = s;
+    }
+    cfg.model = model;
+    if mem_mb > 0 {
+        cfg.max_memory_mb = mem_mb;
+    }
+    println!(
+        "{} — worker ({})",
+        rusty_engine::banner(),
+        if live { "LIVE" } else { "dry-run" }
+    );
+    if !live {
+        for line in rusty_engine::worker::plan_lines(&cfg, cfg.max_memory_mb) {
+            println!("  {line}");
+        }
+        println!("  (dry-run: no sockets; add --live to register + poll)");
+        std::process::exit(0);
+    }
+    match rusty_engine::worker::join_once(&cfg, cfg.max_memory_mb) {
+        Ok(_) => println!(
+            "  registered as {} ({})",
+            cfg.peer_id,
+            rusty_engine::worker::ORIGIN
+        ),
+        Err(e) => {
+            eprintln!("rusty worker: {e}");
+            std::process::exit(1);
+        }
+    }
+    let hb_every = (rusty_engine::worker::HEARTBEAT_SECS / rusty_engine::worker::POLL_SECS).max(1);
+    let mut tick = 0u64;
+    loop {
+        if tick % hb_every == 0 {
+            match rusty_engine::worker::heartbeat_once(&cfg, cfg.max_memory_mb) {
+                Ok(st) if (200..300).contains(&st) => {}
+                Ok(st) => eprintln!("rusty worker: heartbeat HTTP {st}"),
+                Err(e) => eprintln!("rusty worker: heartbeat {e}"),
+            }
+        }
+        match rusty_engine::worker::poll_once(&cfg, true) {
+            Ok(line) if !line.is_empty() => println!("  {line}"),
+            Ok(_) => {}
+            Err(e) => eprintln!("rusty worker: poll {e}"),
+        }
+        tick += 1;
+        std::thread::sleep(std::time::Duration::from_secs(
+            rusty_engine::worker::POLL_SECS,
+        ));
+    }
 }
 
 /// `rusty heartbeat` — write `target/live/rusty_heartbeat.json` once for the GSV keep-live

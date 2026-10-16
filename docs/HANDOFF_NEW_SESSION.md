@@ -122,3 +122,17 @@ GSV `.agents/skills`, hub-MCP stdio `target/live/gsv-mcp.exe`, instructions GSV+
 OmniRoute `:20128` policy-down. Owner-згодою створено **private** GitHub-remote
 `platinoff/rusty-engine` і запушено цей fix-comit; MIT-публікація коду — далі за B11.
 Деталі — `NEXT_SESSION_PROMPT.md` § «Session wire».
+
+**Worker/APK роль + `build-matrix --build` (2026-10-16):** за owner-директивою
+(`GSV_AGI_PATH.md` §worker/APK, коміт `ae83e24`) worker/APK роль перейшла від Telenetis до
+двигунів — `rusty-engine` під id **`rusty-serve`**. Додано **`src/worker.rs`** (PH-706, новий
+band B7-зріз): std-only hub-edge worker — `WorkerConfig` (LAN-first, `GSV_LOCAL_ADDR`/UDP-probe),
+мінімальний `parse_json`/`parse_task`, `execute` (`ping` / `rusty_chat` → `serve_url`
+`/v1/chat/completions`; dry-run без сокетів), білдери тіл, blocking `http_call`/`join_once`/
+`heartbeat_once`/`poll_once` (header `x-gsv-edge-token`, origin `rusty_edge`, role `virtual_node`),
+`plan_lines`+`mask` (токен ніколи не логується) — **17 unit**. CLI `rusty worker [--live] …`
+(dry-run default, `--live` = register→join→heartbeat/poll loop). **`xtask build-matrix --build`**
+(PH-605): гейтить `cargo build --release --target` по `rustup target list --installed`/host,
+пропускає відсутні/невдалі cross-ланки з причиною, не валить матрицю (host gnu `rusty.exe` →
+sha256 `48b1f196…`, 617 984 B; решта — skip). Gate: fmt + clippy `-D` 0 + **181 тест**, один
+локальний коміт, **без push** (B11).

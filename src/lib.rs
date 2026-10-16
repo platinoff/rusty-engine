@@ -26,6 +26,7 @@
 //! - [`http`] — std-only request→response layer, pure `route()` (B5 `PH-501a`)
 //! - [`node`]  — slave/worker runtime over local Wi-Fi (B7/B8)
 //! - [`hub`]   — GSV-native master supervisor (Rust k8s-lite, B8)
+//! - [`worker`] — hub-edge worker/APK role (register/heartbeat/poll/complete, 2026-10-16)
 //! - [`backend`] — compile-time SIMD backend selection (sse/avx/neon, B6 `PH-606`)
 
 pub mod backend;
@@ -49,6 +50,7 @@ pub mod serve;
 pub mod slot;
 pub mod textgen;
 pub mod tokenizer;
+pub mod worker;
 
 /// Crate name as reported by `rusty --version` / `banner()`.
 pub const CRATE_NAME: &str = "rusty-engine";

@@ -4,6 +4,35 @@
 
 > Unknown pick = AskQuestion; iнакше продовжувати з `docs/HANDOFF_NEW_SESSION.md`.
 
+## Owner-директива (2026-10-16) — worker/APK роль перейшла в ДВИГУНИ
+
+Canon: `S:/rust/GSV/docs/gsv/GSV_AGI_PATH.md` (~§worker/APK, коміт `ae83e24` «Telenetis commutation
+role (worker/APK to engines)») + `S:/rust/GSV/docs/gsv/PRODUCTS.md` (row `rusty-engine`):
+**Telenetis = чиста комутація**, а локально-мережевий провайдер/WiFi-worker/APK несуть самі
+двигуни — `rusty-engine` під id **`rusty-serve`** (`llama-rs` = `bunke-rock`). Двигун реєструється
+як worker у GSV-хабі (single-entry edge `/api/edge`, фронт poolAI `/api/v1` — **не** `:8091` off-box):
+register → heartbeat → `virtual-nodes/{peer}/pool/join` → `tasks/poll` → complete/requeue.
+Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker роль**, два коміти (легі двигунів —
+окремі репо), без push (B11).
+
+## Зроблено цього сеансу (2026-10-16, rusty-engine)
+
+- **`src/worker.rs`** (новий, PH-706) — std-only worker/APK runtime: `WorkerConfig` (LAN-first
+  defaults, `GSV_LOCAL_ADDR`/UDP-route probe), мінімальний `parse_json`/`parse_task`, `execute`
+  (`ping` / `rusty_chat` → `serve_url` `/v1/chat/completions`, dry-run без сокетів), білдери тіл
+  (`register_body`/`heartbeat_body`/`join_body`/`complete_body`/`requeue_body`), blocking
+  `http_call`/`join_once`/`heartbeat_once`/`poll_once` (header `x-gsv-edge-token`, origin
+  `rusty_edge`, role `virtual_node`), `plan_lines`+`mask` — **токен ніколи не логується**. 17 unit.
+- **CLI** `rusty worker [--live] [--peer-id] [--hub] [--serve] [--model] [--token-env] [--memory-mb]`
+  — dry-run default друкує план (токен masked); `--live` = blocking register→join→heartbeat/poll loop.
+- **`xtask build-matrix --build`** (PH-605) — гейтить `cargo build --release --target` по
+  `rustup target list --installed`/host (`rustc -vV`); пропускає відсутні/невдалі cross-ланки з
+  причиною (Android NDK / MSVC / cross-linker), не валить матрицю. Демо: host gnu `rusty.exe` →
+  **sha256 `48b1f196…`** (617 984 B); linux/msvc/aarch64/android — skip з причиною.
+- Gate: `cargo xtask check` зелений (fmt + clippy 0 + **181 тест**: 165 lib + 5 dense + 4 scaffold
+  + 4 text + 3 xtask; +4 `#[ignore]` parity), dry-run `rusty worker` при порожньому env-токені показує
+  `<unset>` і LAN-адресу. Один локальний коміт, **без push** (B11).
+
 ## AUTO-DIRECTIVE (owner, 2026-10-15) — на наступне `agi`
 
 Наступного `agi`: **НЕ питати вибору бенду** — одразу брати з черги й **automatically**

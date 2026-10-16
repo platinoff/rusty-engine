@@ -159,7 +159,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B6 — Build matrix: exe / bin / apk  **`[ ]`**
+## Band B6 — Build matrix: exe / bin / apk  **`[~]` (PH-605 `--build` + PH-606 done, 2026-10-14/16)**
 
 > Мета: один портативний бінарник на OS×arch.
 
@@ -169,12 +169,12 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-602 | Linux x86_64 `rusty` | `[ ]` | matrix |
 | PH-603 | Linux aarch64 `rusty` (Pi-class) | `[ ]` | matrix |
 | PH-604 | Android arm64 `rusty.apk`/`.so` (cargo-ndk/Termux, **no Docker**) | `[ ]` | `.cargo/config` + ndk |
-| PH-605 | **`cargo xtask build-matrix`** + SHA-256 артефактів | `[x]` | `xtask/src/main.rs` — `TARGETS` matrix (win-gnu/msvc, linux-x86_64/aarch64, android-arm64 no-Docker) + `sha256_hex` (pure `std`, FIPS 180-4, multi-block) + `build-matrix` рендер з хешем наявних бінарників; 2 unit (NIST vectors + coverage). Фікс `main` argv `skip(2)`→`skip(1)` |
+| PH-605 | **`cargo xtask build-matrix [--build]`** + SHA-256 артефактів | `[x]` | `xtask/src/main.rs` — `TARGETS` matrix (win-gnu/msvc, linux-x86_64/aarch64, android-arm64 no-Docker) + `sha256_hex` (pure `std`, FIPS 180-4, multi-block) + `build-matrix` рендер з хешем наявних бінарників; **`--build`** гейтить `cargo build --release --target` по `rustup target list --installed`/host (`rustc -vV`), пропускає відсутні/невдалі cross-ланки з причиною (Android NDK / MSVC / cross-linker), не валить матрицю; 3 unit (NIST vectors + coverage + `capture`). Фікс `main` argv `skip(2)`→`skip(1)` |
 | PH-606 | **feature-gated backends** (sse/avx/neon single-binary) | `[x]` | `Cargo.toml [features] sse/avx/neon` (default none) + `src/backend.rs` `Backend`/`from_flags`/`compile_backends`/`select` (найсильніший ввімкнений, Scalar-fallback); `cfg(test)`-обмежені під кожен feature-набір. Dispatch-substrate для `PH-203` |
 
 ---
 
-## Band B7 — Rust-docker на Win/Linux хостах  **`[ ]`**
+## Band B7 — Rust-docker на Win/Linux хостах  **`[~]` (PH-706 worker/APK runtime done, 2026-10-16)**
 
 > Мета: slave у Rust-docker-контейнері на localhost, exposed через локальний Wi-Fi/LAN.
 > **Android — поза Docker** (B6/B8). Dry-run за замовчуванням, `--live` за згодою owner.
@@ -186,6 +186,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-703 | LAN/Wi-Fi expose (bind LAN addr, GSV band-233 LAN-first) | `[ ]` | serve bind |
 | PH-704 | dry-run default + `--live` owner-consent gate | `[ ]` | network module |
 | PH-705 | container lifecycle contract (create/start/stop/inspect) | `[ ]` | `tests/docker_contract.rs` |
+| PH-706 | **worker/APK runtime** (`rusty worker`, hub-edge role 2026-10-16): register→heartbeat→pool/join→poll→complete/requeue поверх GSV hub `/api/edge` (фронт poolAI `/api/v1`, **не** `:8091` off-box), origin `rusty_edge` role `virtual_node`, dry-run default + `--live`; std-only JSON+HTTP, token masked | `[x]` | `src/worker.rs` — `WorkerConfig` (LAN-first defaults) · `parse_json`/`parse_task` · `execute` (`ping`/`rusty_chat`→`serve_url` `/v1/chat/completions`) · request builders (`register_body`/`heartbeat_body`/`join_body`/`complete_body`/`requeue_body`) · `http_call`/`join_once`/`heartbeat_once`/`poll_once` · `plan_lines`+`mask` (token ніколи не логується) · CLI `rusty worker [--live]`; 17 unit |
 
 ---
 

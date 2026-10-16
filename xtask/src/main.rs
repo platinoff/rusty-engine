@@ -134,19 +134,111 @@ pub fn sha256_hex(data: &[u8]) -> String {
     out
 }
 
-fn build_matrix() {
-    println!("rusty-engine build matrix ({} targets):", TARGETS.len());
+fn build_matrix(do_build: bool) {
+    let installed = installed_targets();
+    let host = host_triple();
+    println!(
+        "rusty-engine build matrix ({} targets){}:",
+        TARGETS.len(),
+        if do_build { " — BUILD" } else { "" }
+    );
+    if do_build {
+        println!(
+            "  host {host}; installed targets: {}",
+            if installed.is_empty() {
+                "(rustup unavailable)".to_string()
+            } else {
+                installed.join(", ")
+            }
+        );
+    }
     for t in TARGETS {
         println!(
             "  {:26} {:7} {:8} rusty{}   — {}",
             t.triple, t.os, t.arch, t.exe, t.note
         );
         let artifact = format!("target/{}/release/rusty{}", t.triple, t.exe);
+        if do_build && !build_one(t, &host, &installed) {
+            continue;
+        }
         match std::fs::read(&artifact) {
             Ok(bytes) => println!("    sha256 {}  ({} bytes)", sha256_hex(&bytes), bytes.len()),
             Err(_) => println!("    (not built yet: {artifact})"),
         }
     }
+}
+
+/// Build one matrix target (`--bin rusty`). Returns `false` when skipped, so the caller
+/// omits the artifact line. Never aborts the whole matrix — a missing cross-linker is a
+/// skip, not a fatal error (Android/msvc toolchains are external on this box).
+fn build_one(t: &Target, host: &str, installed: &[String]) -> bool {
+    let is_host = t.triple == host;
+    if !is_host && !installed.iter().any(|x| x == t.triple) {
+        println!(
+            "    skipped: target not installed (rustup target add {})",
+            t.triple
+        );
+        return false;
+    }
+    println!(
+        "    building… (cargo build --release --target {})",
+        t.triple
+    );
+    let ok = run_status(
+        "cargo",
+        &["build", "--release", "--target", t.triple, "--bin", "rusty"],
+    );
+    if !ok {
+        println!(
+            "    skipped: link/build failed (needs {})",
+            if t.triple.contains("android") {
+                "Android NDK / cargo-ndk"
+            } else if t.triple.contains("msvc") {
+                "MSVC link.exe"
+            } else {
+                "a cross linker"
+            }
+        );
+    }
+    ok
+}
+
+/// `rustup target list --installed` (empty when rustup is unavailable).
+fn installed_targets() -> Vec<String> {
+    capture("rustup", &["target", "list", "--installed"])
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `rustc -vV` → the `host: <triple>` line.
+fn host_triple() -> String {
+    capture("rustc", &["-vV"])
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("host: ").map(|h| h.trim().to_string()))
+        })
+        .unwrap_or_default()
+}
+
+fn capture(prog: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(prog).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+fn run_status(prog: &str, args: &[&str]) -> bool {
+    Command::new(prog)
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn main() {
@@ -156,7 +248,9 @@ fn main() {
     let cmd = args.first().map(String::as_str).unwrap_or("banner");
     match cmd {
         "banner" => {
-            println!("rusty-engine xtask: banner | fmt | clippy | test | check | build-matrix")
+            println!(
+                "rusty-engine xtask: banner | fmt | clippy | test | check | build-matrix [--build]"
+            )
         }
         "fmt" => run("cargo", &["fmt", "--all"]),
         "clippy" => run("cargo", &["clippy", "--all-targets"]),
@@ -166,7 +260,7 @@ fn main() {
             run("cargo", &["clippy", "--all-targets"]);
             run("cargo", &["test"]);
         }
-        "build-matrix" => build_matrix(),
+        "build-matrix" => build_matrix(args.iter().any(|a| a == "--build")),
         other => {
             eprintln!("unknown xtask command: {other}");
             std::process::exit(2);
@@ -216,5 +310,10 @@ mod tests {
         assert!(triples.contains(&"aarch64-unknown-linux-gnu"));
         assert!(triples.contains(&"aarch64-linux-android"));
         assert_eq!(TARGETS.iter().filter(|t| t.os == "android").count(), 1);
+    }
+
+    #[test]
+    fn capture_missing_program_is_none() {
+        assert!(capture("definitely-not-a-real-program-rusty-xyz", &[]).is_none());
     }
 }
