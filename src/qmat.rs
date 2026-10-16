@@ -68,9 +68,9 @@ impl QMat {
                 2 => crate::kernel::matvec_q4_0_dispatch(bytes, *m, *n, x),
                 6 => crate::kernel::matvec_q5_0(bytes, *m, *n, x),
                 8 => crate::kernel::matvec_q8_0_dispatch(bytes, *m, *n, x),
-                12 => crate::kernel::matvec_q4_k(bytes, *m, *n, x),
+                12 => crate::kernel::matvec_q4_k_dispatch(bytes, *m, *n, x),
                 13 => crate::kernel::matvec_q5_k(bytes, *m, *n, x),
-                14 => crate::kernel::matvec_q6_k(bytes, *m, *n, x),
+                14 => crate::kernel::matvec_q6_k_dispatch(bytes, *m, *n, x),
                 t => {
                     // No fused kernel (e.g. F32/F16): scalar dequant then f32 matvec.
                     let d = crate::quant::dequant(t, bytes).unwrap_or_else(|_| {
