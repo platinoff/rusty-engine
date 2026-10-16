@@ -136,3 +136,17 @@ band B7-зріз): std-only hub-edge worker — `WorkerConfig` (LAN-first, `GSV_
 пропускає відсутні/невдалі cross-ланки з причиною, не валить матрицю (host gnu `rusty.exe` →
 sha256 `48b1f196…`, 617 984 B; решта — skip). Gate: fmt + clippy `-D` 0 + **181 тест**, один
 локальний коміт, **без push** (B11).
+
+**Провайдер живий + perf (2026-10-16, продовження того ж дрain):** `rusty serve` піднято живим
+(`rusty-serve` provider-row → `gsv_keep_live` **`rusty: alive`**). Ще два локальні коміти:
+**`50cd422`** fix(serve) **PH-504** — keep-live heartbeat писався лише на startup+per-connection,
+тож після 60 с простою гас (hub `host_ready("rusty-serve")=false`, доведено емпірично); додано
+потік-тікер кожні `HEARTBEAT_TICK_SECS` (15 с). **`4359eb4`** perf(textgen) **PH-307** —
+`TextRunner::run_text`/`complete` викликали `DenseRunner::generate[_with]`, які **re-prefillять
+увесь префікс на кожен токен** (O(n²)); перемкнуто на наявний `DenseDecoder::generate_incremental`
+(KV-кеш, O(n) на токен), вихід ідентичний (temp 0 == greedy argmax). Заміри на
+`qwen2.5-0.5b-q4_k_m`: `run --max-tokens 4` **debug 91 с → release 6.4 с** (~14×, debug-білд був
+головним фактором); `POST /v1/chat/completions` 8 токенів **>150 с** (зависав, однопоточний loop)
+→ release+incremental **~5.3 с** стабільно (**~28×**). Лишковий ботлнек — `matvec` по
+f32-де-квантованих вагах (≈2 ГБ RAM, ≈2 ГБ трафіку на токен → межа пам'яті), тобто ціль — band
+**B2** (тримати ваги Q4_K/Q6_K + fused `matvec` + AVX2).

@@ -33,6 +33,19 @@ Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker р�
   + 4 text + 3 xtask; +4 `#[ignore]` parity), dry-run `rusty worker` при порожньому env-токені показує
   `<unset>` і LAN-адресу. Один локальний коміт, **без push** (B11).
 
+### Продовження (2026-10-16, provider live + perf)
+
+- Провайдер `rusty-serve` піднято живим: `rusty serve -m data/models/qwen2.5-0.5b-q4_k_m.gguf`
+  (`target/release/rusty.exe`, `0.0.0.0:8090`); `GET /health`/`/v1/models` OK, heartbeat тікає,
+  `gsv_keep_live` → **`rusty: alive`**.
+- **`50cd422`** fix(serve) **PH-504** — heartbeat-тікер кожні 15 с (idle-провайдер більше не гасне
+  за 60 с; було startup+per-connection → `host_ready=false`).
+- **`4359eb4`** perf(textgen) **PH-307** — `run_text`/`complete` декодують інкрементально
+  (`DenseDecoder`, KV-кеш, O(n)); прибрано re-prefill усього префікса (O(n²)). Вихід незмінний.
+- Заміри (0.5B Q4_K_M): `run -4` debug **91 с** → release **6.4 с**; chat 8 ток **>150 с** →
+  release+incremental **~5.3 с** стабільно.
+- **Наступний ботлнек → B2 `PH-203c` AVX2 / fused q4_k·q6_k matvec** (f32→quant; межа пам'яті).
+
 ## AUTO-DIRECTIVE (owner, 2026-10-15) — на наступне `agi`
 
 Наступного `agi`: **НЕ питати вибору бенду** — одразу брати з черги й **automatically**
