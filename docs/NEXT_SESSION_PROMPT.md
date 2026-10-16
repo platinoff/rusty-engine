@@ -46,6 +46,18 @@ Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker р�
   release+incremental **~5.3 с** стабільно.
 - **Наступний ботлнек → B2 `PH-203c` AVX2 / fused q4_k·q6_k matvec** (f32→quant; межа пам'яті).
 
+### Продовження (2026-10-16, B2 QMat + PH-203c AVX2)
+
+- **`99ec49a`** feat(forward) **B2** — `src/qmat.rs` (`QMat::{F32,Quant}` + fused `matvec`-dispatch,
+  `from_model`); `BlockWeights`/`output` → `QMat`, dense-forward більше **не матеріалізує ~2 ГБ f32**
+  (serve RSS ~540 МБ); golden `PH-405` відтворюється **точно**.
+- **`46cebf6`** perf(kernel) **`PH-203c`** — `dot_q4_0/q4_k/q6_k_avx2` (8 lanes) + `dot_q4_k/q6_k_dispatch`
+  / `matvec_*`; `QMat` типи 12/14 через них; parity avx2-vs-scalar. Заміри: serve 8-ток decode
+  **~6.1 с → ~5.1 с** (~16 %); O(n²) parity-path **128.5 с → 102.5 с** (~20 %).
+- **Далі:** лишається ALU-bound — AVX2/FMA для Q5_K (зараз scalar) + батч-`matvec` (кілька рядків за
+  прохід вагами) **або** `PH-405b` llama-rs semantic parity **або** B6 cross-builds / B7 docker-slave.
+  **7 локальних комітів** за сесію, **без push** (B11).
+
 ## AUTO-DIRECTIVE (owner, 2026-10-15) — на наступне `agi`
 
 Наступного `agi`: **НЕ питати вибору бенду** — одразу брати з черги й **automatically**

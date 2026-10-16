@@ -150,3 +150,16 @@ sha256 `48b1f196…`, 617 984 B; решта — skip). Gate: fmt + clippy `-D` 0
 → release+incremental **~5.3 с** стабільно (**~28×**). Лишковий ботлнек — `matvec` по
 f32-де-квантованих вагах (≈2 ГБ RAM, ≈2 ГБ трафіку на токен → межа пам'яті), тобто ціль — band
 **B2** (тримати ваги Q4_K/Q6_K + fused `matvec` + AVX2).
+
+**B2 QMat + PH-203c AVX2 (2026-10-16, той самий drain):** **`99ec49a`** feat(forward) — новий
+`src/qmat.rs` (`QMat::{F32,Quant}`, fused `matvec`-dispatch `q4_0/q5_0/q8_0/q4_k/q5_k/q6_k` + scalar
+dequant-fallback, `from_model`); `BlockWeights` проєкції та `output` стали `QMat`, тож dense-forward
+**більше не матеріалізує ~2 ГБ f32** ваг (serve RSS ~2 ГБ → ~540 МБ) і golden `PH-405` відтворюється
+**точно** (quant-шлях == попереднє f32-золото). **`46cebf6`** perf(kernel) — **`PH-203c`**:
+`dot_q4_0_avx2` / `dot_q4_k_avx2` / `dot_q6_k_avx2` (8 lanes, `_mm256_cvtepu8_epi32` над split-half
+ниблами / per-group `d·sc`+`min·m` / 6-bit пакуванням), AVX2-гілка в `dot_q4_0_dispatch` + нові
+`dot_q4_k/q6_k_dispatch` та `matvec_q4_k/q6_k_dispatch`; `QMat` типи 12/14 через них; parity-тести
+avx2-vs-scalar. Заміри (Qwen2.5-0.5B Q4_K_M, цей box): serve 8-ток decode **~6.1 с → ~5.1 с** (~16 %);
+O(n²) `DenseRunner::generate` parity **128.5 с → 102.5 с** (~20 %). Лишається ALU-bound — наступний
+зріз: AVX2/FMA для Q5_K + батч-`matvec` (кілька рядків на прохід ваг) або B6 cross-builds / B7
+docker-slave. **7 локальних комітів** за сесію, **без push** (B11).
