@@ -8,7 +8,8 @@
 //! reference + tensor-layout confirmation); this slice proves the *plumbing* composes.
 
 use crate::infer::{gqa_repeat_kv, rmsnorm, rope};
-use crate::moe::{expert_ffn, matvec, softmax};
+use crate::moe::softmax;
+use crate::qmat::QMat;
 
 /// Model geometry a block needs (dimensions + RoPE/norm knobs).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,25 +57,32 @@ impl Geometry {
 pub struct BlockWeights {
     pub attn_norm: Vec<f32>,
     /// `q`: d_model×d_model; `k`,`v`: (n_kv·head)×d_model; `o`: d_model×(n_heads·head).
-    pub q: Vec<f32>,
-    pub k: Vec<f32>,
-    pub v: Vec<f32>,
-    pub o: Vec<f32>,
+    pub q: QMat,
+    pub k: QMat,
+    pub v: QMat,
+    pub o: QMat,
     pub ffn_norm: Vec<f32>,
     /// SwiGLU: gate/up are d_ff×d_model, down is d_model×d_ff.
-    pub ffn_gate: Vec<f32>,
-    pub ffn_up: Vec<f32>,
-    pub ffn_down: Vec<f32>,
+    pub ffn_gate: QMat,
+    pub ffn_up: QMat,
+    pub ffn_down: QMat,
+}
+
+/// Dense SwiGLU FFN: `down(swiglu(gate(x), up(x)))`, each projection fused via [`QMat`].
+fn ffn_forward(x: &[f32], gate: &QMat, up: &QMat, down: &QMat) -> Vec<f32> {
+    let g = gate.matvec(x);
+    let u = up.matvec(x);
+    let a = crate::moe::swiglu(&g, &u);
+    down.matvec(&a)
 }
 
 /// Single-token causal attention (a decode step attending over a 1-position span): each
 /// head's softmax over its own key is 1.0, so the context equals the (GQA-broadcast) value.
 /// Q/K are still RoPE-rotated and scored, exercising the real path.
 fn attention_decode(x_norm: &[f32], w: &BlockWeights, g: &Geometry, pos: usize) -> Vec<f32> {
-    let q = matvec(&w.q, g.d_model, g.d_model, x_norm);
-    let kv_dim = g.n_kv_heads * g.head_dim;
-    let k = matvec(&w.k, kv_dim, g.d_model, x_norm);
-    let v = matvec(&w.v, kv_dim, g.d_model, x_norm);
+    let q = w.q.matvec(x_norm);
+    let k = w.k.matvec(x_norm);
+    let v = w.v.matvec(x_norm);
     let v_exp = gqa_repeat_kv(&v, 1, g.n_kv_heads, g.n_heads, g.head_dim);
     let scale = 1.0 / (g.head_dim as f32).sqrt();
     let mut ctx = vec![0.0f32; g.n_heads * g.head_dim];
@@ -93,7 +101,7 @@ fn attention_decode(x_norm: &[f32], w: &BlockWeights, g: &Geometry, pos: usize) 
             *dst = *src * weight;
         }
     }
-    matvec(&w.o, g.d_model, g.n_heads * g.head_dim, &ctx)
+    w.o.matvec(&ctx)
 }
 
 /// One transformer block decode step: attention + FFN with residuals.
@@ -101,20 +109,20 @@ pub fn block_forward(x: &[f32], w: &BlockWeights, g: &Geometry, pos: usize) -> V
     assert_eq!(x.len(), g.d_model, "block_forward: hidden width");
     let attn = attention_decode(&rmsnorm(x, &w.attn_norm, g.rms_eps), w, g, pos);
     let y: Vec<f32> = x.iter().zip(&attn).map(|(a, b)| a + b).collect();
-    let ffn = expert_ffn(
+    let ffn = ffn_forward(
         &rmsnorm(&y, &w.ffn_norm, g.rms_eps),
         &w.ffn_gate,
         &w.ffn_up,
         &w.ffn_down,
-        g.d_model,
-        g.d_ff,
     );
     y.iter().zip(&ffn).map(|(a, b)| a + b).collect()
 }
 
 /// Project a final hidden state to `n_vocab` logits (`out` is n_vocab×d_model).
-pub fn logits_from_hidden(x: &[f32], out_w: &[f32], g: &Geometry, n_vocab: usize) -> Vec<f32> {
-    matvec(out_w, n_vocab, g.d_model, x)
+pub fn logits_from_hidden(x: &[f32], out_w: &QMat, g: &Geometry, n_vocab: usize) -> Vec<f32> {
+    debug_assert_eq!(out_w.rows(), n_vocab, "logits_from_hidden: vocab rows");
+    debug_assert_eq!(out_w.cols(), g.d_model, "logits_from_hidden: hidden width");
+    out_w.matvec(x)
 }
 
 /// Per-layer K/V cache (row-major `seq × kv_dim`), appended one position per decode step.
@@ -141,9 +149,9 @@ pub fn attention_forward_cached(
     let kv_dim = g.n_kv_heads * g.head_dim;
     let q_dim = g.n_heads * g.head_dim;
     let n = rmsnorm(x, &w.attn_norm, g.rms_eps);
-    let q = matvec(&w.q, q_dim, g.d_model, &n);
-    let k = matvec(&w.k, kv_dim, g.d_model, &n);
-    let v = matvec(&w.v, kv_dim, g.d_model, &n);
+    let q = w.q.matvec(&n);
+    let k = w.k.matvec(&n);
+    let v = w.v.matvec(&n);
     cache.k.extend_from_slice(&k);
     cache.v.extend_from_slice(&v);
     let scale = 1.0 / (g.head_dim as f32).sqrt();
@@ -169,7 +177,7 @@ pub fn attention_forward_cached(
             ctx[hs + d] = acc;
         }
     }
-    matvec(&w.o, g.d_model, q_dim, &ctx)
+    w.o.matvec(&ctx)
 }
 
 /// Decode **one** new token at `pos`, attending over every cached key/value (causal), and
@@ -186,13 +194,11 @@ pub fn block_forward_cached(
 ) -> Vec<f32> {
     let attn = attention_forward_cached(x, w, g, pos, cache);
     let y: Vec<f32> = x.iter().zip(&attn).map(|(a, b)| a + b).collect();
-    let ffn = expert_ffn(
+    let ffn = ffn_forward(
         &rmsnorm(&y, &w.ffn_norm, g.rms_eps),
         &w.ffn_gate,
         &w.ffn_up,
         &w.ffn_down,
-        g.d_model,
-        g.d_ff,
     );
     y.iter().zip(&ffn).map(|(a, b)| a + b).collect()
 }
@@ -225,9 +231,9 @@ pub fn block_forward_seq(
     for (i, row) in x_seq.chunks_exact(g.d_model).enumerate() {
         let n = rmsnorm(row, &w.attn_norm, g.rms_eps);
         x_norm[i * g.d_model..(i + 1) * g.d_model].copy_from_slice(&n);
-        q_all[i * q_dim..(i + 1) * q_dim].copy_from_slice(&matvec(&w.q, q_dim, g.d_model, &n));
-        k_all[i * kv_dim..(i + 1) * kv_dim].copy_from_slice(&matvec(&w.k, kv_dim, g.d_model, &n));
-        v_all[i * kv_dim..(i + 1) * kv_dim].copy_from_slice(&matvec(&w.v, kv_dim, g.d_model, &n));
+        q_all[i * q_dim..(i + 1) * q_dim].copy_from_slice(&w.q.matvec(&n));
+        k_all[i * kv_dim..(i + 1) * kv_dim].copy_from_slice(&w.k.matvec(&n));
+        v_all[i * kv_dim..(i + 1) * kv_dim].copy_from_slice(&w.v.matvec(&n));
     }
     let scale = 1.0 / (g.head_dim as f32).sqrt();
     let mut attn_ctx = vec![0.0f32; seq * q_dim];
@@ -260,12 +266,7 @@ pub fn block_forward_seq(
     // Output projection per row + residual.
     let mut y = vec![0.0f32; seq * g.d_model];
     for i in 0..seq {
-        let o_row = matvec(
-            &w.o,
-            g.d_model,
-            g.n_heads * g.head_dim,
-            &attn_ctx[i * q_dim..(i + 1) * q_dim],
-        );
+        let o_row = w.o.matvec(&attn_ctx[i * q_dim..(i + 1) * q_dim]);
         for d in 0..g.d_model {
             y[i * g.d_model + d] = x_seq[i * g.d_model + d] + o_row[d];
         }
@@ -274,13 +275,11 @@ pub fn block_forward_seq(
     let mut z = vec![0.0f32; seq * g.d_model];
     for i in 0..seq {
         let row = &y[i * g.d_model..(i + 1) * g.d_model];
-        let ffn = expert_ffn(
+        let ffn = ffn_forward(
             &rmsnorm(row, &w.ffn_norm, g.rms_eps),
             &w.ffn_gate,
             &w.ffn_up,
             &w.ffn_down,
-            g.d_model,
-            g.d_ff,
         );
         for d in 0..g.d_model {
             z[i * g.d_model + d] = row[d] + ffn[d];
@@ -294,7 +293,7 @@ pub fn last_logits(
     hidden_seq: &[f32],
     g: &Geometry,
     out_norm: &[f32],
-    out_w: &[f32],
+    out_w: &QMat,
     n_vocab: usize,
 ) -> Vec<f32> {
     let seq = hidden_seq.len() / g.d_model;
@@ -316,14 +315,14 @@ mod tests {
     fn zeros_block() -> BlockWeights {
         BlockWeights {
             attn_norm: vec![1.0; 4],
-            q: vec![0.0; 16],
-            k: vec![0.0; 8],
-            v: vec![0.0; 8],
-            o: vec![0.0; 16],
+            q: QMat::from_f32(vec![0.0; 16], 4, 4),
+            k: QMat::from_f32(vec![0.0; 8], 2, 4),
+            v: QMat::from_f32(vec![0.0; 8], 2, 4),
+            o: QMat::from_f32(vec![0.0; 16], 4, 4),
             ffn_norm: vec![1.0; 4],
-            ffn_gate: vec![0.0; 32],
-            ffn_up: vec![0.0; 32],
-            ffn_down: vec![0.0; 32],
+            ffn_gate: QMat::from_f32(vec![0.0; 32], 8, 4),
+            ffn_up: QMat::from_f32(vec![0.0; 32], 8, 4),
+            ffn_down: QMat::from_f32(vec![0.0; 32], 4, 8),
         }
     }
 
@@ -342,14 +341,14 @@ mod tests {
         let g = geom();
         let w = BlockWeights {
             attn_norm: vec![1.0; 4],
-            q: (0..16).map(|i| i as f32 * 0.01 - 0.07).collect(),
-            k: (0..8).map(|i| i as f32 * 0.02 - 0.06).collect(),
-            v: (0..8).map(|i| 0.1 - i as f32 * 0.03).collect(),
-            o: (0..16).map(|i| i as f32 * 0.015 - 0.11).collect(),
+            q: QMat::from_f32((0..16).map(|i| i as f32 * 0.01 - 0.07).collect(), 4, 4),
+            k: QMat::from_f32((0..8).map(|i| i as f32 * 0.02 - 0.06).collect(), 2, 4),
+            v: QMat::from_f32((0..8).map(|i| 0.1 - i as f32 * 0.03).collect(), 2, 4),
+            o: QMat::from_f32((0..16).map(|i| i as f32 * 0.015 - 0.11).collect(), 4, 4),
             ffn_norm: vec![1.0; 4],
-            ffn_gate: (0..32).map(|i| i as f32 * 0.01 - 0.15).collect(),
-            ffn_up: (0..32).map(|i| 0.2 - i as f32 * 0.01).collect(),
-            ffn_down: (0..32).map(|i| i as f32 * 0.005 - 0.08).collect(),
+            ffn_gate: QMat::from_f32((0..32).map(|i| i as f32 * 0.01 - 0.15).collect(), 8, 4),
+            ffn_up: QMat::from_f32((0..32).map(|i| 0.2 - i as f32 * 0.01).collect(), 8, 4),
+            ffn_down: QMat::from_f32((0..32).map(|i| i as f32 * 0.005 - 0.08).collect(), 4, 8),
         };
         let out = block_forward(&[0.5, -0.5, 1.0, 0.0], &w, &g, 3);
         assert_eq!(out.len(), g.d_model);
@@ -378,6 +377,7 @@ mod tests {
         out_w[4 * g.d_model] = 1.0;
         out_w[4 * g.d_model + 1] = 1.0; // [1,1,0,0]·[1,2,0,0]=3 > others
         out_w[0] = 0.1; // token 0 row [0.1,0,..]·..=0.1
+        let out_w = QMat::from_f32(out_w, n_vocab, g.d_model);
         let logits = logits_from_hidden(&after_block, &out_w, &g, n_vocab);
         assert_eq!(logits.len(), n_vocab);
         assert_eq!(argmax(&logits), Some(4));
@@ -397,14 +397,14 @@ mod tests {
         // attention + FFN branches active, so causal context really matters.
         BlockWeights {
             attn_norm: vec![1.0; 4],
-            q: (0..16).map(|i| i as f32 * 0.03 - 0.2).collect(),
-            k: (0..8).map(|i| i as f32 * 0.02 - 0.06).collect(),
-            v: (0..8).map(|i| 0.11 - i as f32 * 0.04).collect(),
-            o: (0..16).map(|i| i as f32 * 0.015 - 0.1).collect(),
+            q: QMat::from_f32((0..16).map(|i| i as f32 * 0.03 - 0.2).collect(), 4, 4),
+            k: QMat::from_f32((0..8).map(|i| i as f32 * 0.02 - 0.06).collect(), 2, 4),
+            v: QMat::from_f32((0..8).map(|i| 0.11 - i as f32 * 0.04).collect(), 2, 4),
+            o: QMat::from_f32((0..16).map(|i| i as f32 * 0.015 - 0.1).collect(), 4, 4),
             ffn_norm: vec![1.0; 4],
-            ffn_gate: (0..32).map(|i| i as f32 * 0.01 - 0.14).collect(),
-            ffn_up: (0..32).map(|i| 0.2 - i as f32 * 0.012).collect(),
-            ffn_down: (0..32).map(|i| i as f32 * 0.006 - 0.08).collect(),
+            ffn_gate: QMat::from_f32((0..32).map(|i| i as f32 * 0.01 - 0.14).collect(), 8, 4),
+            ffn_up: QMat::from_f32((0..32).map(|i| 0.2 - i as f32 * 0.012).collect(), 8, 4),
+            ffn_down: QMat::from_f32((0..32).map(|i| i as f32 * 0.006 - 0.08).collect(), 4, 8),
         }
     }
 

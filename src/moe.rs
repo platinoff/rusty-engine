@@ -463,6 +463,7 @@ mod tests {
     use super::*;
     use crate::cache::{expert_bytes, ExpertCache};
     use crate::forward::{block_forward_cached, BlockWeights, Geometry, LayerKv};
+    use crate::qmat::QMat;
 
     /// Two experts of distinct weight; returns (router_w, experts, inter) for a 3-expert top-1.
     fn cached_forward_fixtures() -> (Vec<f32>, Vec<ExpertWeights>, usize, usize, RouterConfig) {
@@ -549,21 +550,24 @@ mod tests {
         // PH-403b equivalence: 1-expert top-1 MoE block reproduces the dense block forward
         // step-by-step over a growing KV prefix (positions 0,1,2).
         let g = Geometry::new(4, 2, 1, 8, 10_000.0, 1e-5); // d_model4 heads2 kv1 head2 ff8
+        let gate_w: Vec<f32> = (0..32).map(|i| i as f32 * 0.01 - 0.15).collect();
+        let up_w: Vec<f32> = (0..32).map(|i| 0.2 - i as f32 * 0.012).collect();
+        let down_w: Vec<f32> = (0..32).map(|i| i as f32 * 0.006 - 0.09).collect();
         let w = BlockWeights {
             attn_norm: vec![1.0; 4],
-            q: (0..16).map(|i| i as f32 * 0.02 - 0.15).collect(),
-            k: (0..8).map(|i| i as f32 * 0.03 - 0.1).collect(),
-            v: (0..8).map(|i| 0.2 - i as f32 * 0.05).collect(),
-            o: (0..16).map(|i| i as f32 * 0.025 - 0.18).collect(),
+            q: QMat::from_f32((0..16).map(|i| i as f32 * 0.02 - 0.15).collect(), 4, 4),
+            k: QMat::from_f32((0..8).map(|i| i as f32 * 0.03 - 0.1).collect(), 2, 4),
+            v: QMat::from_f32((0..8).map(|i| 0.2 - i as f32 * 0.05).collect(), 2, 4),
+            o: QMat::from_f32((0..16).map(|i| i as f32 * 0.025 - 0.18).collect(), 4, 4),
             ffn_norm: vec![1.0; 4],
-            ffn_gate: (0..32).map(|i| i as f32 * 0.01 - 0.15).collect(),
-            ffn_up: (0..32).map(|i| 0.2 - i as f32 * 0.012).collect(),
-            ffn_down: (0..32).map(|i| i as f32 * 0.006 - 0.09).collect(),
+            ffn_gate: QMat::from_f32(gate_w.clone(), 8, 4),
+            ffn_up: QMat::from_f32(up_w.clone(), 8, 4),
+            ffn_down: QMat::from_f32(down_w.clone(), 4, 8),
         };
         let ffn = ExpertWeights {
-            gate: w.ffn_gate.clone(),
-            up: w.ffn_up.clone(),
-            down: w.ffn_down.clone(),
+            gate: gate_w,
+            up: up_w,
+            down: down_w,
         };
         let router_w = [1.0f32, 0.0, 0.0, 0.0]; // 1 expert × d_model
         let cfg = RouterConfig {

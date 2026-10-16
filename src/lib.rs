@@ -17,6 +17,7 @@
 //! - [`infer`] — transformer forward, paged KV-cache, sampler (B3)
 //! - [`forward`] — single-block transformer composition (PH-305d) + seq prefill (PH-305)
 //! - [`model`] — GGUF model-config + tensor-geometry validation (PH-305c/e)
+//! - [`qmat`]  — quantized/f32 weight matrix with fused matvec (B2 in the forward path)
 //! - [`runner`] — dense end-to-end generation on a real GGUF (PH-305)
 //! - [`tokenizer`] — GGUF tokenizer metadata + byte-level BPE (fallback + specials)
 //! - [`gpt2`] — HF GPT-2/Qwen2 pre-tokenizer regex splitter (std-only, PH-305b)
@@ -43,6 +44,7 @@ pub mod loader;
 pub mod model;
 pub mod moe;
 pub mod node;
+pub mod qmat;
 pub mod quant;
 pub mod repack;
 pub mod runner;

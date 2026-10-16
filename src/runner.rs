@@ -15,6 +15,7 @@ use crate::forward::{
 use crate::infer::{apply_repetition_penalty, argmax, rmsnorm, sample, GenerationOptions, SeedRng};
 use crate::loader::MmapModel;
 use crate::model::ModelConfig;
+use crate::qmat::QMat;
 
 /// A fully dequantized dense model, ready to run a forward pass over token ids.
 pub struct DenseRunner {
@@ -27,8 +28,8 @@ pub struct DenseRunner {
     pub blocks: Vec<BlockWeights>,
     /// `output_norm.weight` (or `norm.weight`) dequantized, length `d_model`.
     pub output_norm: Vec<f32>,
-    /// `output.weight` dequantized, row-major `n_vocab × d_model`.
-    pub output: Vec<f32>,
+    /// `output.weight` in stored quant blocks, row-major `n_vocab × d_model` (fused matvec).
+    pub output: QMat,
     /// Optional EOS token id (from `tokenizer.ggml.eos_token_id`).
     pub eos_token_id: Option<u32>,
 }
@@ -51,22 +52,22 @@ impl DenseRunner {
             cfg.rope_freq_base,
             cfg.rms_eps,
         );
+        let d_model = cfg.d_model;
+        let kv_dim = geom.n_kv_heads * geom.head_dim;
+        let d_ff = cfg.d_ff;
         let embed = need(model.dequant("token_embd.weight"), "token_embd.weight")?;
         let mut blocks = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = format!("blk.{i}.");
             let attn_norm = need(model.dequant(&format!("{p}attn_norm.weight")), "attn_norm")?;
-            let q = need(model.dequant(&format!("{p}attn_q.weight")), "attn_q")?;
-            let k = need(model.dequant(&format!("{p}attn_k.weight")), "attn_k")?;
-            let v = need(model.dequant(&format!("{p}attn_v.weight")), "attn_v")?;
-            let o = need(
-                model.dequant(&format!("{p}attn_output.weight")),
-                "attn_output",
-            )?;
+            let q = QMat::from_model(model, &format!("{p}attn_q.weight"), d_model, d_model)?;
+            let k = QMat::from_model(model, &format!("{p}attn_k.weight"), kv_dim, d_model)?;
+            let v = QMat::from_model(model, &format!("{p}attn_v.weight"), kv_dim, d_model)?;
+            let o = QMat::from_model(model, &format!("{p}attn_output.weight"), d_model, d_model)?;
             let ffn_norm = need(model.dequant(&format!("{p}ffn_norm.weight")), "ffn_norm")?;
-            let ffn_gate = need(model.dequant(&format!("{p}ffn_gate.weight")), "ffn_gate")?;
-            let ffn_up = need(model.dequant(&format!("{p}ffn_up.weight")), "ffn_up")?;
-            let ffn_down = need(model.dequant(&format!("{p}ffn_down.weight")), "ffn_down")?;
+            let ffn_gate = QMat::from_model(model, &format!("{p}ffn_gate.weight"), d_ff, d_model)?;
+            let ffn_up = QMat::from_model(model, &format!("{p}ffn_up.weight"), d_ff, d_model)?;
+            let ffn_down = QMat::from_model(model, &format!("{p}ffn_down.weight"), d_model, d_ff)?;
             blocks.push(BlockWeights {
                 attn_norm,
                 q,
@@ -83,7 +84,7 @@ impl DenseRunner {
             Ok(v) => v,
             Err(_) => need(model.dequant("norm.weight"), "norm.weight")?,
         };
-        let output = need(model.dequant("output.weight"), "output.weight")?;
+        let output = QMat::from_model(model, "output.weight", cfg.n_vocab, d_model)?;
         Ok(Self {
             geom,
             n_layers: cfg.n_layers,
