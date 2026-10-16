@@ -66,7 +66,7 @@ impl QMat {
                 n,
             } => match *ggml_type {
                 2 => crate::kernel::matvec_q4_0_dispatch(bytes, *m, *n, x),
-                6 => crate::kernel::matvec_q5_0(bytes, *m, *n, x),
+                6 => crate::kernel::matvec_q5_0_dispatch(bytes, *m, *n, x),
                 8 => crate::kernel::matvec_q8_0_dispatch(bytes, *m, *n, x),
                 12 => crate::kernel::matvec_q4_k_dispatch(bytes, *m, *n, x),
                 13 => crate::kernel::matvec_q5_k(bytes, *m, *n, x),

@@ -644,6 +644,80 @@ pub unsafe fn dot_q6_k_avx2(a: &[u8], b: &[f32]) -> f32 {
     hsum_ps_sse2(_mm_add_ps(lo, hi))
 }
 
+/// AVX2 `dot(dequant_q5_0(a), b)` — split-half nibbles eight at a time; the 5th bit is
+/// gathered from `qh` per lane with `_mm256_srlv_epi32` (bias −16).
+///
+/// # Safety
+/// Requires AVX2 (runtime-detected via [`dot_q5_0_dispatch`]). `a.len()` multiple of 22 and
+/// `b.len() == a.len()/22*32` (both debug-asserted).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn dot_q5_0_avx2(a: &[u8], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = a.len() / 22;
+    debug_assert_eq!(a.len(), nb * 22, "dot_q5_0_avx2: partial block");
+    debug_assert_eq!(b.len(), nb * 32, "dot_q5_0_avx2: vector length mismatch");
+    let mask = _mm256_set1_epi32(0x0F);
+    let sixteen = _mm256_set1_epi32(16);
+    let ones = _mm256_set1_epi32(1);
+    let shifts = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mut acc = _mm256_setzero_ps();
+    for (k, blk) in a.chunks_exact(22).enumerate() {
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dv = _mm256_set1_ps(d);
+        let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+        let qs = &blk[6..22];
+        let bo = k * 32;
+        for jj in (0..16).step_by(8) {
+            let v = _mm256_cvtepu8_epi32(_mm_loadl_epi64(qs.as_ptr().add(jj).cast()));
+            let lo_nib = _mm256_and_si256(v, mask);
+            let hi_nib = _mm256_srli_epi32(v, 4);
+            let b0 = _mm256_set1_epi32(((qh >> jj) & 0xFF) as i32);
+            let b1 = _mm256_set1_epi32(((qh >> (jj + 16)) & 0xFF) as i32);
+            let bit0 = _mm256_slli_epi32(_mm256_and_si256(_mm256_srlv_epi32(b0, shifts), ones), 4);
+            let bit1 = _mm256_slli_epi32(_mm256_and_si256(_mm256_srlv_epi32(b1, shifts), ones), 4);
+            let lo = _mm256_sub_epi32(_mm256_or_si256(lo_nib, bit0), sixteen);
+            let hi = _mm256_sub_epi32(_mm256_or_si256(hi_nib, bit1), sixteen);
+            let lov = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(lo));
+            let hiv = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(hi));
+            acc = _mm256_add_ps(
+                acc,
+                _mm256_mul_ps(lov, _mm256_loadu_ps(b.as_ptr().add(bo + jj))),
+            );
+            acc = _mm256_add_ps(
+                acc,
+                _mm256_mul_ps(hiv, _mm256_loadu_ps(b.as_ptr().add(bo + 16 + jj))),
+            );
+        }
+    }
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    hsum_ps_sse2(_mm_add_ps(lo, hi))
+}
+
+/// Runtime-dispatched Q5_0 dot: AVX2 when the CPU reports support, else the scalar oracle.
+pub fn dot_q5_0_dispatch(a: &[u8], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: gated by the runtime AVX2 check above.
+            return unsafe { dot_q5_0_avx2(a, b) };
+        }
+    }
+    dot_q5_0(a, b)
+}
+
+/// Row-major `W[m×n]` Q5_0, times `x[n]`, via the dispatched dot.
+pub fn matvec_q5_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matvec_q5_0_dispatch: n%32");
+    let row_bytes = n / 32 * 22;
+    debug_assert_eq!(w.len(), m * row_bytes, "matvec_q5_0_dispatch: weight size");
+    debug_assert_eq!(x.len(), n, "matvec_q5_0_dispatch: input width");
+    (0..m)
+        .map(|r| dot_q5_0_dispatch(&w[r * row_bytes..(r + 1) * row_bytes], x))
+        .collect()
+}
+
 /// Runtime-dispatched Q4_K dot: AVX2 when the CPU reports support, else the scalar oracle.
 pub fn dot_q4_k_dispatch(a: &[u8], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -1003,6 +1077,23 @@ mod tests {
             .collect();
         let want = dot_q4_0(&a, &b);
         let got = unsafe { dot_q4_0_avx2(&a, &b) };
+        assert!(
+            (got - want).abs() <= want.abs() * 1e-3 + 1e-3,
+            "got={got} want={want}"
+        );
+    }
+
+    #[test]
+    fn dot_q5_0_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let a = q5_blocks(4);
+        let b: Vec<f32> = (0..a.len() / 22 * 32)
+            .map(|i| (i as f32) * 0.02 - 1.2)
+            .collect();
+        let want = dot_q5_0(&a, &b);
+        let got = unsafe { dot_q5_0_avx2(&a, &b) };
         assert!(
             (got - want).abs() <= want.abs() * 1e-3 + 1e-3,
             "got={got} want={want}"
