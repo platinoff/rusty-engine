@@ -12,7 +12,7 @@
 use crate::core::{EngineError, Result};
 use crate::loader::MmapModel;
 use crate::model::ModelConfig;
-use crate::runner::DenseRunner;
+use crate::runner::{DenseDecoder, DenseRunner};
 use crate::tokenizer::{Bpe, TokenizerMeta};
 
 /// A dense runner paired with the model's byte-level BPE, for text in / text out.
@@ -53,7 +53,10 @@ impl TextRunner {
                 message: "textgen: prompt tokenized to empty".to_string(),
             });
         }
-        let out = self.runner.generate(&ids, max_new);
+        // PH-307: decode incrementally over the KV cache (O(n) per token) instead of
+        // re-prefilling the whole prefix every step (O(n^2)); identical greedy stream.
+        let mut dec = DenseDecoder::new(&self.runner);
+        let out = dec.generate_incremental(&ids, max_new);
         let new = &out[ids.len().min(out.len())..];
         Ok(self.bpe.decode(new))
     }
@@ -79,12 +82,10 @@ impl TextRunner {
                 message: "textgen: prompt tokens empty".to_string(),
             });
         }
-        let opts = crate::infer::GenerationOptions {
-            temperature: 0.0,
-            ..Default::default()
-        };
-        let mut rng = crate::infer::SeedRng::new(0);
-        let out = self.runner.generate_with(&ids, &opts, max_new, &mut rng);
+        // PH-307: KV-cache incremental greedy (temperature 0 == argmax) instead of the
+        // re-prefill `generate_with`; the token stream is identical (see dense_gen test).
+        let mut dec = DenseDecoder::new(&self.runner);
+        let out = dec.generate_incremental(&ids, max_new);
         let new = &out[ids.len().min(out.len())..];
         Ok(self.bpe.decode(new))
     }
