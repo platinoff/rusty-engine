@@ -163,3 +163,15 @@ avx2-vs-scalar. Заміри (Qwen2.5-0.5B Q4_K_M, цей box): serve 8-ток d
 O(n²) `DenseRunner::generate` parity **128.5 с → 102.5 с** (~20 %). Лишається ALU-bound — наступний
 зріз: AVX2/FMA для Q5_K + батч-`matvec` (кілька рядків на прохід ваг) або B6 cross-builds / B7
 docker-slave. **7 локальних комітів** за сесію, **без push** (B11).
+
+**Факт-корекція форматів + `max_tokens` + Q5_0 (той самий drain):** `rusty inspect` на реальній
+Qwen2.5-0.5B Q4_K_M показав, що 896-ширинні тензори **не** K-quant: `output` **Q8_0**,
+`token_embd`/attn q·k·v·o/`ffn_gate`/`ffn_up` **Q5_0**, лише `ffn_down` (4864) **Q6_K** — тож
+домінантний скалярний шлях це **Q5_0** (~51 % MAC/токен), а не Q4_K. Коміти: **`ca935d6`**
+perf(serve) **PH-501c** — `serve` хардкодив `max_new=8` (кожен запит = 8 кроків ~5 с, незалежно від
+`max_tokens`); додано `http::max_tokens_of` (clamp 1..=512, default 8) → 1-токен запит **5.09 с →
+0.67 с**. **`fc308af`** perf(kernel) — `dot_q5_0_avx2` (+`_dispatch`/`matvec_*`, `QMat` type 6):
+split-half ниббл + 5-й біт через `_mm256_srlv_epi32`; golden `PH-405` досі **точний**; decode
+**~0.56 → ~0.33 с/токен**, 8-токен chat **5.06 → 3.01 с**, O(n²) parity-path **128.5 → 52.6 с**
+(**2.4×**). **9 локальних комітів**, без push (B11). Наступне: `Q8_0` (output, ~28 % MAC) вже AVX2;
+лишається FMA для Q5_0/Q6_K + батч-`matvec` (рядки на прохід ваг).

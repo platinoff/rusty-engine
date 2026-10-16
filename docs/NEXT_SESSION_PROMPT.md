@@ -58,6 +58,18 @@ Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker р�
   прохід вагами) **або** `PH-405b` llama-rs semantic parity **або** B6 cross-builds / B7 docker-slave.
   **7 локальних комітів** за сесію, **без push** (B11).
 
+### Продовження 2 (2026-10-16, формати + max_tokens + Q5_0)
+
+- **`rusty inspect`** реальної Qwen2.5-0.5B Q4_K_M: 896-ширинні тензори **не** K-quant — `output`
+  **Q8_0**, `token_embd`/attn q·k·v·o/`ffn_gate`/`ffn_up` **Q5_0**, лише `ffn_down` (4864) **Q6_K**;
+  домінантний скалярний шлях — **Q5_0** (~51 % MAC/токен).
+- **`ca935d6`** perf(serve) **PH-501c** — `serve` хардкодив `max_new=8` (усі запити ~5 с незалежно
+  від `max_tokens`); `http::max_tokens_of` (clamp 1..=512) → 1-токен **5.09 с → 0.67 с**.
+- **`fc308af`** perf(kernel) — `dot_q5_0_avx2` (+dispatch, `QMat` type 6); golden точний; decode
+  **~0.56 → ~0.33 с/токен**, 8-токен chat **5.06 → 3.01 с**, parity-path **128.5 → 52.6 с** (2.4×).
+- **Далі:** FMA-варіанти Q5_0/Q6_K + батч-`matvec` (prefill/GEMM) **або** `PH-405b` llama-rs parity
+  **або** B6 cross-builds / B7 docker-slave. **9 локальних комітів**, без push (B11).
+
 ## AUTO-DIRECTIVE (owner, 2026-10-15) — на наступне `agi`
 
 Наступного `agi`: **НЕ питати вибору бенду** — одразу брати з черги й **automatically**
