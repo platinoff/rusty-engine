@@ -225,16 +225,15 @@ pub fn block_forward_seq(
     let kv_dim = g.n_kv_heads * g.head_dim;
     let q_dim = g.n_heads * g.head_dim;
     let mut x_norm = vec![0.0f32; seq * g.d_model];
-    let mut q_all = vec![0.0f32; seq * q_dim];
-    let mut k_all = vec![0.0f32; seq * kv_dim];
-    let mut v_all = vec![0.0f32; seq * kv_dim];
     for (i, row) in x_seq.chunks_exact(g.d_model).enumerate() {
         let n = rmsnorm(row, &w.attn_norm, g.rms_eps);
         x_norm[i * g.d_model..(i + 1) * g.d_model].copy_from_slice(&n);
-        q_all[i * q_dim..(i + 1) * q_dim].copy_from_slice(&w.q.matvec(&n));
-        k_all[i * kv_dim..(i + 1) * kv_dim].copy_from_slice(&w.k.matvec(&n));
-        v_all[i * kv_dim..(i + 1) * kv_dim].copy_from_slice(&w.v.matvec(&n));
     }
+    // Batched projections: each weight block is dequantized once for the whole prompt
+    // (row-wise `matvec` would repeat that `seq×` — the dequant-heavy part of prefill).
+    let q_all = w.q.matmul(&x_norm, seq);
+    let k_all = w.k.matmul(&x_norm, seq);
+    let v_all = w.v.matmul(&x_norm, seq);
     let scale = 1.0 / (g.head_dim as f32).sqrt();
     let mut attn_ctx = vec![0.0f32; seq * q_dim];
     for h in 0..g.n_heads {
@@ -263,27 +262,115 @@ pub fn block_forward_seq(
             }
         }
     }
-    // Output projection per row + residual.
+    // Output projection (batched) + residual.
+    let o_all = w.o.matmul(&attn_ctx, seq);
     let mut y = vec![0.0f32; seq * g.d_model];
-    for i in 0..seq {
-        let o_row = w.o.matvec(&attn_ctx[i * q_dim..(i + 1) * q_dim]);
-        for d in 0..g.d_model {
-            y[i * g.d_model + d] = x_seq[i * g.d_model + d] + o_row[d];
+    for i in 0..seq * g.d_model {
+        y[i] = x_seq[i] + o_all[i];
+    }
+    // FFN (SwiGLU), batched: one rmsnorm pass, then gate/up/down over the whole prompt.
+    let mut y_norm = vec![0.0f32; seq * g.d_model];
+    for (i, row) in y.chunks_exact(g.d_model).enumerate() {
+        let n = rmsnorm(row, &w.ffn_norm, g.rms_eps);
+        y_norm[i * g.d_model..(i + 1) * g.d_model].copy_from_slice(&n);
+    }
+    let gate = w.ffn_gate.matmul(&y_norm, seq);
+    let up = w.ffn_up.matmul(&y_norm, seq);
+    let act = crate::moe::swiglu(&gate, &up);
+    let down = w.ffn_down.matmul(&act, seq);
+    let mut z = vec![0.0f32; seq * g.d_model];
+    for i in 0..seq * g.d_model {
+        z[i] = y[i] + down[i];
+    }
+    z
+}
+
+/// Batched prefill that also fills the KV cache: one pass over the `seq`-row prompt with
+/// the same attention as [`block_forward_seq`], but every row's K/V is appended to
+/// `cache` (raw — RoPE is applied on read, matching [`attention_forward_cached`]). This
+/// turns an O(`seq`) sequence of single-token decode steps into one batched pass, so the
+/// quant dequant cost is paid once instead of `seq×`. Returns the `seq × d_model` hidden
+/// state; the caller keeps the last row for logits. `cache` must already hold `pos_start`
+/// positions (0 for a fresh prompt).
+#[allow(clippy::needless_range_loop)]
+pub fn block_forward_prefill_cached(
+    x_seq: &[f32],
+    w: &BlockWeights,
+    g: &Geometry,
+    pos_start: usize,
+    cache: &mut LayerKv,
+) -> Vec<f32> {
+    let seq = x_seq.len() / g.d_model;
+    assert_eq!(
+        seq * g.d_model,
+        x_seq.len(),
+        "block_forward_prefill_cached: seq × d_model"
+    );
+    let kv_dim = g.n_kv_heads * g.head_dim;
+    let q_dim = g.n_heads * g.head_dim;
+    assert_eq!(
+        cache.k.len() / kv_dim,
+        pos_start,
+        "block_forward_prefill_cached: cache/pos mismatch"
+    );
+
+    let mut x_norm = vec![0.0f32; seq * g.d_model];
+    for (i, row) in x_seq.chunks_exact(g.d_model).enumerate() {
+        let n = rmsnorm(row, &w.attn_norm, g.rms_eps);
+        x_norm[i * g.d_model..(i + 1) * g.d_model].copy_from_slice(&n);
+    }
+    let q_all = w.q.matmul(&x_norm, seq);
+    let k_all = w.k.matmul(&x_norm, seq);
+    let v_all = w.v.matmul(&x_norm, seq);
+    cache.k.extend_from_slice(&k_all);
+    cache.v.extend_from_slice(&v_all);
+
+    let scale = 1.0 / (g.head_dim as f32).sqrt();
+    let mut attn_ctx = vec![0.0f32; seq * q_dim];
+    for h in 0..g.n_heads {
+        let hs = h * g.head_dim;
+        let kv_h = (h * g.n_kv_heads / g.n_heads) * g.head_dim;
+        for i in 0..seq {
+            let pos = pos_start + i;
+            let q_r = rope(
+                &q_all[i * q_dim + hs..i * q_dim + hs + g.head_dim],
+                pos,
+                g.rope_freq_base,
+            );
+            let scores: Vec<f32> = (0..=pos)
+                .map(|j| {
+                    let k_raw = &cache.k[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
+                    let k_r = rope(k_raw, j, g.rope_freq_base);
+                    q_r.iter().zip(&k_r).map(|(a, b)| a * b).sum::<f32>() * scale
+                })
+                .collect();
+            let probs = softmax(&scores);
+            for d in 0..g.head_dim {
+                let mut acc = 0.0f32;
+                for j in 0..=pos {
+                    acc += probs[j] * cache.v[j * kv_dim + kv_h + d];
+                }
+                attn_ctx[i * q_dim + hs + d] = acc;
+            }
         }
     }
-    // FFN per row (SwiGLU): rmsnorm → gate/up/down, add residual.
+    let o_all = w.o.matmul(&attn_ctx, seq);
+    let mut y = vec![0.0f32; seq * g.d_model];
+    for i in 0..seq * g.d_model {
+        y[i] = x_seq[i] + o_all[i];
+    }
+    let mut y_norm = vec![0.0f32; seq * g.d_model];
+    for (i, row) in y.chunks_exact(g.d_model).enumerate() {
+        let n = rmsnorm(row, &w.ffn_norm, g.rms_eps);
+        y_norm[i * g.d_model..(i + 1) * g.d_model].copy_from_slice(&n);
+    }
+    let gate = w.ffn_gate.matmul(&y_norm, seq);
+    let up = w.ffn_up.matmul(&y_norm, seq);
+    let act = crate::moe::swiglu(&gate, &up);
+    let down = w.ffn_down.matmul(&act, seq);
     let mut z = vec![0.0f32; seq * g.d_model];
-    for i in 0..seq {
-        let row = &y[i * g.d_model..(i + 1) * g.d_model];
-        let ffn = ffn_forward(
-            &rmsnorm(row, &w.ffn_norm, g.rms_eps),
-            &w.ffn_gate,
-            &w.ffn_up,
-            &w.ffn_down,
-        );
-        for d in 0..g.d_model {
-            z[i * g.d_model + d] = row[d] + ffn[d];
-        }
+    for i in 0..seq * g.d_model {
+        z[i] = y[i] + down[i];
     }
     z
 }

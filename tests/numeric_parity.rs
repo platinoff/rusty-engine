@@ -29,13 +29,26 @@ const GOLDEN: &str = "tests/data/qwen25_golden.txt";
 const PROMPT: &[u32] = &[151644, 872, 198, 3837, 1059, 8701]; // fixed seed ids
 const GEN: usize = 16;
 
-/// Greedy continuation fingerprint for the fixed prompt.
+/// Greedy continuation fingerprint for the fixed prompt (**re-prefill** path).
 fn fingerprint(model_path: &Path) -> Vec<u32> {
     let m = unsafe { MmapModel::open(model_path) }.expect("open model");
     let cfg = ModelConfig::from_file(m.header()).expect("config");
     assert!(cfg.validate(m.header()).is_empty(), "real geometry invalid");
     let runner = DenseRunner::from_model(&m, &cfg).expect("runner");
     let out = runner.generate(PROMPT, GEN);
+    out[PROMPT.len()..].to_vec()
+}
+
+/// The **serve/production** path: the prompt is prefilled into the KV cache in one batched
+/// pass (`DenseDecoder::prefill`) and then decoded incrementally. Must match the re-prefill
+/// fingerprint above — this is what `rusty serve` runs, so it needs its own guard.
+fn fingerprint_incremental(model_path: &Path) -> Vec<u32> {
+    use rusty_engine::runner::DenseDecoder;
+    let m = unsafe { MmapModel::open(model_path) }.expect("open model");
+    let cfg = ModelConfig::from_file(m.header()).expect("config");
+    let runner = DenseRunner::from_model(&m, &cfg).expect("runner");
+    let mut dec = DenseDecoder::new(&runner);
+    let out = dec.generate_incremental(PROMPT, GEN);
     out[PROMPT.len()..].to_vec()
 }
 
@@ -98,5 +111,12 @@ fn qwen25_greedy_fingerprint_is_stable() {
     assert_eq!(
         gen, gg,
         "PH-405 numeric regression: greedy continuation drifted from the golden fingerprint"
+    );
+
+    // Same golden, but through the incremental/serve path (batched cache prefill + decode).
+    let inc = fingerprint_incremental(model);
+    assert_eq!(
+        inc, gg,
+        "PH-405 incremental regression: DenseDecoder::prefill + step drifted from the golden"
     );
 }

@@ -82,6 +82,44 @@ impl QMat {
         }
     }
 
+    /// Batched `W[m×n] · X[rows×n] → Out[rows×m]` for prefill. Quant formats swap each
+    /// block's dequant out of the row loop (see `kernel::matmul_*`), so the int→float
+    /// conversions that dominate `matvec` are paid once instead of once per row.
+    pub fn matmul(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        match self {
+            Self::F32 { data, m, n } => {
+                let mut out = Vec::with_capacity(rows * m);
+                for row in x.chunks_exact(*n).take(rows) {
+                    out.extend_from_slice(&crate::moe::matvec(data, *m, *n, row));
+                }
+                out
+            }
+            Self::Quant {
+                ggml_type,
+                bytes,
+                m,
+                n,
+            } => match *ggml_type {
+                2 => crate::kernel::matmul_q4_0_dispatch(bytes, *m, *n, x, rows),
+                6 => crate::kernel::matmul_q5_0_dispatch(bytes, *m, *n, x, rows),
+                8 => crate::kernel::matmul_q8_0_dispatch(bytes, *m, *n, x, rows),
+                12 => crate::kernel::matmul_q4_k_dispatch(bytes, *m, *n, x, rows),
+                13 => crate::kernel::matmul_q5_k(bytes, *m, *n, x, rows),
+                14 => crate::kernel::matmul_q6_k_dispatch(bytes, *m, *n, x, rows),
+                t => {
+                    let d = crate::quant::dequant(t, bytes).unwrap_or_else(|_| {
+                        panic!("QMat: no fused matmul and dequant failed for ggml type {t}")
+                    });
+                    let mut out = Vec::with_capacity(rows * m);
+                    for row in x.chunks_exact(*n).take(rows) {
+                        out.extend_from_slice(&crate::moe::matvec(&d, *m, *n, row));
+                    }
+                    out
+                }
+            },
+        }
+    }
+
     /// Build from a mapped model tensor by name; `m`/`n` come from the model geometry
     /// (GGUF stores `W[m×n]` as `dims = [n, m]`). Errors when the tensor is absent.
     pub fn from_model(
@@ -127,5 +165,17 @@ mod tests {
         let qm = QMat::from_bytes(0, bytes, 2, 3);
         let x = [2.0f32, -1.0, 0.25];
         assert_eq!(qm.matvec(&x), crate::moe::matvec(&data, 2, 3, &x));
+    }
+
+    #[test]
+    fn matmul_matches_rowwise_matvec() {
+        let data: Vec<f32> = (0..12).map(|i| i as f32 * 0.25 - 1.0).collect();
+        let qm = QMat::from_f32(data, 3, 4);
+        let x = [1.0f32, -2.0, 0.5, 3.0, 0.0, 1.0, -1.0, 2.0];
+        let got = qm.matmul(&x, 2);
+        let want: Vec<f32> = (0..2)
+            .flat_map(|r| qm.matvec(&x[r * 4..(r + 1) * 4]))
+            .collect();
+        assert_eq!(got, want);
     }
 }

@@ -764,6 +764,169 @@ pub fn matvec_q6_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32]) -> Vec<f32>
         .collect()
 }
 
+// ── `PH-305` prefill: batched matmul with per-block weight reuse ─────────────
+//
+// Row-wise `matvec` re-reads and re-dequantizes a whole weight row for every input row,
+// so a `seq`-token prefill pays `seq×` the dequant work — and the int→float conversion is
+// what dominates the quant kernels. The `matmul_*` variants iterate weight rows outer and
+// input rows inner, dequantizing each block **once** into a small f32 buffer reused across
+// all rows. Memory stays bounded (one block buffer); only pure-f32 MACs scale with `seq`.
+
+/// Dequantize one 18-byte Q4_0 block into 32 floats (split-half nibbles, bias −8).
+fn dq_q4_0_block(b: &[u8], out: &mut [f32]) {
+    let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+    let qs = &b[2..18];
+    for j in 0..16 {
+        out[j] = d * ((qs[j] & 0x0F) as i32 - 8) as f32;
+        out[16 + j] = d * ((qs[j] >> 4) as i32 - 8) as f32;
+    }
+}
+
+/// Dequantize one 22-byte Q5_0 block into 32 floats (5th bit from `qh`, bias −16).
+fn dq_q5_0_block(b: &[u8], out: &mut [f32]) {
+    let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+    let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+    let qs = &b[6..22];
+    for j in 0..16 {
+        let bit0 = (((qh >> j) & 1) << 4) as i32;
+        let bit1 = (((qh >> (j + 16)) & 1) << 4) as i32;
+        out[j] = d * (((qs[j] & 0x0F) as i32 | bit0) - 16) as f32;
+        out[16 + j] = d * (((qs[j] >> 4) as i32 | bit1) - 16) as f32;
+    }
+}
+
+/// Dequantize one 34-byte Q8_0 block into 32 floats (`d * i8`).
+fn dq_q8_0_block(b: &[u8], out: &mut [f32]) {
+    let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+    for j in 0..32 {
+        out[j] = (b[2 + j] as i8) as f32 * d;
+    }
+}
+
+/// f32 dot, AVX2+FMA when available (a genuine win for pure f32 MACs).
+///
+/// # Safety
+/// Requires AVX2+FMA (gated by [`dot_f32_dispatch`]); `a` and `b` must be equal length
+/// (debug-asserted) — the `*_loadu_ps` intrinsics read only within that window.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(a.len(), b.len(), "dot_f32_avx2: length mismatch");
+    let n = a.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        acc = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i)),
+            _mm256_loadu_ps(b.as_ptr().add(i)),
+            acc,
+        );
+        i += 8;
+    }
+    let mut s = hsum_ps_sse2(_mm_add_ps(
+        _mm256_castps256_ps128(acc),
+        _mm256_extractf128_ps(acc, 1),
+    ));
+    while i < n {
+        s += a[i] * b[i];
+        i += 1;
+    }
+    s
+}
+
+/// Runtime-dispatched f32 dot: AVX2+FMA when the CPU reports support, else a scalar fold.
+fn dot_f32_dispatch(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: gated by the runtime AVX2+FMA check above.
+            return unsafe { dot_f32_avx2(a, b) };
+        }
+    }
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Batched `W[m×n] · X[rows×n] → Out[rows×m]`, dequantizing each `block_bytes` block once
+/// (via `dq`) and reusing it across every row.
+#[allow(clippy::too_many_arguments)]
+fn matmul_reuse(
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    block_bytes: usize,
+    block_vals: usize,
+    dq: impl Fn(&[u8], &mut [f32]),
+) -> Vec<f32> {
+    debug_assert_eq!(x.len(), rows * n, "matmul: X rows × n");
+    let blocks = n / block_vals;
+    let row_bytes = blocks * block_bytes;
+    debug_assert_eq!(w.len(), m * row_bytes, "matmul: weight size");
+    let mut out = vec![0.0f32; rows * m];
+    let mut buf = vec![0.0f32; block_vals];
+    let mut acc = vec![0.0f32; rows];
+    for r in 0..m {
+        acc.iter_mut().for_each(|a| *a = 0.0);
+        let wr = &w[r * row_bytes..(r + 1) * row_bytes];
+        for b in 0..blocks {
+            dq(&wr[b * block_bytes..(b + 1) * block_bytes], &mut buf);
+            let xoff = b * block_vals;
+            for (row, a) in acc.iter_mut().enumerate() {
+                let xb = &x[row * n + xoff..row * n + xoff + block_vals];
+                *a += dot_f32_dispatch(&buf, xb);
+            }
+        }
+        for (row, a) in acc.iter().enumerate() {
+            out[row * m + r] = *a;
+        }
+    }
+    out
+}
+
+/// Batched Q4_0 `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
+pub fn matmul_q4_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matmul_q4_0_dispatch: n%32");
+    matmul_reuse(w, m, n, x, rows, 18, 32, dq_q4_0_block)
+}
+
+/// Batched Q5_0 `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
+pub fn matmul_q5_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matmul_q5_0_dispatch: n%32");
+    matmul_reuse(w, m, n, x, rows, 22, 32, dq_q5_0_block)
+}
+
+/// Batched Q8_0 `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
+pub fn matmul_q8_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matmul_q8_0_dispatch: n%32");
+    matmul_reuse(w, m, n, x, rows, 34, 32, dq_q8_0_block)
+}
+
+/// Batched Q4_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
+pub fn matmul_q4_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
+    debug_assert_eq!(n % 256, 0, "matmul_q4_k_dispatch: n%256");
+    matmul_reuse(w, m, n, x, rows, 144, 256, |b, o| {
+        dq_q4_k_block(b, o.try_into().expect("q4_k block buffer is 256"))
+    })
+}
+
+/// Batched Q5_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
+pub fn matmul_q5_k(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
+    debug_assert_eq!(n % 256, 0, "matmul_q5_k: n%256");
+    matmul_reuse(w, m, n, x, rows, 176, 256, |b, o| {
+        dq_q5_k_block(b, o.try_into().expect("q5_k block buffer is 256"))
+    })
+}
+
+/// Batched Q6_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
+pub fn matmul_q6_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
+    debug_assert_eq!(n % 256, 0, "matmul_q6_k_dispatch: n%256");
+    matmul_reuse(w, m, n, x, rows, 210, 256, |b, o| {
+        dq_q6_k_block(b, o.try_into().expect("q6_k block buffer is 256"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,5 +1295,58 @@ mod tests {
             (got - want).abs() <= want.abs() * 1e-4 + 1e-4,
             "got={got} want={want}"
         );
+    }
+
+    #[test]
+    fn matmul_matches_rowwise_matvec() {
+        let (m, n, rows) = (5usize, 64usize, 3usize);
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i as i32 * 7 % 13) as f32) * 0.1 - 0.6)
+            .collect();
+        let close = |a: &[f32], b: &[f32]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(p, q)| (p - q).abs() <= 1e-2 * (1.0 + p.abs()))
+        };
+        let rowwise = |w: &[u8], mv: fn(&[u8], usize, usize, &[f32]) -> Vec<f32>| -> Vec<f32> {
+            (0..rows)
+                .flat_map(|r| mv(w, m, n, &x[r * n..(r + 1) * n]))
+                .collect()
+        };
+
+        let q4 = q4_blocks(m * n / 32);
+        assert!(close(
+            &matmul_q4_0_dispatch(&q4, m, n, &x, rows),
+            &rowwise(&q4, matvec_q4_0_dispatch)
+        ));
+
+        let q5 = q5_blocks(m * n / 32);
+        assert!(close(
+            &matmul_q5_0_dispatch(&q5, m, n, &x, rows),
+            &rowwise(&q5, matvec_q5_0_dispatch)
+        ));
+
+        let q8 = q8_blocks(m * n / 32);
+        assert!(close(
+            &matmul_q8_0_dispatch(&q8, m, n, &x, rows),
+            &rowwise(&q8, matvec_q8_0_dispatch)
+        ));
+
+        // K-quants need n % 256, so use a 256-wide row.
+        let (km, kn) = (3usize, 256usize);
+        let kx: Vec<f32> = (0..rows * kn)
+            .map(|i| ((i as i32 * 5 % 11) as f32) * 0.1 - 0.5)
+            .collect();
+        let krowwise = |w: &[u8], mv: fn(&[u8], usize, usize, &[f32]) -> Vec<f32>| -> Vec<f32> {
+            (0..rows)
+                .flat_map(|r| mv(w, km, kn, &kx[r * kn..(r + 1) * kn]))
+                .collect()
+        };
+        let q6 = k_blocks(2, km * kn / 256);
+        assert!(close(
+            &matmul_q6_k_dispatch(&q6, km, kn, &kx, rows),
+            &krowwise(&q6, matvec_q6_k_dispatch)
+        ));
     }
 }

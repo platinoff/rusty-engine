@@ -9,8 +9,8 @@
 
 use crate::core::{EngineError, Result};
 use crate::forward::{
-    block_forward_cached, block_forward_seq, last_logits, logits_from_hidden, BlockWeights,
-    Geometry, LayerKv,
+    block_forward_cached, block_forward_prefill_cached, block_forward_seq, last_logits,
+    logits_from_hidden, BlockWeights, Geometry, LayerKv,
 };
 use crate::infer::{apply_repetition_penalty, argmax, rmsnorm, sample, GenerationOptions, SeedRng};
 use crate::loader::MmapModel;
@@ -213,6 +213,28 @@ impl<'a> DenseDecoder<'a> {
         )
     }
 
+    /// Batched prompt prefill: fill the KV cache in one pass (projections batched, so the
+    /// quant dequant is paid once) and return the last-position logits. Equivalent to
+    /// calling [`step`](Self::step) once per prompt token, but O(1) batched passes per
+    /// layer instead of `prompt.len()`.
+    pub fn prefill(&mut self, prompt: &[u32]) -> Vec<f32> {
+        assert!(!prompt.is_empty(), "prefill: empty prompt");
+        let g = &self.runner.geom;
+        let d = g.d_model;
+        let mut hidden = vec![0.0f32; prompt.len() * d];
+        for (i, &t) in prompt.iter().enumerate() {
+            hidden[i * d..(i + 1) * d].copy_from_slice(self.runner.embed_row(t));
+        }
+        let pos_start = self.seq_len;
+        for (l, blk) in self.runner.blocks.iter().enumerate() {
+            hidden = block_forward_prefill_cached(&hidden, blk, g, pos_start, &mut self.caches[l]);
+        }
+        self.seq_len += prompt.len();
+        let last = &hidden[(prompt.len() - 1) * d..prompt.len() * d];
+        let normed = rmsnorm(last, &self.runner.output_norm, g.rms_eps);
+        logits_from_hidden(&normed, &self.runner.output, g, self.runner.n_vocab)
+    }
+
     /// Prefill the prompt, then greedily append up to `max_new` tokens (stop at EOS).
     /// `step` returns the distribution for the token *after* its input, so the last
     /// prefill step's logits already selects the first generated token — exactly the
@@ -220,11 +242,8 @@ impl<'a> DenseDecoder<'a> {
     pub fn generate_incremental(&mut self, prompt: &[u32], max_new: usize) -> Vec<u32> {
         assert!(!prompt.is_empty(), "generate_incremental: empty prompt");
         let mut seq: Vec<u32> = Vec::with_capacity(prompt.len() + max_new);
-        let mut logits = Vec::new();
-        for &t in prompt {
-            logits = self.step(t);
-            seq.push(t);
-        }
+        let mut logits = self.prefill(prompt);
+        seq.extend_from_slice(prompt);
         for _ in 0..max_new {
             match argmax(&logits) {
                 Some(t) if Some(t as u32) == self.runner.eos_token_id => break,
