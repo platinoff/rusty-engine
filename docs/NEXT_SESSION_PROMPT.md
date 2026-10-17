@@ -82,17 +82,26 @@ Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker р�
 - **Далі:** упакований int8 SIMD dot (`q8_0×q8` `vec_dot`) або register-blocked GEMM **або**
   `PH-405b` llama-rs parity **або** B6 cross-builds / B7 docker-slave. **13 комітів**, без push.
 
-## AUTO-DIRECTIVE (owner, 2026-10-15) — на наступне `agi`
+## AUTO-DIRECTIVE (owner, 2026-10-15; оновлено 2026-10-17) — на наступне `agi`
 
-Наступного `agi`: **НЕ питати вибору бенду** — одразу брати з черги й **automatically**
-робити **`PH-405b` llama-rs semantic greedy-parity** (live llama-rs as reference oracle):
-greedy token-stream рушія vs llama-rs decode на коротких промптах для тієї ж Qwen2.5-0.5B,
-+ `tokenizer.json` byte-exact pre-regex перевірка `Bpe`/`gpt2` проти HF-векторів. Product =
-`rusty-engine`, той же ticket-цикл create→claim→drain→done, один локальний коміт, **без push**
-(B11). Тікети/keep-live за `agi`-скіллом; hub-оракул llama-rs перевірити через `gsv_keep_live`
-перед parity-зрізом. Деталі запуску оракула — у секції «llama-rs parity» нижче.
-Одразу після `PH-405b` — зріз **`PH-507`** (owner-директива 2026-10-15, bunke-rock-подібний
-provider-row у hub-каталозі; § «Session wire» нижче).
+Наступного `agi`: **НЕ питати вибору бенду** — одразу брати з черги.
+
+- **`PH-405b` — ✅ ЗРОБЛЕНО (2026-10-17).** llama-rs semantic greedy-parity: знайдено
+  й виправлено **биті q/k/v-біаси Qwen2** (`BlockWeights.{q,k,v}_bias`) + **RoPE
+  GPT-J→NeoX**; наш greedy тепер байт-у-байт із записаним оракулом (55/12/48). Гейти —
+  `tests/moe_parity.rs` (Гейт A tokenizer byte-exact PASS; Гейт B офлайн+live-оракул),
+  факти — `docs/research/llama-rs-parity.md`. Golden перезахоплено. Деталі — «Продовження 6»
+  у `docs/HANDOFF_NEW_SESSION.md`.
+- **Наступний пункт черги — `PH-507`** (owner-директива 2026-10-15, bunke-rock-подібний
+  provider-row у hub-каталозі; § «Session wire» нижче): зареєструвати `rusty serve` як
+  `kind:local` рядок у GSV `src/boxes/omni/catalog.rs` (`host_ready`-гейт на
+  `target/live/rusty_heartbeat.json` + gguf-файл, fail-open), авто-перемикання local↔cloud
+  у `GET /api/omni/route`, SSE через hub, WiFi multi-host (LAN-first band 233).
+  Product = `rusty-engine`, той же ticket-цикл create→claim→drain→done, один локальний
+  коміт, **без push** (B11). Тікети/keep-live за `agi`-скіллом; перед зрізом перевірити
+  hub-сервіси через `gsv_keep_live`.
+- Якщо `PH-507` заблокований (потрібен GSV-side код/дозвіл) — альтернативи: `PH-202/203`
+  (repack/SIMD), `PH-501` (axum serve), B6 cross-builds / B7 docker-slave.
 
 ## Session wire (виправлено 2026-10-15, owner-згода на push налаштувань)
 
@@ -187,24 +196,28 @@ docker → supervisor → dist-MoE → UI → distribs/publish**`. B1–B4 за�
 7. **B11 distribs/publish** — `PH-1101..1106` semver/CHANGELOG · `xtask dist` · MIT
    attribution · **GitHub push (owner згода — єдиний дозволений push)**.
 
-**Зовнішні гейти (чекають owner/підлогу, NOT pure-`agi` std-slice):** `PH-405` llama-rs
-greedy-parity (оракул) · `PH-406` real MoE `.gguf` у `data/models/` · `PH-203` SIMD
-(`core::arch`, arch-gated). Ці робляться окремими зрізами коли підлога готова.
+**Зовнішні гейти (чекають owner/підлогу, NOT pure-`agi` std-slice):** ~~`PH-405` llama-rs
+greedy-parity~~ ✅ **`PH-405b` done 2026-10-17** · `PH-406` real MoE `.gguf` у `data/models/` ·
+`PH-203` SIMD (`core::arch`, arch-gated). Ці робляться окремими зрізами коли підлога готова.
 
-## llama-rs parity (`PH-405b`) — як робити
+## llama-rs parity (`PH-405b`) — ✅ ЗРОБЛЕНО (2026-10-17)
 
-1. `gsv_keep_live` → підтвердити `llama_rs` alive (heartbeat `llama-rs/target/live/…`). Якщо
-   ні — не вигадувати оракул: зупинитись і повідомити owner (це єдиний випадок, коли `agi`
-   ставить питання/паузу, бо зовнішня підлога відсутня).
-2. Спільний вхід: **той самий** `data/models/qwen2.5-0.5b-q4_k_m.gguf`.
-3. Еталон: greedy decode N токенів у llama-rs (його heartbeat/API-контракт) на фіксованих
-   prompt-ids → записати `docs/research/llama-rs-parity.md` (фактаж).
-4. `rusty-engine`: `DenseRunner.generate` (greedy, `temp<=0`) тими ж ids → порівняти перші
-   збіжні префікси; допустити розбіжність після першої дивергенції (float accumulation
-   відмінна), **голо=префікс-збіг** + `finish_reason`. Тест: `tests/moe_parity.rs`.
-5. Токенайзація: взяти HF `qwen2` `tokenizer.json` (додати в `data/`, gitignored) → golden
-   вектори pre-split/merges → `gpt2_pre_split`/`Bpe` byte-exact unit-тести (`PH-305b` gate).
-6. Один локальний коміт, без push.
+Гейт уже живе в `tests/moe_parity.rs`; запуск (оракул — на тій самій 0.5B, `:8085`):
+
+```bash
+# оракул (S:/rust/llama-rs) — НЕ чіпати живої llama-fast :8082 (1.5B)
+./target/release/llama_serve.exe models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
+  --port 8085 --model-name qwen05-oracle --max-tokens 12 --temperature 0.0
+# Гейт A (tokenizer byte-exact) + Гейт B офлайн (записаний оракул, без мережі)
+cargo test --release --test moe_parity -- --ignored
+# Гейт B live (потребує PH405B_ORACLE_URL)
+PH405B_ORACLE_URL=http://127.0.0.1:8085/v1/chat/completions \
+  cargo test --release --test moe_parity -- --ignored greedy_parity
+```
+
+Знайдені й виправлені помилки: **q/k/v-біаси Qwen2** (головна) + **RoPE NeoX**. Результат —
+байт-у-байт збіг (55/12/48). Деталі — `docs/research/llama-rs-parity.md`, «Продовження 6»
+у HANDOFF.
 
 ## Контекст-дисципліна (кожен бенд «мільйон»)
 

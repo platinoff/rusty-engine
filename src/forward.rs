@@ -61,11 +61,37 @@ pub struct BlockWeights {
     pub k: QMat,
     pub v: QMat,
     pub o: QMat,
+    /// **Qwen2** q/k/v biases (empty for Llama-style models that carry none): `q` is
+    /// `d_model`, `k`/`v` are `n_kv·head`. Adding these is mandatory for Qwen2 parity —
+    /// omitting them is a systematic forward error (PH-405).
+    pub q_bias: Vec<f32>,
+    pub k_bias: Vec<f32>,
+    pub v_bias: Vec<f32>,
     pub ffn_norm: Vec<f32>,
     /// SwiGLU: gate/up are d_ff×d_model, down is d_model×d_ff.
     pub ffn_gate: QMat,
     pub ffn_up: QMat,
     pub ffn_down: QMat,
+}
+
+/// Add a per-output bias to a single vector (no-op when the bias slice is empty).
+fn add_bias(mut v: Vec<f32>, b: &[f32]) -> Vec<f32> {
+    for (x, &b) in v.iter_mut().zip(b) {
+        *x += b;
+    }
+    v
+}
+
+/// Add a per-output bias to every row of a row-major `rows × b.len()` buffer (no-op when empty).
+fn add_bias_rows(v: &mut [f32], b: &[f32]) {
+    if b.is_empty() {
+        return;
+    }
+    for row in v.chunks_mut(b.len()) {
+        for (x, &b) in row.iter_mut().zip(b) {
+            *x += b;
+        }
+    }
 }
 
 /// Dense SwiGLU FFN: `down(swiglu(gate(x), up(x)))`, each projection fused via [`QMat`].
@@ -80,9 +106,9 @@ fn ffn_forward(x: &[f32], gate: &QMat, up: &QMat, down: &QMat) -> Vec<f32> {
 /// head's softmax over its own key is 1.0, so the context equals the (GQA-broadcast) value.
 /// Q/K are still RoPE-rotated and scored, exercising the real path.
 fn attention_decode(x_norm: &[f32], w: &BlockWeights, g: &Geometry, pos: usize) -> Vec<f32> {
-    let q = w.q.matvec(x_norm);
-    let k = w.k.matvec(x_norm);
-    let v = w.v.matvec(x_norm);
+    let q = add_bias(w.q.matvec(x_norm), &w.q_bias);
+    let k = add_bias(w.k.matvec(x_norm), &w.k_bias);
+    let v = add_bias(w.v.matvec(x_norm), &w.v_bias);
     let v_exp = gqa_repeat_kv(&v, 1, g.n_kv_heads, g.n_heads, g.head_dim);
     let scale = 1.0 / (g.head_dim as f32).sqrt();
     let mut ctx = vec![0.0f32; g.n_heads * g.head_dim];
@@ -149,9 +175,9 @@ pub fn attention_forward_cached(
     let kv_dim = g.n_kv_heads * g.head_dim;
     let q_dim = g.n_heads * g.head_dim;
     let n = rmsnorm(x, &w.attn_norm, g.rms_eps);
-    let q = w.q.matvec(&n);
-    let k = w.k.matvec(&n);
-    let v = w.v.matvec(&n);
+    let q = add_bias(w.q.matvec(&n), &w.q_bias);
+    let k = add_bias(w.k.matvec(&n), &w.k_bias);
+    let v = add_bias(w.v.matvec(&n), &w.v_bias);
     cache.k.extend_from_slice(&k);
     cache.v.extend_from_slice(&v);
     let scale = 1.0 / (g.head_dim as f32).sqrt();
@@ -231,9 +257,12 @@ pub fn block_forward_seq(
     }
     // Batched projections: each weight block is dequantized once for the whole prompt
     // (row-wise `matvec` would repeat that `seq×` — the dequant-heavy part of prefill).
-    let q_all = w.q.matmul(&x_norm, seq);
-    let k_all = w.k.matmul(&x_norm, seq);
-    let v_all = w.v.matmul(&x_norm, seq);
+    let mut q_all = w.q.matmul(&x_norm, seq);
+    let mut k_all = w.k.matmul(&x_norm, seq);
+    let mut v_all = w.v.matmul(&x_norm, seq);
+    add_bias_rows(&mut q_all, &w.q_bias);
+    add_bias_rows(&mut k_all, &w.k_bias);
+    add_bias_rows(&mut v_all, &w.v_bias);
     let scale = 1.0 / (g.head_dim as f32).sqrt();
     let mut attn_ctx = vec![0.0f32; seq * q_dim];
     for h in 0..g.n_heads {
@@ -319,9 +348,12 @@ pub fn block_forward_prefill_cached(
         let n = rmsnorm(row, &w.attn_norm, g.rms_eps);
         x_norm[i * g.d_model..(i + 1) * g.d_model].copy_from_slice(&n);
     }
-    let q_all = w.q.matmul(&x_norm, seq);
-    let k_all = w.k.matmul(&x_norm, seq);
-    let v_all = w.v.matmul(&x_norm, seq);
+    let mut q_all = w.q.matmul(&x_norm, seq);
+    let mut k_all = w.k.matmul(&x_norm, seq);
+    let mut v_all = w.v.matmul(&x_norm, seq);
+    add_bias_rows(&mut q_all, &w.q_bias);
+    add_bias_rows(&mut k_all, &w.k_bias);
+    add_bias_rows(&mut v_all, &w.v_bias);
     cache.k.extend_from_slice(&k_all);
     cache.v.extend_from_slice(&v_all);
 
@@ -406,6 +438,9 @@ mod tests {
             k: QMat::from_f32(vec![0.0; 8], 2, 4),
             v: QMat::from_f32(vec![0.0; 8], 2, 4),
             o: QMat::from_f32(vec![0.0; 16], 4, 4),
+            q_bias: Vec::new(),
+            k_bias: Vec::new(),
+            v_bias: Vec::new(),
             ffn_norm: vec![1.0; 4],
             ffn_gate: QMat::from_f32(vec![0.0; 32], 8, 4),
             ffn_up: QMat::from_f32(vec![0.0; 32], 8, 4),
@@ -432,6 +467,9 @@ mod tests {
             k: QMat::from_f32((0..8).map(|i| i as f32 * 0.02 - 0.06).collect(), 2, 4),
             v: QMat::from_f32((0..8).map(|i| 0.1 - i as f32 * 0.03).collect(), 2, 4),
             o: QMat::from_f32((0..16).map(|i| i as f32 * 0.015 - 0.11).collect(), 4, 4),
+            q_bias: Vec::new(),
+            k_bias: Vec::new(),
+            v_bias: Vec::new(),
             ffn_norm: vec![1.0; 4],
             ffn_gate: QMat::from_f32((0..32).map(|i| i as f32 * 0.01 - 0.15).collect(), 8, 4),
             ffn_up: QMat::from_f32((0..32).map(|i| 0.2 - i as f32 * 0.01).collect(), 8, 4),
@@ -488,6 +526,9 @@ mod tests {
             k: QMat::from_f32((0..8).map(|i| i as f32 * 0.02 - 0.06).collect(), 2, 4),
             v: QMat::from_f32((0..8).map(|i| 0.11 - i as f32 * 0.04).collect(), 2, 4),
             o: QMat::from_f32((0..16).map(|i| i as f32 * 0.015 - 0.1).collect(), 4, 4),
+            q_bias: Vec::new(),
+            k_bias: Vec::new(),
+            v_bias: Vec::new(),
             ffn_norm: vec![1.0; 4],
             ffn_gate: QMat::from_f32((0..32).map(|i| i as f32 * 0.01 - 0.14).collect(), 8, 4),
             ffn_up: QMat::from_f32((0..32).map(|i| 0.2 - i as f32 * 0.012).collect(), 8, 4),

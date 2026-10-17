@@ -68,12 +68,17 @@ impl DenseRunner {
             let ffn_gate = QMat::from_model(model, &format!("{p}ffn_gate.weight"), d_ff, d_model)?;
             let ffn_up = QMat::from_model(model, &format!("{p}ffn_up.weight"), d_ff, d_model)?;
             let ffn_down = QMat::from_model(model, &format!("{p}ffn_down.weight"), d_model, d_ff)?;
+            // Qwen2 carries q/k/v biases; Llama-style models do not — absent tensor = empty.
+            let bias_of = |name: String| model.dequant(&name).unwrap_or_default();
             blocks.push(BlockWeights {
                 attn_norm,
                 q,
                 k,
                 v,
                 o,
+                q_bias: bias_of(format!("{p}attn_q.bias")),
+                k_bias: bias_of(format!("{p}attn_k.bias")),
+                v_bias: bias_of(format!("{p}attn_v.bias")),
                 ffn_norm,
                 ffn_gate,
                 ffn_up,

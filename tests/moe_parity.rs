@@ -7,11 +7,13 @@
 //! qwen2 split — see `src/gpt2.rs`).
 //!
 //! Gate B (parity): llama-rs (`llama_serve`, same Qwen2.5-0.5B Q4_K_M, sha
-//! `74a4da8c`) greedy-decodes the same prompts at `temperature=0`; our
-//! `DenseRunner`/`DenseDecoder` greedy stream over BPE ids must share the
-//! longest common prefix with the oracle's text. Float accumulation differs by
-//! design, so the headline is **prefix match**, not full-stream equality.
-//! Recorded facts live in `docs/research/llama-rs-parity.md`.
+//! `74a4da8c`) greedy-decodes the same prompts at `temperature=0`. **Resolved
+//! (PH-405):** the forward diverged on garbage logits until the missing Qwen2
+//! q/k/v biases were added and RoPE switched from the GPT-J interleaved pairing
+//! to NeoX rotate-half — now our greedy stream matches the oracle byte-for-byte
+//! on all three recorded rows. Float accumulation differs by design, so the
+//! headline stays **prefix match** (floors near the full string), not bitwise
+//! stream equality. Recorded facts live in `docs/research/llama-rs-parity.md`.
 //!
 //! Run: `PH405B_ORACLE_URL=http://127.0.0.1:8085/v1/chat/completions cargo test
 //! --release --test moe_parity -- --ignored`
@@ -119,24 +121,52 @@ fn tokenizer_json_byte_exact_gate() {
 // ── Gate B — live llama-rs greedy parity ─────────────────────────────────────
 
 /// (prompt, oracle greedy text recorded 2026-10-15, expected min char-prefix)
-/// — facts: `docs/research/llama-rs-parity.md`. Floors are **0** until `PH-405`
-/// forward-numeric parity lands: the first generated token already diverges
-/// (ours `122007` vs oracle `ĠParis`=12095) even though ids, determinism
-/// (`full == incremental`) and the oracle reference itself are stable.
-/// Bump the floors as part of that fix — this harness then guards the gain.
+/// — facts: `docs/research/llama-rs-parity.md`. Floors are the **full** recorded
+/// oracle strings minus a small margin: after the PH-405 fix (Qwen2 q/k/v bias +
+/// NeoX RoPE) our greedy stream reproduces the oracle byte-for-byte on all three
+/// rows (lcp 55 / 12 / 48), so a floor slip now means a real forward regression.
 const PARITY_CASES: [(&str, &str, usize); 3] = [
     (
         "The capital of France is",
         " Paris. It is the largest city in Europe and the second",
-        0,
+        52,
     ),
-    ("2+2=", "4, 3+3=6, 4+", 0),
+    ("2+2=", "4, 3+3=6, 4+", 10),
     (
         "Berlin is a",
         " city in the state of Berlin, Germany. It is the",
-        0,
+        45,
     ),
 ];
+
+/// Local (offline) guard: our greedy stream vs the **recorded** oracle text from
+/// `docs/research/llama-rs-parity.md` — no live oracle required, so this runs in CI
+/// whenever the real model is present. Before the PH-405 RoPE fix the lcp was 0 on
+/// every row (first token already garbage); after it the first tokens must match.
+#[test]
+#[ignore = "parity: needs the real 0.5B GGUF (no network); compares to recorded oracle text"]
+fn greedy_text_against_recorded_oracle() {
+    let path = Path::new(MODEL);
+    if !path.exists() {
+        eprintln!("skip: real model not present at {MODEL}");
+        return;
+    }
+    let model = unsafe { MmapModel::open(path) }.expect("open real model");
+    let tr = rusty_engine::textgen::TextRunner::from_model(&model).expect("TextRunner");
+    for (prompt, oracle_expected, min_prefix) in PARITY_CASES {
+        let ids = tr.tokenize(prompt).expect("encode prompt");
+        let mut dec = DenseDecoder::new(&tr.runner);
+        let seq = dec.generate_incremental(&ids, 12);
+        let new = &seq[ids.len().min(seq.len())..];
+        let our_text = tr.bpe.decode(new);
+        let lcp = common_prefix_chars(oracle_expected, &our_text);
+        println!("recorded-oracle prompt={prompt:?} oracle={oracle_expected:?} rusty={our_text:?} lcp={lcp}");
+        assert!(
+            lcp >= min_prefix,
+            "recorded-oracle prefix floor for {prompt:?}: {lcp} < {min_prefix}"
+        );
+    }
+}
 
 fn http_post_completions(url: &str, body: &str) -> Result<String, String> {
     let rest = url

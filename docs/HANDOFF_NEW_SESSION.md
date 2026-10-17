@@ -250,3 +250,42 @@ f32-`matmul` нечутливий до форми циклу (~9 GFLOPS неза
 (B6/B7).
 
 **15 локальних комітів**, без push (B11).
+
+### Продовження 6 — PH-405b: forward-parity з llama-rs ВИПРАВЛЕНО (биті біаси + RoPE)
+
+Гейт `tests/moe_parity.rs` уже існував (Гейт A — tokenizer byte-exact; Гейт B —
+greedy-parity проти живої llama-rs), але Гейт B **розходився на першому ж токені**
+(префікс-збіг = 0, аргмакс — сміття), а `min_prefix` був 0.
+
+**Знайдено дві систематичні помилки forward-стека** (вхід був правильний:
+токенізація byte-exact, геометрія валідна, logits finite):
+
+1. **Пропущені q/k/v-біаси Qwen2 — головна причина.** GGUF несе
+   `blk.N.attn_{q,k,v}.bias` (291 тензор = 219 + 3×24), `model.rs` їх лише
+   *валідував*, а forward їх не додавав (у `BlockWeights` не було полів). Qwen2
+   (на відміну від Llama) має qkv-біаси — без них вихід шумовий. Фікс:
+   `BlockWeights.{q,k,v}_bias` + `add_bias`/`add_bias_rows` у всіх attention-шляхах;
+   `runner.rs` тягне біаси **опційно** (порожні для Llama-style моделей).
+2. **RoPE-mapping.** `infer::rope` робив GPT-J interleaved (пари `2i,2i+1`), тоді як
+   Qwen2/llama.cpp використовують **NeoX rotate-half** (пари `i, i+d/2`). Фікс:
+   rotate-half (коментар обіцяв «llama.cpp convention», а код був GPT-J).
+
+**Результат (офлайн-гейт `greedy_text_against_recorded_oracle`, без мережі)** — наш
+greedy-стрім збігається з **записаним** оракулом байт-у-байт на всіх трьох рядках:
+
+| prompt | oracle | rusty | lcp |
+|---|---|---|---|
+| `The capital of France is` | ` Paris. It is the largest city in Europe and the second` | той самий | **55/55** |
+| `2+2=` | `4, 3+3=6, 4+` | той самий | **12/12** |
+| `Berlin is a` | ` city in the state of Berlin, Germany. It is the` | той самий | **48/48** |
+
+Floor-и `PARITY_CASES` піднято до повної довжини мінус запас (52/10/45). Гейт A —
+PASS (vocab 151936, merges 151387, ids точні). Числовий відпечаток
+`tests/data/qwen25_golden.txt` **перезахоплено** — старі «шумові» токени
+(`127498 27277 …`) замінено на зв'язні (`7063 8749 14358 …`). Факти —
+`docs/research/llama-rs-parity.md`. Перевірено: `cargo test` (усі ok), clippy чисто,
+`cargo test --release -- --ignored` (moe_parity 3 ok, numeric_parity ok). Живий
+`rusty serve` на `0.0.0.0:8090` після фіксу віддає **зв'язний текст** (chat8:
+`I'm trying to create a simple`).
+
+**16 локальних комітів**, без push (B11).

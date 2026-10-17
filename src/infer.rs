@@ -83,18 +83,21 @@ pub fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
 
 /// Rotary positional embedding (RoPE) over one head vector of even length, at `pos`.
 ///
-/// Pair `i` (elements `2i, 2i+1`) rotates by `pos * theta_i`,
-/// `theta_i = base^(-2i/d)` — the llama.cpp / HF convention.
+/// **NeoX rotate-half** (llama.cpp `LLAMA_ROPE_TYPE_NEOX`, HF/Llama/Qwen `rotate_half`):
+/// pair `i` = elements `(i, i + d/2)` rotates by `pos * theta_i`,
+/// `theta_i = base^(-2i/d)`. Qwen2 uses NeoX, not the GPT-J interleaved
+/// `(2i, 2i+1)` pairing — mixing them is a *systematic* forward error (PH-405).
 pub fn rope(head: &[f32], pos: usize, base: f32) -> Vec<f32> {
     let d = head.len();
+    let half = d / 2;
     let mut out = head.to_vec();
-    for i in 0..d / 2 {
+    for i in 0..half {
         let theta = 1.0 / base.powf((2 * i) as f32 / d.max(1) as f32);
         let angle = pos as f32 * theta;
         let (c, s) = (angle.cos(), angle.sin());
-        let (x0, x1) = (head[2 * i], head[2 * i + 1]);
-        out[2 * i] = x0 * c - x1 * s;
-        out[2 * i + 1] = x1 * c + x0 * s;
+        let (x0, x1) = (head[i], head[i + half]);
+        out[i] = x0 * c - x1 * s;
+        out[i + half] = x1 * c + x0 * s;
     }
     out
 }

@@ -133,6 +133,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-404 | **expert-cache LRU** + byte-budget + pin + prefetch | `[x]` | `src/cache.rs` — `ExpertCache::get_or_load/put/prefetch/set_pinned` + `ExpertKey`/`CacheStats`, budgeted LRU eviction (pinned skipped), oversized→uncached; 7 unit |
 | PH-404b | **MoE forward через cache** (top-k experts on demand) | `[x]` | `src/moe.rs` — `moe_layer_forward_cached(...&mut ExpertCache, load)`: route→`get_or_load` per expert; == `moe_layer_forward` (deterministic loader, 1e-6) навіть при budget<resident; hit⇒loader not called (2 unit) |
 | PH-405 | **numeric regression gate** (real Qwen2.5 greedy fingerprint) | `[x]` | `tests/numeric_parity.rs` + `tests/data/qwen25_golden.txt` — детерм. greedy-відбиток 24-шарового `DenseRunner.generate` на справжній моделі (guard quant/forward/KV/sampler); `#[ignore]` release-job (~60s), CI без моделі skip. llama-rs semantic parity → окремий зріз |
+| PH-405b | **llama-rs semantic greedy-parity + HF `tokenizer.json` byte-exact** | `[x]` | `tests/moe_parity.rs` — Гейт A (vocab 151936/merges 151387/id-точки/`qwen2` pre-regex) PASS; Гейт B: наш greedy байт-у-байт із записаним оракулом (55/12/48). **Фікс:** додано q/k/v-біаси Qwen2 (`BlockWeights.{q,k,v}_bias`) + RoPE GPT-J→NeoX rotate-half. Факти — `docs/research/llama-rs-parity.md`; golden перезахоплено |
 | PH-406 | run Qwen3-30B-A3B / Mixtral GGUF pure-Rust | `[ ]` | `src/moe/forward.rs` |
 | PH-407 | bench tok/s vs llama-rs baseline | `[ ]` | `benches/moe.rs` |
 

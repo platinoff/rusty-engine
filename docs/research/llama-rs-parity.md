@@ -33,38 +33,40 @@ greedy-parity токен-стрімів + **byte-exact** перевірка toke
   `[2610, 525, 264, 10950, 17847, 13]`; `The capital of France is` →
   `[785, 6722, 315, 9625, 374]`; `2+2=` → `[17, 10, 17, 28]` (байт-простір).
 
-## Гейт B — semantic greedy parity: DIVERGES at the FIRST token (PH-405 open)
+## Гейт B — semantic greedy parity: PASS (byte-for-byte, PH-405 fixed)
 
-Оракул стабільний (повтори тексту 1:1). Наші стріми детерміновані
-(`full == incremental` на реальній моделі — новий факт, раніше перевірялось
-лише synth). Але top-1 після префіксу — сміття, префікс-збіг = 0:
+**Фікс (2026-10-17, та сама agi-сесія).** Оракул був стабільний, вхід
+правильний (токенізація byte-exact, геометрія валідна, усі 151 936 logits
+finite), але top-1 був сміттям — префікс-збіг = 0 на кожному рядку. Знайдено
+**дві** систематичні помилки forward-стека (обидві в `rusty-engine`):
 
-| prompt | ids | oracle 1-й токен | rusty 1-й токен | lcp |
-|--------|-----|------------------|-----------------|-----|
-| `The capital of France is` | `785 6722 315 9625 374` | `ĠParis` (12095) | `122007` ("èĹ¿") | 0 |
-| `2+2=` | `17 10 17 28` | `4` (19) | `6186` ("izont") | 0 |
-| `Berlin is a` | `94409 374 264` | `Ġcity` (3283) | `17528` ("flix") | 0 |
+1. **Пропущені q/k/v-біаси Qwen2.** GGUF несе `blk.N.attn_{q,k,v}.bias`
+   (291 тензор = 219 + 3×24), `model.rs` їх лише *валідував*, а forward їх не
+   додавав. Qwen2 (на відміну від Llama) має qkv-біаси — без них вихід шумовий.
+   Фікс: `BlockWeights.{q,k,v}_bias` + `add_bias`/`add_bias_rows` у всіх
+   attention-шляхах; `runner.rs` тягне біаси опційно (порожні для Llama-style).
+   **Це головна причина.**
+2. **RoPE-mapping.** `infer::rope` робив GPT-J interleaved (пари `2i,2i+1`),
+   тоді як Qwen2/llama.cpp використовують **NeoX rotate-half** (пари
+   `i, i+d/2`). Фікс: rotate-half. (RoPE діє з pos≥1, тож сам по собі він
+   давав шум; разом із біасами стек тепер точний.)
 
-Висновок: **вхід правильний** (токенізація byte-exact, геометри config валідний,
-усі 151 936 logits finite), **помилка всередині forward-стека** — не numerical
-accumulation, а систематична. Логи аргмаксу поводяться як після невдалої
-проєкції (безкаркадне «шумове» argmax).
+Результат на зафіксованих goldens (`tests/moe_parity.rs`,
+`greedy_text_against_recorded_oracle` — офлайн, без мережі):
 
-### Підозрювані (порядок для PH-405-фікса)
+| prompt | ids | oracle текст | rusty | lcp |
+|--------|-----|--------------|-------|-----|
+| `The capital of France is` | `785 6722 315 9625 374` | ` Paris. It is the largest city in Europe and the second` | той самий | **55/55** |
+| `2+2=` | `17 10 17 28` | `4, 3+3=6, 4+` | той самий | **12/12** |
+| `Berlin is a` | `94409 374 264` | ` city in the state of Berlin, Germany. It is the` | той самий | **48/48** |
 
-1. **Q4_K_M dequant block math** (super-block scales/mins, interleave 32×N) —
-   `quant.rs` vs `ggml-common.h` (кеш: `docs/research/ggml-blocks.md`).
-2. **RoPE positions у prefill** (`block_forward_seq` base-pos) — all-positions
-   на pos 0 дадуть саме такий тип деградації.
-3. **GQA head-mapping** (14 q-heads / 2 kv-heads) у `forward.rs`.
-4. **SwiGLU orientation** gate/up у `ffn`.
-5. `rms_eps` / final norm.
+`full == incremental` на реальній моделі збережено. Floor-и `min_prefix` у
+`PARITY_CASES` піднято до повної довжини мінус невеликий запас (52 / 10 / 45) —
+тепер гейт ловить будь-який регрес forward.
 
-Наступний зріз: one-prompt diff-профіль per-layer hidden проти llama-rs
-(його heartbeat/API не віддає hidden — порівнювати логіти через
-`/v1/completions` топи чи local-зріз `llama-rs` як dev-залежність).
-Тести-харнес (`tests/moe_parity.rs`) готові: floor-и `min_prefix` підняти
-разом з фіксом.
+Числовий стрічковий відпечаток `tests/data/qwen25_golden.txt` **перезахоплено**
+(`RUSTY_CAPTURE_GOLDEN=1`) — старі «шумові» токени (`127498 27277 …`) замінено
+на зв'язні (`7063 8749 14358 …`, `198`=нова строка).
 
 ## Як повторити
 
