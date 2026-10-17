@@ -183,3 +183,22 @@ bottleneck — не множення-додавання, а **int→float кон
 відкоченого джерела й перезапущено hidden: decode стабільно **~0.33–0.35 с/токен** (chat1 0.68 с,
 chat8 3.07 с, chat16 5.90 с). Наступний реальний важіль — **батч-`matvec` (prefill/GEMM)**: читати
 ваги раз на кілька рядків замість разу на рядок.
+
+**Batched prefill (зроблено).** Дві причини повільного промпту: (1) `block_forward_seq` кликав
+`matvec` по рядку → кожен блок ваг де-квантувався `seq×`; (2) `serve` взагалі не робив батч-prefill —
+`DenseDecoder::generate_incremental` годував промпт **по токену** через `block_forward_cached`
+(`TextRunner::complete`/`run_text`). Додано:
+- `kernel::matmul_{q4_0,q5_0,q8_0,q4_k,q5_k,q6_k}_dispatch` + `dot_f32_dispatch` (AVX2+FMA) —
+  зовнішній цикл по рядках ваг, внутрішній по рядках входу: блок де-квантується **один раз** у
+  малий f32-буфер і переюзується для всіх рядків (пам'ять O(1), MACs скалються з `seq`);
+- `QMat::matmul(x, rows)` (F32 → по-рядковий fallback);
+- `forward::block_forward_seq` тепер батчений (q/k/v/o + SwiGLU gate/up/down одним `matmul`);
+- `forward::block_forward_prefill_cached` — батч-prefill, що **наповнює KV-кеш** (k/v сирі, RoPE на
+  читанні) → `DenseDecoder::prefill`, який тепер кличе `generate_incremental`.
+Заміри: re-prefill parity-path **52.2 → 19.2 с** (2.7×); serve на ~700-токенному промпті
+**>180 с (таймаут) → ~80 с** (2.2×); decode без регресії (~0.33 с/токен). Golden `PH-405` точний —
+і розширено: той самий golden тепер перевіряє **й інкрементальний/serve шлях**
+(`fingerprint_incremental`). Лишається bound на пропускну здатність f32-MAC (`seq × ваги`); наступне —
+**упакований int8 SIMD dot** (ggml-style `q8_0×q8` з `vec_dot`) або register-blocked GEMM.
+
+**13 локальних комітів**, без push (B11).

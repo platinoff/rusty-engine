@@ -70,6 +70,18 @@ Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker р�
 - **Далі:** FMA-варіанти Q5_0/Q6_K + батч-`matvec` (prefill/GEMM) **або** `PH-405b` llama-rs parity
   **або** B6 cross-builds / B7 docker-slave. **9 локальних комітів**, без push (B11).
 
+### Продовження 3 (батч-prefill)
+
+- Причини: `block_forward_seq` викликав `matvec` по рядку (де-квант `seq×`), а `serve` годував промпт
+  по токену (`generate_incremental` → `block_forward_cached`).
+- Додано `kernel::matmul_*_dispatch` + `dot_f32_dispatch` (AVX2+FMA; блок де-квантиться раз і
+  переюзується по рядках), `QMat::matmul`, батчений `block_forward_seq`,
+  `block_forward_prefill_cached` + `DenseDecoder::prefill`.
+- Заміри: parity-path **52.2 → 19.2 с**; serve ~700-токен промпт **>180 с → ~80 с**; decode без
+  регресії. Golden розширено на інкрементальний шлях.
+- **Далі:** упакований int8 SIMD dot (`q8_0×q8` `vec_dot`) або register-blocked GEMM **або**
+  `PH-405b` llama-rs parity **або** B6 cross-builds / B7 docker-slave. **13 комітів**, без push.
+
 ## AUTO-DIRECTIVE (owner, 2026-10-15) — на наступне `agi`
 
 Наступного `agi`: **НЕ питати вибору бенду** — одразу брати з черги й **automatically**
