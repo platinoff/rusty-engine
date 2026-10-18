@@ -99,6 +99,21 @@ Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker р�
 - Gate: `cargo test` **197 green**, clippy 0, fmt ok. **23 локальних комітів**, без push (B11).
 - **Далі:** NEON (`PH-203` arm64) **або** `PH-501` (axum serve) **або** B6 cross-builds / B7 docker-slave.
 
+### Продовження 5 (2026-10-17, PH-505 residual — RAM у `/metrics`)
+
+- **`hub::ram_bytes()`** (новий, std-only, без крейтів): Windows — working set через
+  `K32GetProcessMemoryInfo` (FFI `extern "system"`, kernel32/psapi); Linux — resident-сторінки з
+  `/proc/self/statm` × 4096; інакше 0. `Metrics::to_json` тепер семплить живий RSS → `/metrics`
+  віддає `ram_bytes` + `ram_mb` (окрім `tok_per_sec`/`active_experts`/`peak_experts`).
+- **`ChatOutcome.active_experts`** — поле додано й протягнуто в `serve` → `metrics.record(..)`;
+  на dense-шляху = 0 (наповниться з `PH-406` MoE, коли зʼявиться MoE-модель).
+- Перевірка: unit `ram_bytes_reads_the_process_where_supported` + `metrics_json_shape`; live
+  `:8090` → `"ram_bytes":1502031872,"ram_mb":1432.4` (модель завантажена). Окремий прогон на
+  `:8095` (stub) → `ram_mb 4.6`.
+- Gate: `cargo test` **198 green**, clippy 0, fmt ok. **24 локальних комітів**, без push (B11).
+- **Далі:** NEON (`PH-203` arm64) **або** `PH-501` (axum serve) **або** B6/B7; `PH-505` закрито по
+  суті (лишається наповнити `active_experts` з MoE-шляху `PH-406`).
+
 ## AUTO-DIRECTIVE (owner, 2026-10-15; оновлено 2026-10-17) — на наступне `agi`
 
 Наступного `agi`: **НЕ питати вибору бенду** — одразу брати з черги.

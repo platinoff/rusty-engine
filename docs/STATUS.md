@@ -2,22 +2,22 @@
 
 **Snapshot:** 2026-10-17 (agi-ланцюг: B0→B1 GGUF→B2 quant→B3 dense/KV/sampler/BPE→B4 MoE→B5
 serve/heartbeat → **PH-405b forward-parity з llama-rs ✅** → **PH-507 hub provider-row E2E ✅
-(JSON + SSE) через живий хаб `:9999`** → **B2 SIMD bench ✅ (`PH-203` x86 / `PH-205`, 1.8–5.3×)**)
-· **без push** (remote-only у B11).
+(JSON + SSE) через живий хаб `:9999`** → **B2 SIMD bench ✅ (`PH-203` x86 / `PH-205`, 1.8–5.3×)**
+→ **`PH-505` residual ✅ (per-process RAM у `/metrics`)**) · **без push** (remote-only у B11).
 
 ## Верифікований стан (zmіряно цього сеансу, не «на памʼять»)
 
 | Метрика | Значення |
 |---------|----------|
 | `git status` | **clean** (0 drift) |
-| Локальні коміти | **23** (ahead of `origin/main`; B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench, без push — remote = B11) |
-| Тести | **197** (178 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
+| Локальні коміти | **24** (ahead of `origin/main`; B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM, без push — remote = B11) |
+| Тести | **198** (179 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
-| Rust LOC | **11631** (`src` 9775 + `tests` 1317 + `xtask` 319 + `benches` 220) |
+| Rust LOC | **11708** (`src` 9852 + `tests` 1317 + `xtask` 319 + `benches` 220) |
 | UI LOC (glue) | **157** (html+css+js) |
 | **Rust ratio** | **98.7%** (ціль 95–100 ✓) |
-| Docs LOC | 1579 (concept/arch/roadmap/UI/research/handoff/NEXT) |
+| Docs LOC | 1653 (concept/arch/roadmap/UI/research/handoff/NEXT) |
 | Tracked files | 64 |
 | Реальна модель | `data/models/qwen2.5-0.5b-q4_k_m.gguf` (491 400 032 B, **gitignored**, sha256 `74a4da8c…`) |
 | Трекінг `data/` | лише `.gitkeep` (модель не в репо ✓) |
@@ -32,7 +32,7 @@ serve/heartbeat → **PH-405b forward-parity з llama-rs ✅** → **PH-507 hub 
 | **B2** kernels | 🟡 | `PH-201/201+/201c/201d` fused dot/gemv Q4_0/Q5_0/Q8_0 + oracle K-кванти; `PH-204` fused K-quant dot/gemv; `PH-202` repack; **`PH-203` x86 SIMD (SSE2 Q4_0/Q8_0, AVX2 Q4_0/Q5_0/Q8_0/Q4_K/Q6_K) + `PH-205` bench ✅ (1.8–5.3×)**; лишився NEON |
 | **B3** forward | ✅ **complete** | `PH-301..306` + `PH-305a/c/d/e` + **`PH-305`/`PH-306`** (multi-layer dense runner + CLI `rusty run`, real Qwen2.5 24-layer prefill) + **`PH-305b`** (BPE byte-fallback + atomic specials) + **`PH-306b`** (text pipeline: `src/textgen.rs` `TextRunner` + `rusty run -p "text"` + `tests/text_gen.rs` synth round-trip); **`PH-405`** numeric regression-gate + **`PH-405b`** semantic greedy-parity з llama-rs ✅ |
 | **B4** MoE-core | 🟡 | `PH-401..403` (router softmax/sigmoid/group, SwiGLU, shared) + `PH-406a` `moe_layer_forward` + **`PH-404` expert-cache LRU** (`src/cache.rs`, budgeted + pin + prefetch); parity/run/bench (405/406/407) open |
-| **B5** serve | 🟡 | PH-501a/b (std HTTP + real TextRunner), PH-502 (SSE), PH-503 (slot-cache), PH-504 (heartbeat), PH-505 (metrics), PH-506 (serve integration tests ✅); **PH-507 hub provider-row E2E ✅ (`rusty-serve` через хаб, JSON+SSE)** |
+| **B5** serve | 🟡 | PH-501a/b (std HTTP + real TextRunner), PH-502 (SSE), PH-503 (slot-cache), PH-504 (heartbeat), PH-505 (**metrics + per-process RAM**), PH-506 (serve integration tests ✅); **PH-507 hub provider-row E2E ✅ (`rusty-serve` через хаб, JSON+SSE)** |
 | B6 build-matrix(exe/bin/apk) / B7 docker / B8 supervisor / B9 dist-MoE / B10 UI / B11 distribs | ☐ | заплановано (бенди в роадмепі) |
 
 **Між конекцій:** від токена до logits стек повний — `config → validate → dequant → embed →

@@ -147,6 +147,9 @@ pub struct ChatOutcome {
     pub generated_tokens: u64,
     /// Wall-clock seconds spent generating this completion.
     pub decode_secs: f64,
+    /// MoE experts materialized for this completion. The dense runner activates none, so
+    /// this is 0 until the MoE path (PH-406) reports its top-k breadth.
+    pub active_experts: u64,
 }
 
 /// HTTP chat handler (PH-501b). `json_body` is the raw request body (messages JSON);
@@ -169,12 +172,14 @@ pub fn chat_response(runner: &TextRunner, json_body: &str, max_new: usize) -> Ch
                 response: crate::http::Response::json(200, json),
                 generated_tokens: generated as u64,
                 decode_secs,
+                active_experts: 0,
             }
         }
         Err(e) => ChatOutcome {
             response: crate::http::Response::json(400, format!(r#"{{"error":"{}"}}"#, e.message)),
             generated_tokens: 0,
             decode_secs: 0.0,
+            active_experts: 0,
         },
     }
 }
@@ -215,12 +220,14 @@ pub fn chat_stream_response(runner: &TextRunner, json_body: &str, max_new: usize
                 },
                 generated_tokens: generated as u64,
                 decode_secs,
+                active_experts: 0,
             }
         }
         Err(e) => ChatOutcome {
             response: crate::http::Response::json(400, format!(r#"{{"error":"{}"}}"#, e.message)),
             generated_tokens: 0,
             decode_secs: 0.0,
+            active_experts: 0,
         },
     }
 }

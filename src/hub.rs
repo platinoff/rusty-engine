@@ -73,6 +73,63 @@ pub fn write_heartbeat(
     Ok(path)
 }
 
+/// Resident set size (RAM in use) of **this** process, in bytes, for the `/metrics`
+/// panel (PH-505). `std`-only, no crates: Windows reads the working set via
+/// `K32GetProcessMemoryInfo` (kernel32/psapi), Linux the resident page count from
+/// `/proc/self/statm`. Returns 0 where the platform call is unavailable, so the
+/// endpoint stays total on any target.
+pub fn ram_bytes() -> u64 {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            fn K32GetProcessMemoryInfo(
+                process: *mut core::ffi::c_void,
+                counters: *mut ProcessMemoryCounters,
+                cb: u32,
+            ) -> i32;
+        }
+        let mut pmc: ProcessMemoryCounters = unsafe { core::mem::zeroed() };
+        pmc.cb = core::mem::size_of::<ProcessMemoryCounters>() as u32;
+        // SAFETY: `GetCurrentProcess` yields a pseudo-handle that is never closed and is
+        // valid for the call; `pmc` is a live, correctly-sized `PROCESS_MEMORY_COUNTERS`.
+        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) };
+        if ok != 0 {
+            pmc.working_set_size as u64
+        } else {
+            0
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // `/proc/self/statm` field 2 is resident pages; x86_64/arm64 pages are 4 KiB.
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        statm
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+            .saturating_mul(4096)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        0
+    }
+}
+
 /// Runtime metrics exposed at `GET /metrics` (PH-505). Pure counters the serve loop
 /// accumulates; `tok_per_sec` is derived and zero-guarded so it never divides by 0.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -116,16 +173,20 @@ impl Metrics {
         }
     }
 
-    /// JSON (hand-built, std-only).
+    /// JSON (hand-built, std-only). Samples the live process RSS via [`ram_bytes`] so the
+    /// `/metrics` panel reports tok/s · RAM · experts (PH-505).
     pub fn to_json(&self) -> String {
+        let ram = ram_bytes();
         format!(
-            r#"{{"calls":{},"generated_tokens":{},"decode_secs":{},"tok_per_sec":{},"active_experts":{},"peak_experts":{}}}"#,
+            r#"{{"calls":{},"generated_tokens":{},"decode_secs":{},"tok_per_sec":{},"active_experts":{},"peak_experts":{},"ram_bytes":{},"ram_mb":{:.1}}}"#,
             self.calls,
             self.generated_tokens,
             self.decode_secs,
             self.tok_per_sec(),
             self.active_experts,
-            self.peak_experts
+            self.peak_experts,
+            ram,
+            ram as f64 / (1024.0 * 1024.0)
         )
     }
 }
@@ -205,5 +266,14 @@ mod tests {
         assert!(j.starts_with('{') && j.ends_with('}'));
         assert!(j.contains("\"generated_tokens\":1"));
         assert!(j.contains("\"tok_per_sec\":0"));
+        assert!(j.contains("\"ram_bytes\":"));
+        assert!(j.contains("\"ram_mb\":"));
+    }
+
+    #[test]
+    fn ram_bytes_reads_the_process_where_supported() {
+        if cfg!(windows) || cfg!(target_os = "linux") {
+            assert!(ram_bytes() > 0, "expected a positive working set");
+        }
     }
 }

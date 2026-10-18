@@ -339,3 +339,20 @@ clippy чисто. Лишається в межах PH-507: WiFi multi-host (ban
 
 Gate: `cargo test` **197 green** (178 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen, +5 ignored),
 clippy `--all-targets` 0, fmt ok. **23 локальних комітів**, без push (B11).
+
+### Продовження 9 — PH-505 residual: per-process RAM у `/metrics`
+
+`/metrics` віддавав tok/s + experts, але не RAM. Додано **`hub::ram_bytes()`** (std-only, без
+крейтів): Windows — working set через `K32GetProcessMemoryInfo` (`extern "system"` FFI,
+kernel32/psapi), Linux — resident-сторінки з `/proc/self/statm` × 4096, інакше 0. `Metrics::to_json`
+семплить живий RSS → у відповідь додано `ram_bytes` та `ram_mb`. `ChatOutcome` отримав поле
+`active_experts`, яке `serve` передає в `metrics.record(..)` (на dense-шляху 0 — наповниться з
+`PH-406` MoE).
+
+Перевірка: unit `ram_bytes_reads_the_process_where_supported` + `metrics_json_shape`; live `:8090` →
+`"ram_bytes":1502031872,"ram_mb":1432.4` (модель 0.5B завантажена); окремий прогон на `:8095` (stub)
+→ `ram_mb 4.6`. **Увага:** живий serve `:8090` (старий PID 9992) встиг впасти між сеансами — піднято
+заново (`target/live/serve.sh`, PID 13844). Порт `:8091` належить poolAI (не наш).
+
+Gate: `cargo test` **198 green** (179 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen, +5 ignored),
+clippy 0, fmt ok. **24 локальних комітів**, без push (B11).
