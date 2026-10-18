@@ -82,8 +82,10 @@ pub fn handle_conn(
             } else {
                 crate::textgen::chat_response(tr, body, max_new)
             };
-            metrics.record(0, 0.0, 0);
-            r
+            // PH-505: record the real decode stats (tokens + wall clock); the runner is the
+            // dense path, so no MoE experts are materialized (0).
+            metrics.record(r.generated_tokens, r.decode_secs, 0);
+            r.response
         }
         _ => {
             let r = crate::http::route_with(&buf[..filled], metrics);

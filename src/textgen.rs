@@ -140,15 +140,23 @@ pub fn extract_message_content(json: &str) -> String {
     parts.join(" ")
 }
 
+/// One chat completion plus the decode stats the serve loop reports (PH-505).
+pub struct ChatOutcome {
+    pub response: crate::http::Response,
+    /// Newly generated tokens (`usage.completion_tokens`).
+    pub generated_tokens: u64,
+    /// Wall-clock seconds spent generating this completion.
+    pub decode_secs: f64,
+}
+
 /// HTTP chat handler (PH-501b). `json_body` is the raw request body (messages JSON);
-/// returns the full OpenAI-shaped HTTP response for POST /v1/chat/completions.
-pub fn chat_response(
-    runner: &TextRunner,
-    json_body: &str,
-    max_new: usize,
-) -> crate::http::Response {
+/// returns the full OpenAI-shaped HTTP response for POST /v1/chat/completions plus the
+/// decode stats (PH-505).
+pub fn chat_response(runner: &TextRunner, json_body: &str, max_new: usize) -> ChatOutcome {
+    let started = std::time::Instant::now();
     match runner.complete(json_body, max_new) {
         Ok(text) => {
+            let decode_secs = started.elapsed().as_secs_f64();
             let escaped = escape_json_text(&text);
             let prompt_len = runner
                 .bpe
@@ -157,9 +165,17 @@ pub fn chat_response(
                 .len();
             let generated = (runner.bpe.encode(&text).map(|v| v.len()).unwrap_or(0)).max(1);
             let json = chat_completion_body(&escaped, prompt_len, generated);
-            crate::http::Response::json(200, json)
+            ChatOutcome {
+                response: crate::http::Response::json(200, json),
+                generated_tokens: generated as u64,
+                decode_secs,
+            }
         }
-        Err(e) => crate::http::Response::json(400, format!(r#"{{"error":"{}"}}"#, e.message)),
+        Err(e) => ChatOutcome {
+            response: crate::http::Response::json(400, format!(r#"{{"error":"{}"}}"#, e.message)),
+            generated_tokens: 0,
+            decode_secs: 0.0,
+        },
     }
 }
 
@@ -182,23 +198,30 @@ pub fn chat_completion_body(content: &str, prompt_len: usize, generated: usize) 
 /// `chat.completion.chunk` delta event plus the terminating `[DONE]`, the same
 /// minimal streaming contract `llama_serve` (bunke-rock) exposes. The hub can
 /// hold `text/event-stream` against the engine without a client-visible gap.
-pub fn chat_stream_response(
-    runner: &TextRunner,
-    json_body: &str,
-    max_new: usize,
-) -> crate::http::Response {
+pub fn chat_stream_response(runner: &TextRunner, json_body: &str, max_new: usize) -> ChatOutcome {
+    let started = std::time::Instant::now();
     match runner.complete(json_body, max_new) {
         Ok(text) => {
+            let decode_secs = started.elapsed().as_secs_f64();
             let escaped = escape_json_text(&text);
+            let generated = (runner.bpe.encode(&text).map(|v| v.len()).unwrap_or(0)).max(1);
             let body = crate::http::sse_body("cmpl-0", "rusty-engine", &[&escaped]);
-            crate::http::Response {
-                status: 200,
-                reason: "OK",
-                content_type: "text/event-stream",
-                body,
+            ChatOutcome {
+                response: crate::http::Response {
+                    status: 200,
+                    reason: "OK",
+                    content_type: "text/event-stream",
+                    body,
+                },
+                generated_tokens: generated as u64,
+                decode_secs,
             }
         }
-        Err(e) => crate::http::Response::json(400, format!(r#"{{"error":"{}"}}"#, e.message)),
+        Err(e) => ChatOutcome {
+            response: crate::http::Response::json(400, format!(r#"{{"error":"{}"}}"#, e.message)),
+            generated_tokens: 0,
+            decode_secs: 0.0,
+        },
     }
 }
 

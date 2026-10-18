@@ -289,6 +289,42 @@ fn serve_with_model_completes_over_the_wire() {
 }
 
 #[test]
+fn chat_response_reports_decode_stats() {
+    // PH-505: chat_response returns the response *plus* the decode stats the serve loop
+    // feeds into /metrics (tokens + wall clock), instead of hardcoded zeros.
+    let bytes = synth_text_gguf();
+    std::fs::create_dir_all("target").unwrap();
+    let path = Path::new("target/text_gen_stats.gguf");
+    std::fs::write(path, &bytes).unwrap();
+    let model = unsafe { MmapModel::open(path) }.expect("open synth");
+    let tr = TextRunner::from_model(&model).expect("TextRunner");
+
+    let out = rusty_engine::textgen::chat_response(
+        &tr,
+        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+        3,
+    );
+    assert_eq!(out.response.status, 200);
+    assert!(
+        out.generated_tokens >= 1,
+        "generated tokens counted: {}",
+        out.generated_tokens
+    );
+    assert!(out.decode_secs >= 0.0);
+    let json = rusty_engine::worker::parse_json(&out.response.body).expect("valid JSON");
+    assert_eq!(
+        json.get("usage")
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_u64()),
+        Some(out.generated_tokens),
+        "usage.completion_tokens mirrors the reported stat"
+    );
+
+    drop(model);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn serve_with_model_streams_sse_over_the_wire() {
     use std::io::{Read, Write};
     use std::net::TcpStream;

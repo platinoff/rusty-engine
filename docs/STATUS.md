@@ -10,7 +10,7 @@ serve/heartbeat → **PH-405b forward-parity з llama-rs ✅** → **PH-507 hub 
 |---------|----------|
 | `git status` | **clean** (0 drift) |
 | Локальні коміти | **17** (ahead of `origin/main`; B0→B5 serve/heartbeat + PH-405b + PH-507, без push — remote = B11) |
-| Тести | **196** (178 lib + 5 dense-gen + 4 scaffold + 5 serve + 4 text-gen; +5 ignored parity), 0 failed |
+| Тести | **197** (178 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
 | Rust LOC | **11119** (`src` 9750 + `tests` 1050 + `xtask` 319) |
