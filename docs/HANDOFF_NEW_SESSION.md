@@ -317,3 +317,25 @@ clippy чисто. Лишається в межах PH-507: WiFi multi-host (ban
 у OpenCode/Cursor.
 
 **17 локальних комітів**, без push (B11).
+
+### Продовження 8 — B2 SIMD bench (`PH-205`) + закриття x86-диспатчу (`PH-203`)
+
+`benches/quant.rs` (новий, **std-only**, без `criterion`, `harness=false`) міряє scalar-оракул проти
+`*_dispatch` для кожного quant-ядра і друкує ns + speedup + `|Δ|` (SIMD має збігатися зі скаляром).
+`Cargo.toml` отримав `[[bench]] name = "quant"`.
+
+**Заміри (release, Qwen-форма 896²):** dot `q4_0` **2.32×**, `q8_0` **1.78×**, `q5_0` **2.12×**,
+`q4_k` **3.94×**, `q6_k` **5.31×**; matvec `q4_0` **2.30×**, `q8_0` **1.78×**; `|Δ| ≤ 4e-3`
+(SIMD==scalar до f32-округлення).
+
+**Граблищі — у фікстурах, не в ядрах.** Перші прогони дали `|Δ|` до сотень і **NaN**. Причини: (1)
+`fill_floats` ділив xorshift на 4096 замість 2²⁴ → значення до ~4096 (не ±0.5); (2) масштаб блоку
+`d` (f16) залишався random-байтами → Inf/NaN; (3) **`Q6_K` тримає `d` у хвості блоку, offset 208**,
+а не 0. Після стампу фінітних `d`/`min` (і правильного offset) — тихо.
+
+**Інвентар SIMD (x86 закрито):** SSE2 `Q4_0`/`Q8_0`; AVX2 `Q4_0`/`Q5_0`/`Q8_0`/`Q4_K`/`Q6_K`;
+`dot/matvec/matmul_*_dispatch` ланцюг AVX2→SSE2→scalar, підключений до forward через `qmat.rs`
+(`QMat::matvec/matmul`). **Лишився тільки NEON (arm64)**, тому `PH-203` тримає `[~]`.
+
+Gate: `cargo test` **197 green** (178 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen, +5 ignored),
+clippy `--all-targets` 0, fmt ok. **23 локальних комітів**, без push (B11).

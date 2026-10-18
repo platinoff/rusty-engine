@@ -82,6 +82,23 @@ Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker р�
 - **Далі:** упакований int8 SIMD dot (`q8_0×q8` `vec_dot`) або register-blocked GEMM **або**
   `PH-405b` llama-rs parity **або** B6 cross-builds / B7 docker-slave. **13 комітів**, без push.
 
+### Продовження 4 (2026-10-17, B2 SIMD bench — `PH-203`/`PH-205`)
+
+- **`benches/quant.rs`** (новий, `PH-205`) — std-only bench (**без `criterion`**), `harness=false`,
+  детермінований xorshift; для кожного quant-ядра друкує scalar-час, `*_dispatch`-час, speedup і
+  `|Δ|` (sanity: SIMD == scalar-оракул). `Cargo.toml` → `[[bench]] name="quant"`.
+- **Заміри (release, Qwen-форма 896²):** dot `q4_0` **2.32×**, `q8_0` **1.78×**, `q5_0` **2.12×**,
+  `q4_k` **3.94×**, `q6_k` **5.31×**; matvec `q4_0` **2.30×**, `q8_0` **1.78×**; `|Δ| ≤ 4e-3`
+  (SIMD==scalar до f32-округлення).
+- **Фікс фікстур, не ядер:** перші прогони давали NaN/велике `|Δ|` — це були артефакти даних
+  (f16-scale з random-байтів → Inf/NaN; `fill_floats` ділив на 4096, не 2²⁴; `Q6_K` має `d` у
+  хвості блоку, offset **208**, не 0). Після фіксу — тихо.
+- **`PH-203` x86 закрито:** SSE2 `Q4_0`/`Q8_0`; AVX2 `Q4_0`/`Q5_0`/`Q8_0`/`Q4_K`/`Q6_K`;
+  `dot/matvec/matmul_*_dispatch` (AVX2→SSE2→scalar) підключені до forward через `qmat.rs`. Лишився
+  **NEON arm64**.
+- Gate: `cargo test` **197 green**, clippy 0, fmt ok. **23 локальних комітів**, без push (B11).
+- **Далі:** NEON (`PH-203` arm64) **або** `PH-501` (axum serve) **або** B6 cross-builds / B7 docker-slave.
+
 ## AUTO-DIRECTIVE (owner, 2026-10-15; оновлено 2026-10-17) — на наступне `agi`
 
 Наступного `agi`: **НЕ питати вибору бенду** — одразу брати з черги.
@@ -98,8 +115,9 @@ Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker р�
   `chat_completion_body` + тест `worker::parse_json`); плюс читання тіла за `Content-Length`
   (`serve.rs`/`http.rs`). Деталі — «Продовження 7» у `docs/HANDOFF_NEW_SESSION.md`. **Лишається
   в межах PH-507:** WiFi multi-host (band 233) і provider `rusty/*` у OpenCode/Cursor.
-- **Next:** або довиконати решту `PH-507` (multi-host + IDE-chat), або `PH-202/203`
-  (repack/SIMD), `PH-501` (axum serve), B6 cross-builds / B7 docker-slave.
+- **Next:** або довиконати решту `PH-507` (multi-host + IDE-chat), або **NEON (`PH-203` arm64)**,
+  `PH-501` (axum serve), B6 cross-builds / B7 docker-slave. **B2 x86 SIMD + bench (`PH-203`/`PH-205`)
+  — ✅ зроблено** (див. «Продовження 4»).
 
 ## Session wire (виправлено 2026-10-15, owner-згода на push налаштувань)
 
