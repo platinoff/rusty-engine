@@ -92,15 +92,13 @@ Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker р�
   `tests/moe_parity.rs` (Гейт A tokenizer byte-exact PASS; Гейт B офлайн+live-оракул),
   факти — `docs/research/llama-rs-parity.md`. Golden перезахоплено. Деталі — «Продовження 6»
   у `docs/HANDOFF_NEW_SESSION.md`.
-- **Наступний пункт черги — `PH-507`** (owner-директива 2026-10-15, bunke-rock-подібний
-  provider-row у hub-каталозі; § «Session wire» нижче): зареєструвати `rusty serve` як
-  `kind:local` рядок у GSV `src/boxes/omni/catalog.rs` (`host_ready`-гейт на
-  `target/live/rusty_heartbeat.json` + gguf-файл, fail-open), авто-перемикання local↔cloud
-  у `GET /api/omni/route`, SSE через hub, WiFi multi-host (LAN-first band 233).
-  Product = `rusty-engine`, той же ticket-цикл create→claim→drain→done, один локальний
-  коміт, **без push** (B11). Тікети/keep-live за `agi`-скіллом; перед зрізом перевірити
-  hub-сервіси через `gsv_keep_live`.
-- Якщо `PH-507` заблокований (потрібен GSV-side код/дозвіл) — альтернативи: `PH-202/203`
+- **`PH-507` — ✅ E2E ЗРОБЛЕНО (2026-10-17).** Провайдер `rusty-serve` у hub-каталозі працює
+  через живий хаб `:9999` → `rusty serve :8090`: JSON-відповідь і SSE-пасстру (`.x-gsv-mcp: sse`).
+  Корінь давнього `null` — **незакритий корінь** у JSON `textgen::chat_response` (фікс
+  `chat_completion_body` + тест `worker::parse_json`); плюс читання тіла за `Content-Length`
+  (`serve.rs`/`http.rs`). Деталі — «Продовження 7» у `docs/HANDOFF_NEW_SESSION.md`. **Лишається
+  в межах PH-507:** WiFi multi-host (band 233) і provider `rusty/*` у OpenCode/Cursor.
+- **Next:** або довиконати решту `PH-507` (multi-host + IDE-chat), або `PH-202/203`
   (repack/SIMD), `PH-501` (axum serve), B6 cross-builds / B7 docker-slave.
 
 ## Session wire (виправлено 2026-10-15, owner-згода на push налаштувань)

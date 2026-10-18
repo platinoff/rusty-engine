@@ -289,3 +289,31 @@ PASS (vocab 151936, merges 151387, ids точні). Числовий відпе�
 `I'm trying to create a simple`).
 
 **16 локальних комітів**, без push (B11).
+
+### Продовження 7 — PH-507: hub-провайдер `rusty-serve` працює E2E (кривий JSON + читання тіла)
+
+Через GSV-хаб (`POST /api/omni/v1/chat/completions`, провайдер `rusty-serve`,
+модель `rusty-05`) відповідь приходила як **`null`**, хоч прямий виклик `rusty serve`
+на `:8090` віддавав коректний OpenAI-обʼєкт. Діагностика (canned-listener `:8123`,
+stub-serve, окремий діагностичний хаб `:9998` з `GSV_OMNI_DEBUG`, перехоплення байтів
+upstream-відповіді):
+
+**Корінь — невалідний JSON у `textgen::chat_response`.** Формат-рядок закривав
+обʼєкт `usage`, але **не закривав корінь** — у тілі бракувало однієї `}` (4 `{`, 3 `}`).
+`curl` шле байти без валідації, а хаб робить
+`serde_json::from_slice(&bytes).unwrap_or(Value::Null)` (`GSV/src/boxes/omni/proxy.rs`)
+→ `null` при HTTP 200. Помилка парсера: `EOF while parsing an object at line 1 column 256`.
+
+- `textgen.rs`: виділено `chat_completion_body(content, prompt_len, generated)`,
+  додано пропущену кореневу `}`; тіло тестується строгим std-only `worker::parse_json`.
+- `serve.rs`/`http.rs`: читати тіло за оголошеним `Content-Length` (раніше зупинка на
+  першому `\r\n\r\n` губила розділені head/body); кап піднято до 1 MiB з ростом буфера;
+  додано `http::content_length`.
+
+**E2E перевірка (живий хаб `:9999` → serve `:8090`):**
+`The capital of France is` → ` Paris. It is the largest city in` (HTTP 200, валідний JSON);
+`stream:true` → SSE-чанки пасструузятся хабом (`x-gsv-mcp: sse`). 178 lib-тестів ok,
+clippy чисто. Лишається в межах PH-507: WiFi multi-host (band 233) і провайдер `rusty/*`
+у OpenCode/Cursor.
+
+**17 локальних комітів**, без push (B11).
