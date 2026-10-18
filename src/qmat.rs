@@ -155,36 +155,45 @@ impl QMat {
 
     /// Batched `W[m×n] · X[rows×n] → Out[rows×m]` for prefill. Quant formats swap each
     /// block's dequant out of the row loop (see `kernel::matmul_*`), so the int→float
-    /// conversions that dominate `matvec` are paid once instead of once per row. Input
-    /// rows are independent, so the batch is split across workers the same way.
+    /// conversions that dominate `matvec` are paid once instead of once per row. Split by
+    /// **weight rows** (output columns) so each block is still dequantized exactly once —
+    /// splitting by input rows would re-dequantize the whole matrix per worker. Each worker's
+    /// block is scattered back into the row-major `Out`.
     pub fn matmul(&self, x: &[f32], rows: usize) -> Vec<f32> {
         let (m, n) = (self.rows(), self.cols());
-        let threads = workers_for(rows.saturating_mul(m).saturating_mul(n), rows);
-        if threads <= 1 {
-            return self.matmul_serial(x, rows);
-        }
+        let threads = workers_for(rows.saturating_mul(m).saturating_mul(n), m);
         let (ggml_type, bytes) = match self {
             Self::Quant {
                 ggml_type, bytes, ..
             } => (*ggml_type, bytes.as_slice()),
             Self::F32 { .. } => return self.matmul_serial(x, rows),
         };
-        let Some(_rb) = crate::kernel::quant_row_bytes(ggml_type, n) else {
+        let Some(rb) = crate::kernel::quant_row_bytes(ggml_type, n) else {
             return self.matmul_serial(x, rows);
         };
-        let chunk = rows.div_ceil(threads);
-        let mut out = vec![0f32; rows * m];
+        if threads <= 1 {
+            return self.matmul_serial(x, rows);
+        }
+        let chunk = m.div_ceil(threads);
+        let mut parts: Vec<Vec<f32>> = vec![Vec::new(); m.div_ceil(chunk)];
         std::thread::scope(|s| {
-            for (ci, part) in out.chunks_mut(chunk * m).enumerate() {
-                let start = ci * chunk;
-                let cnt = part.len() / m;
-                let xs = &x[start * n..(start + cnt) * n];
+            for (ci, slot) in parts.iter_mut().enumerate() {
+                let col0 = ci * chunk;
+                let mc = chunk.min(m - col0);
+                let wsub = &bytes[col0 * rb..(col0 + mc) * rb];
                 s.spawn(move || {
-                    let got = crate::kernel::matmul_dispatch(ggml_type, bytes, m, n, xs, cnt);
-                    part.copy_from_slice(&got);
+                    *slot = crate::kernel::matmul_dispatch(ggml_type, wsub, mc, n, x, rows);
                 });
             }
         });
+        let mut out = vec![0f32; rows * m];
+        for (ci, got) in parts.iter().enumerate() {
+            let col0 = ci * chunk;
+            let mc = chunk.min(m - col0);
+            for (r, dst) in out.chunks_mut(m).enumerate() {
+                dst[col0..col0 + mc].copy_from_slice(&got[r * mc..(r + 1) * mc]);
+            }
+        }
         out
     }
 
