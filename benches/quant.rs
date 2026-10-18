@@ -217,4 +217,56 @@ fn main() {
         k::matvec_q8_0_dispatch,
         200,
     );
+
+    // `PH-203e` follow-up: is a persistent pool worth it? Compare one decode-shaped
+    // projection (gate/up, 4864x896 Q5_0) on the serial kernel, the row-parallel `QMat`
+    // path, and the cost of the `thread::scope` spawn+join that path pays per call.
+    println!("\n== parallel projection vs spawn overhead ==");
+    let spawn_iters = 200u32;
+    let t = time(spawn_iters, || {
+        std::thread::scope(|s| {
+            for _ in 0..12 {
+                s.spawn(|| black_box(0u8));
+            }
+        });
+    });
+    let spawn_us = t.as_secs_f64() * 1e6 / spawn_iters as f64;
+    println!("scope spawn+join (12 th)  {spawn_us:>10.1} us");
+
+    let gm = 4864usize;
+    let wg = blocks(19, gm * (n / 32), 22, 0, None);
+    let serial = time(20, || {
+        black_box(k::matvec_q5_0_dispatch(&wg, gm, n, &x));
+    })
+    .as_secs_f64()
+        * 1e3
+        / 20.0;
+    let qm = rusty_engine::qmat::QMat::from_bytes(6, wg.clone(), gm, n);
+    let par = time(20, || {
+        black_box(qm.matvec(&x));
+    })
+    .as_secs_f64()
+        * 1e3
+        / 20.0;
+    println!(
+        "gate/up 4864x896 Q5_0    serial {serial:>8.3} ms | QMat {par:>8.3} ms | speedup {:>5.2}x",
+        serial / par
+    );
+    println!(
+        "per-call scope would add {:.1} ms/token (~120 projections); the pool pays the spawn once",
+        spawn_us / 1000.0 * 120.0
+    );
+
+    // Prefill shape: the same weight applied to 961 prompt rows.
+    let rows = 961usize;
+    let xb = fill_floats(21, rows * n);
+    let t = time(1, || {
+        black_box(k::matmul_q5_0_dispatch(&wg, gm, n, &xb, rows));
+    });
+    let serial_mm = t.as_secs_f64() * 1e3;
+    let t = time(3, || {
+        black_box(qm.matmul(&xb, rows));
+    });
+    let par_mm = t.as_secs_f64() * 1e3 / 3.0;
+    println!("prefill matmul 4864x896 x{rows}  serial {serial_mm:>8.1} ms | QMat {par_mm:>8.1} ms | speedup {:>5.2}x", serial_mm / par_mm);
 }

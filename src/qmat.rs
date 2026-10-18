@@ -12,27 +12,12 @@ use crate::core::{EngineError, Result};
 /// split across worker threads — below this the thread spawn costs more than it saves.
 const PAR_MAC_MIN: usize = 1 << 18;
 
-/// Requested worker count: `RUSTY_THREADS` when set (1–256), else the machine's
-/// available parallelism; never zero.
-fn requested_threads() -> usize {
-    if let Ok(v) = std::env::var("RUSTY_THREADS") {
-        if let Ok(n) = v.trim().parse::<usize>() {
-            if n >= 1 {
-                return n.min(256);
-            }
-        }
-    }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-}
-
 /// Worker count for a projection of `work` MACs, capped to `rows` (each worker needs ≥1 row).
 fn workers_for(work: usize, rows: usize) -> usize {
     if work < PAR_MAC_MIN || rows < 2 {
         return 1;
     }
-    requested_threads().min(rows).max(1)
+    crate::pool::requested_threads().min(rows).max(1)
 }
 
 /// A row-major `m × n` weight matrix: either f32, or its stored quant blocks.
@@ -106,21 +91,26 @@ impl QMat {
                 let mut out = vec![0f32; *m];
                 let chunk = (*m).div_ceil(threads);
                 let t = *ggml_type;
-                std::thread::scope(|s| {
-                    for (ci, part) in out.chunks_mut(chunk).enumerate() {
-                        let base = ci * chunk;
-                        s.spawn(move || {
-                            for (i, o) in part.iter_mut().enumerate() {
-                                let r = base + i;
-                                *o = crate::kernel::quant_row_dot(
-                                    t,
-                                    &bytes[r * rb..(r + 1) * rb],
-                                    x,
-                                );
-                            }
-                        });
+                let mm = *m;
+                let jobs = mm.div_ceil(chunk);
+                let parts = std::sync::Mutex::new(Vec::<(usize, Vec<f32>)>::with_capacity(jobs));
+                crate::pool::parallel_for(jobs, |ci| {
+                    let base = ci * chunk;
+                    let end = (base + chunk).min(mm);
+                    let mut v = Vec::with_capacity(end.saturating_sub(base));
+                    for r in base..end {
+                        v.push(crate::kernel::quant_row_dot(
+                            t,
+                            &bytes[r * rb..(r + 1) * rb],
+                            x,
+                        ));
                     }
+                    parts.lock().unwrap().push((ci, v));
                 });
+                for (ci, v) in parts.into_inner().unwrap() {
+                    let base = ci * chunk;
+                    out[base..base + v.len()].copy_from_slice(&v);
+                }
                 out
             }
         }
@@ -175,19 +165,17 @@ impl QMat {
             return self.matmul_serial(x, rows);
         }
         let chunk = m.div_ceil(threads);
-        let mut parts: Vec<Vec<f32>> = vec![Vec::new(); m.div_ceil(chunk)];
-        std::thread::scope(|s| {
-            for (ci, slot) in parts.iter_mut().enumerate() {
-                let col0 = ci * chunk;
-                let mc = chunk.min(m - col0);
-                let wsub = &bytes[col0 * rb..(col0 + mc) * rb];
-                s.spawn(move || {
-                    *slot = crate::kernel::matmul_dispatch(ggml_type, wsub, mc, n, x, rows);
-                });
-            }
+        let jobs = m.div_ceil(chunk);
+        let parts = std::sync::Mutex::new(Vec::<(usize, Vec<f32>)>::with_capacity(jobs));
+        crate::pool::parallel_for(jobs, |ci| {
+            let col0 = ci * chunk;
+            let mc = chunk.min(m - col0);
+            let wsub = &bytes[col0 * rb..(col0 + mc) * rb];
+            let got = crate::kernel::matmul_dispatch(ggml_type, wsub, mc, n, x, rows);
+            parts.lock().unwrap().push((ci, got));
         });
         let mut out = vec![0f32; rows * m];
-        for (ci, got) in parts.iter().enumerate() {
+        for (ci, got) in parts.into_inner().unwrap() {
             let col0 = ci * chunk;
             let mc = chunk.min(m - col0);
             for (r, dst) in out.chunks_mut(m).enumerate() {

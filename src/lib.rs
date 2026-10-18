@@ -44,6 +44,7 @@ pub mod loader;
 pub mod model;
 pub mod moe;
 pub mod node;
+pub mod pool;
 pub mod qmat;
 pub mod quant;
 pub mod repack;
