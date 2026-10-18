@@ -322,8 +322,8 @@ pub unsafe fn dot_q4_0_sse2(a: &[u8], b: &[f32]) -> f32 {
 pub fn dot_q4_0_dispatch(a: &[u8], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: gated by the runtime AVX2 check above.
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: gated by the runtime AVX2+FMA check above.
             return unsafe { dot_q4_0_avx2(a, b) };
         }
         if std::is_x86_feature_detected!("sse2") {
@@ -376,42 +376,40 @@ pub unsafe fn dot_q8_0_sse2(a: &[u8], b: &[f32]) -> f32 {
     hsum_ps_sse2(acc)
 }
 
-/// AVX2 `dot(dequant_q8_0(a), b)` — `PH-203c`. Eight `i8` per lane via an `[i32;8]`
-/// gather (four lanes wide is the AVX2 sweet spot), `_mm256_cvtepi32_ps` × broadcast
-/// scale × `b`, reduced with a `_mm256` fold into SSE2's `hsum_ps_sse2`.
+/// AVX2+FMA `dot(dequant_q8_0(a), b)` — `PH-203c`. Eight `i8` per lane via
+/// `_mm256_cvtepi8_epi32`, `_mm256_cvtepi32_ps` × broadcast scale × `b` fused with
+/// `_mm256_fmadd_ps` into two independent accumulators (the `d` scale is constant per
+/// 34-byte block, so `d·(q·b)` folds cleanly), reduced with a `_mm256` fold into SSE2's
+/// `hsum_ps_sse2`.
 ///
 /// # Safety
-/// Requires AVX2 (runtime-detected via [`dot_q8_0_dispatch`]). `a.len()` multiple of 34
+/// Requires AVX2+FMA (runtime-detected via [`dot_q8_0_dispatch`]). `a.len()` multiple of 34
 /// and `b.len() == a.len()/34*32` (both debug-asserted).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 pub unsafe fn dot_q8_0_avx2(a: &[u8], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     let nb = a.len() / 34;
     debug_assert_eq!(a.len(), nb * 34, "dot_q8_0_avx2: partial block");
     debug_assert_eq!(b.len(), nb * 32, "dot_q8_0_avx2: vector length mismatch");
-    let mut acc = _mm256_setzero_ps();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
     for (k, blk) in a.chunks_exact(34).enumerate() {
         let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         let dv = _mm256_set1_ps(d);
         let qs = &blk[2..];
         let bo = k * 32;
-        for jj in (0..32).step_by(8) {
-            let mut v = [0i32; 8];
-            for t in 0..8 {
-                v[t] = qs[jj + t] as i8 as i32;
-            }
-            let vv = _mm256_mul_ps(
-                dv,
-                _mm256_cvtepi32_ps(_mm256_loadu_si256(v.as_ptr().cast())),
-            );
-            acc = _mm256_add_ps(
-                acc,
-                _mm256_mul_ps(vv, _mm256_loadu_ps(b.as_ptr().add(bo + jj))),
-            );
+        for jj in (0..32).step_by(16) {
+            let r0 = _mm_loadl_epi64(qs.as_ptr().add(jj).cast());
+            let v0 = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r0)));
+            acc0 = _mm256_fmadd_ps(v0, _mm256_loadu_ps(b.as_ptr().add(bo + jj)), acc0);
+            let r1 = _mm_loadl_epi64(qs.as_ptr().add(jj + 8).cast());
+            let v1 = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r1)));
+            acc1 = _mm256_fmadd_ps(v1, _mm256_loadu_ps(b.as_ptr().add(bo + jj + 8)), acc1);
         }
     }
     // Reduce 256-bit lanes to 128-bit, then SSE2 horizontal sum.
+    let acc = _mm256_add_ps(acc0, acc1);
     let lo = _mm256_castps256_ps128(acc);
     let hi = _mm256_extractf128_ps(acc, 1);
     hsum_ps_sse2(_mm_add_ps(lo, hi))
@@ -421,8 +419,8 @@ pub unsafe fn dot_q8_0_avx2(a: &[u8], b: &[f32]) -> f32 {
 pub fn dot_q8_0_dispatch(a: &[u8], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: gated by the runtime AVX2 check above.
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: gated by the runtime AVX2+FMA check above.
             return unsafe { dot_q8_0_avx2(a, b) };
         }
         if std::is_x86_feature_detected!("sse2") {
@@ -446,14 +444,15 @@ pub fn matvec_q8_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32]) -> Vec<f32>
 
 // ── `PH-203c` AVX2 fused dots (x86_64) ───────────────────────────────────────
 
-/// AVX2 `dot(dequant_q4_0(a), b)` — split-half nibbles eight at a time (`lo` → `b[0..16]`,
-/// `hi` → `b[16..32]`), reduced with a `__m256` fold into SSE2's `hsum_ps_sse2`.
+/// AVX2+FMA `dot(dequant_q4_0(a), b)` — split-half nibbles eight at a time (`lo` → `b[0..16]`,
+/// `hi` → `b[16..32]`) into two independent accumulators via `_mm256_fmadd_ps`, reduced with a
+/// `__m256` fold into SSE2's `hsum_ps_sse2`.
 ///
 /// # Safety
-/// Requires AVX2 (runtime-detected via [`dot_q4_0_dispatch`]). `a.len()` multiple of 18 and
+/// Requires AVX2+FMA (runtime-detected via [`dot_q4_0_dispatch`]). `a.len()` multiple of 18 and
 /// `b.len() == a.len()/18*32` (both debug-asserted).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 pub unsafe fn dot_q4_0_avx2(a: &[u8], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     let nb = a.len() / 18;
@@ -461,7 +460,8 @@ pub unsafe fn dot_q4_0_avx2(a: &[u8], b: &[f32]) -> f32 {
     debug_assert_eq!(b.len(), nb * 32, "dot_q4_0_avx2: vector length mismatch");
     let mask = _mm256_set1_epi32(0x0F);
     let eight = _mm256_set1_epi32(8);
-    let mut acc = _mm256_setzero_ps();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
     for (k, blk) in a.chunks_exact(18).enumerate() {
         let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         let dv = _mm256_set1_ps(d);
@@ -474,16 +474,11 @@ pub unsafe fn dot_q4_0_avx2(a: &[u8], b: &[f32]) -> f32 {
             let hi = _mm256_sub_epi32(_mm256_srli_epi32(v, 4), eight);
             let lov = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(lo));
             let hiv = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(hi));
-            acc = _mm256_add_ps(
-                acc,
-                _mm256_mul_ps(lov, _mm256_loadu_ps(b.as_ptr().add(bo + jj))),
-            );
-            acc = _mm256_add_ps(
-                acc,
-                _mm256_mul_ps(hiv, _mm256_loadu_ps(b.as_ptr().add(bo + 16 + jj))),
-            );
+            acc0 = _mm256_fmadd_ps(lov, _mm256_loadu_ps(b.as_ptr().add(bo + jj)), acc0);
+            acc1 = _mm256_fmadd_ps(hiv, _mm256_loadu_ps(b.as_ptr().add(bo + 16 + jj)), acc1);
         }
     }
+    let acc = _mm256_add_ps(acc0, acc1);
     let lo = _mm256_castps256_ps128(acc);
     let hi = _mm256_extractf128_ps(acc, 1);
     hsum_ps_sse2(_mm_add_ps(lo, hi))
@@ -644,14 +639,15 @@ pub unsafe fn dot_q6_k_avx2(a: &[u8], b: &[f32]) -> f32 {
     hsum_ps_sse2(_mm_add_ps(lo, hi))
 }
 
-/// AVX2 `dot(dequant_q5_0(a), b)` — split-half nibbles eight at a time; the 5th bit is
-/// gathered from `qh` per lane with `_mm256_srlv_epi32` (bias −16).
+/// AVX2+FMA `dot(dequant_q5_0(a), b)` — split-half nibbles eight at a time; the 5th bit is
+/// gathered from `qh` per lane with `_mm256_srlv_epi32` (bias −16); the two halves fold into
+/// independent accumulators via `_mm256_fmadd_ps`.
 ///
 /// # Safety
-/// Requires AVX2 (runtime-detected via [`dot_q5_0_dispatch`]). `a.len()` multiple of 22 and
+/// Requires AVX2+FMA (runtime-detected via [`dot_q5_0_dispatch`]). `a.len()` multiple of 22 and
 /// `b.len() == a.len()/22*32` (both debug-asserted).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 pub unsafe fn dot_q5_0_avx2(a: &[u8], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     let nb = a.len() / 22;
@@ -661,7 +657,8 @@ pub unsafe fn dot_q5_0_avx2(a: &[u8], b: &[f32]) -> f32 {
     let sixteen = _mm256_set1_epi32(16);
     let ones = _mm256_set1_epi32(1);
     let shifts = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-    let mut acc = _mm256_setzero_ps();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
     for (k, blk) in a.chunks_exact(22).enumerate() {
         let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         let dv = _mm256_set1_ps(d);
@@ -680,16 +677,11 @@ pub unsafe fn dot_q5_0_avx2(a: &[u8], b: &[f32]) -> f32 {
             let hi = _mm256_sub_epi32(_mm256_or_si256(hi_nib, bit1), sixteen);
             let lov = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(lo));
             let hiv = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(hi));
-            acc = _mm256_add_ps(
-                acc,
-                _mm256_mul_ps(lov, _mm256_loadu_ps(b.as_ptr().add(bo + jj))),
-            );
-            acc = _mm256_add_ps(
-                acc,
-                _mm256_mul_ps(hiv, _mm256_loadu_ps(b.as_ptr().add(bo + 16 + jj))),
-            );
+            acc0 = _mm256_fmadd_ps(lov, _mm256_loadu_ps(b.as_ptr().add(bo + jj)), acc0);
+            acc1 = _mm256_fmadd_ps(hiv, _mm256_loadu_ps(b.as_ptr().add(bo + 16 + jj)), acc1);
         }
     }
+    let acc = _mm256_add_ps(acc0, acc1);
     let lo = _mm256_castps256_ps128(acc);
     let hi = _mm256_extractf128_ps(acc, 1);
     hsum_ps_sse2(_mm_add_ps(lo, hi))
@@ -699,8 +691,8 @@ pub unsafe fn dot_q5_0_avx2(a: &[u8], b: &[f32]) -> f32 {
 pub fn dot_q5_0_dispatch(a: &[u8], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: gated by the runtime AVX2 check above.
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: gated by the runtime AVX2+FMA check above.
             return unsafe { dot_q5_0_avx2(a, b) };
         }
     }
@@ -1079,8 +1071,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn dot_q8_0_avx2_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") {
-            eprintln!("PH-203c: AVX2 absent on this host; skipping explicit avx2 check");
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            eprintln!("PH-203c: AVX2+FMA absent on this host; skipping explicit avx2 check");
             return;
         }
         let a = q8_blocks(5);
@@ -1231,7 +1223,7 @@ mod tests {
 
     #[test]
     fn dot_q4_0_avx2_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
             return;
         }
         let a = q4_blocks(4);
@@ -1248,7 +1240,7 @@ mod tests {
 
     #[test]
     fn dot_q5_0_avx2_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
             return;
         }
         let a = q5_blocks(4);
