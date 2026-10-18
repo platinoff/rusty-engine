@@ -156,14 +156,26 @@ pub fn chat_response(
                 .unwrap_or_default()
                 .len();
             let generated = (runner.bpe.encode(&text).map(|v| v.len()).unwrap_or(0)).max(1);
-            let json = format!(
-                r#"{{"id":"cmpl-0","object":"chat.completion","model":"rusty-engine","choices":[{{"index":0,"message":{{"role":"assistant","content":"{escaped}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{prompt_len},"completion_tokens":{generated},"total_tokens":{}}}"#,
-                prompt_len + generated
-            );
+            let json = chat_completion_body(&escaped, prompt_len, generated);
             crate::http::Response::json(200, json)
         }
         Err(e) => crate::http::Response::json(400, format!(r#"{{"error":"{}"}}"#, e.message)),
     }
+}
+
+/// OpenAI-shaped `chat.completion` body. `content` must already be JSON-escaped
+/// (see [`escape_json_text`]). Split out so the wire contract is unit-testable
+/// without a loaded model: a missing **root** `}` here produced invalid JSON that
+/// `curl` and the tokenizer gates accepted but the hub's `serde_json` rejected,
+/// surfacing as a `null` proxy reply end-to-end (PH-507).
+pub fn chat_completion_body(content: &str, prompt_len: usize, generated: usize) -> String {
+    let mut body = format!(
+        r#"{{"id":"cmpl-0","object":"chat.completion","model":"rusty-engine","choices":[{{"index":0,"message":{{"role":"assistant","content":"{content}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{prompt_len},"completion_tokens":{generated},"total_tokens":{total}"#,
+        total = prompt_len + generated
+    );
+    // Close the `usage` object and the root object.
+    body.push_str("}}");
+    body
 }
 
 /// PH-507: SSE variant of [`chat_response`] — the completion is emitted as one
@@ -220,5 +232,24 @@ mod tests {
         assert!(extract_message_content(j).starts_with('a'));
         assert_eq!(extract_message_content("{}"), "");
         assert_eq!(extract_message_content(r#"{"max_tokens":8}"#), "");
+    }
+
+    #[test]
+    fn chat_completion_body_is_valid_json_with_root_brace() {
+        // PH-507: the body must be a complete JSON object — curl tolerated the
+        // missing root `}` but the hub's `serde_json` did not (null proxy reply).
+        let body = chat_completion_body(" Paris.", 5, 8);
+        assert!(body.ends_with("}}"), "{body}");
+        assert!(crate::worker::parse_json(&body).is_ok(), "{body}");
+        assert!(body.contains("\"total_tokens\":13"), "{body}");
+        assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+        assert!(body.contains("\"content\":\" Paris.\""), "{body}");
+    }
+
+    #[test]
+    fn chat_completion_body_keeps_escaped_content_parseable() {
+        let content = escape_json_text("a \"q\" \\ c\nd");
+        let body = chat_completion_body(&content, 1, 2);
+        assert!(crate::worker::parse_json(&body).is_ok(), "{body}");
     }
 }

@@ -65,6 +65,21 @@ pub fn body_of(request: &str) -> &str {
     }
 }
 
+/// `Content-Length` value from a header block (case-insensitive; `0` when absent or
+/// unparsable). The serve loop uses it to read the whole request body — hyper/reqwest
+/// write the head and the body as separate segments, so stopping at `\r\n\r\n` would
+/// drop the body (PH-507).
+pub fn content_length(head: &str) -> usize {
+    for line in head.lines() {
+        if let Some((name, val)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                return val.trim().parse::<usize>().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
 /// A request "wants streaming" when its JSON body carries `"stream": true`.
 pub fn wants_stream(body: &str) -> bool {
     let b = body.replace(' ', "");
@@ -244,6 +259,20 @@ mod tests {
             Some(("POST", "/v1/chat/completions"))
         );
         assert!(parse_request_line("onlyone").is_none());
+    }
+
+    #[test]
+    fn content_length_is_case_insensitive_and_defaults_zero() {
+        assert_eq!(
+            content_length("POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 42\r\n\r\n"),
+            42
+        );
+        assert_eq!(
+            content_length("GET /x HTTP/1.1\r\ncontent-length: 7\r\n\r\n"),
+            7
+        );
+        assert_eq!(content_length("GET /x HTTP/1.1\r\nHost: h\r\n\r\n"), 0);
+        assert_eq!(content_length("garbage"), 0);
     }
 
     #[test]

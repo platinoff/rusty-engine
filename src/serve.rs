@@ -10,8 +10,11 @@ use std::net::{TcpListener, TcpStream};
 
 pub const PATH_MODELS: &str = "/v1/models";
 pub const PATH_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
-/// Cap on bytes read per request (headers only in the `PH-501a` slice).
-const MAX_REQUEST_BYTES: usize = 8 * 1024;
+/// Cap on bytes read per request (header + body). Prompts can be large, so this is
+/// generous; the loop still streams only what `Content-Length` declares.
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+/// Initial buffer; the loop grows it on demand up to [`MAX_REQUEST_BYTES`].
+const READ_CHUNK: usize = 16 * 1024;
 /// Generated-token cap when the request carries no usable `max_tokens`.
 const DEFAULT_MAX_NEW: usize = 8;
 /// Hard ceiling on `max_tokens` accepted from a client (guards a runaway request).
@@ -36,17 +39,31 @@ pub fn handle_conn(
     metrics: &mut crate::hub::Metrics,
     model: Option<&crate::textgen::TextRunner>,
 ) -> std::io::Result<()> {
-    let mut buf = vec![0u8; MAX_REQUEST_BYTES];
+    let mut buf = vec![0u8; READ_CHUNK];
     let mut filled = 0usize;
-    // Read until the header terminator or the cap, so the request line is always present.
+    let mut header_end: Option<usize> = None;
+    // Read the head, then keep reading until the whole `Content-Length` body has
+    // arrived (hyper/reqwest split head and body across segments — PH-507), or the cap.
     while filled < MAX_REQUEST_BYTES {
+        if filled == buf.len() {
+            buf.resize((buf.len() * 2).min(MAX_REQUEST_BYTES), 0);
+        }
         let n = stream.read(&mut buf[filled..])?;
         if n == 0 {
             break;
         }
         filled += n;
-        if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        if header_end.is_none() {
+            if let Some(i) = buf[..filled].windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(i + 4);
+            }
+        }
+        if let Some(he) = header_end {
+            let head = String::from_utf8_lossy(&buf[..he]);
+            let want = he.saturating_add(crate::http::content_length(&head));
+            if filled >= want.min(MAX_REQUEST_BYTES) {
+                break;
+            }
         }
     }
     let text = String::from_utf8_lossy(&buf[..filled]).into_owned();
@@ -77,7 +94,8 @@ pub fn handle_conn(
         }
     };
     stream.write_all(&resp.to_http_bytes())?;
-    stream.flush()
+    stream.flush()?;
+    Ok(())
 }
 
 /// Bind `addr` (typically `127.0.0.1:PORT`) and serve forever (stub completions). Blocks.
@@ -183,5 +201,38 @@ mod tests {
     fn routes_are_openai_shaped() {
         assert_eq!(PATH_MODELS, "/v1/models");
         assert_eq!(PATH_CHAT_COMPLETIONS, "/v1/chat/completions");
+    }
+
+    #[test]
+    fn reads_the_body_when_head_and_body_arrive_separately() {
+        // hyper/reqwest write the head, then the body — a reader that stops at the
+        // `\r\n\r\n` terminator would see an empty body (the PH-507 hub `null` bug).
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local_addr");
+        let th = std::thread::spawn(move || {
+            let mut m = crate::hub::Metrics::zero();
+            serve_one(&listener, &mut m, None).expect("serve_one");
+        });
+        let body = b"{\"model\":\"rusty-05\",\"stream\":true}";
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            PATH_CHAT_COMPLETIONS,
+            body.len()
+        );
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client.write_all(head.as_bytes()).expect("write head");
+        client.flush().expect("flush head");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        client.write_all(body).expect("write body");
+        client.flush().expect("flush body");
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).expect("read");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+        // `stream:true` is in the body only — SSE proves the body was fully read.
+        assert!(
+            resp.contains("Content-Type: text/event-stream\r\n"),
+            "{resp}"
+        );
+        th.join().expect("server thread");
     }
 }
