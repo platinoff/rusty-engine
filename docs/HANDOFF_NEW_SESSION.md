@@ -356,3 +356,40 @@ kernel32/psapi), Linux — resident-сторінки з `/proc/self/statm` × 40
 
 Gate: `cargo test` **198 green** (179 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen, +5 ignored),
 clippy 0, fmt ok. **24 локальних комітів**, без push (B11).
+
+### Продовження 10 — PH-203d: hot AVX2-ядра переведено на FMA
+
+Скалярні передумови: три найгарячіші `dot_*_avx2` робили `mul_ps` + `add_ps` в **один** акумулятор
+(довгий ланцюг залежності по `add`, latency ~4 цикли на кожен), а Q8_0 ще й збирав ваги через
+скалярний `[i32;8]`-цикл (`qs[jj+t] as i8 as i32`).
+
+Що змінено (`src/kernel.rs`):
+
+- **Q8_0**: замість скалярного гезеру — `_mm_loadl_epi64` + `_mm256_cvtepi8_epi32`; множення й
+  накопичення злито у `_mm256_fmadd_ps` у **два** акумулятори (jj та jj+8). Оскільки `d` стала на
+  блок (34 B), `d·(q·b)` складається коректно; FMA дає одне округлення замість двох.
+- **Q4_0 / Q5_0**: low/high половини розведено на два акумулятори (`acc0`/`acc1`), `mul`+`add`
+  замінено на `fmadd`, напр. `acc0 = _mm256_fmadd_ps(lov, loadu(b+bo+jj), acc0)`.
+- **Диспатч і явні parity-тести** гейтовано `avx2 && fma` (раніше лише `avx2`); FMA присутня на
+  кожному AVX2-хості з Haswell (2013). Q4_K/Q6_K ядра не чіпали (лишились `avx2`).
+
+Виміри (`benches/quant.rs`, 5 прогонів, best-of, dot 8192 елементів / matvec 896²):
+
+| kernel | було (dispatch) | стало | speedup vs scalar |
+|--------|-----------------|-------|-------------------|
+| dot_q8_0 | 6740 ns | **5185 ns** | 1.72× → **2.09×** |
+| dot_q4_0 | 5584 ns | 5348 ns | 2.31× → 2.41× |
+| dot_q5_0 | 6388 ns | 6124 ns | 2.14× → 2.30× |
+| matvec_q8_0 | 604 984 ns | **518 189 ns** | 1.77× → **2.06×** |
+
+`|Δ|` проти скаляра **без регресії** (q8_0: 1.34e-3 → **9.8e-4** — FMA точніший). Q8_0 — це LM-head
+(`output.weight`), тож виграш видно на живому шляху: decode `:8090` **2.27 → 2.68 tok/s**
+(Qwen2.5-0.5B Q4_K_M).
+
+Інфра-нотатки сеансу: живий `:8090` знову впав між сеансами — перезапуск робив через
+`Invoke-CimMethod Win32_Process Create` з `cmd.exe /c "cd … && target\release\rusty.exe serve …"`
+(короткий `bash -lc` під PowerShell дає job-kill після завершення tool-call; WMI+cmd переживає).
+Живий хаб `S:/rust/GSV/target/live/gsv-server.exe` (`:9999`) не чіпали.
+
+Gate: fmt 0, clippy `--all-targets -D warnings` 0, **198 тестів** green. **25 локальних комітів**
+(`c2102bb perf(kernel): AVX2+FMA fused dots for Q4_0/Q5_0/Q8_0 (PH-203d)`), без push (B11).
