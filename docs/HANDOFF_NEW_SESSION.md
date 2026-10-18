@@ -393,3 +393,31 @@ clippy 0, fmt ok. **24 локальних комітів**, без push (B11).
 
 Gate: fmt 0, clippy `--all-targets -D warnings` 0, **198 тестів** green. **25 локальних комітів**
 (`c2102bb perf(kernel): AVX2+FMA fused dots for Q4_0/Q5_0/Q8_0 (PH-203d)`), без push (B11).
+
+### Продовження 11 — PH-203e: проєкції паралеляться по рядках
+
+Двигун декодував на одному ядрі з 12 (Ryzen 5 5500U). Рядки `W[m×n] · x[n]` незалежні й кожен — та
+сама скалярна послідовність, тож їх можна роздати воркерам без зміни результату.
+
+- **`src/qmat.rs`**: `QMat::matvec` ділить `m` рядків, `QMat::matmul` ділить **рядки ваг**
+  (вихідні стовпці) — і збирає блоки назад у row-major `Out`. Поріг `PAR_MAC_MIN = 2¹⁸`;
+  воркерів дає `RUSTY_THREADS` (1–256) або `available_parallelism()`. Старі тіла —
+  `matvec_serial`/`matmul_serial` (fallback: F32, типи без fused-ядра, малі проєкції).
+- **`src/kernel.rs`**: `quant_row_bytes`, `quant_row_dot`, `matmul_dispatch` — щоб qmat не
+  дублював геометрію блоків по типах.
+- **Пастка, яку зловили виміром:** перша версія ділила `matmul` по вхідних рядках. `matmul_reuse`
+  де-квантизує блок один раз і переюзує на всі вхідні рядки — тому кожен воркер де-квантизував
+  **усю** матрицю, і prefill не прискорювався взагалі (186 с на 961 токен, як до змін). Після
+  поділу по рядках ваг: 321 токен 45.6 с → 24.7 с.
+- **Біт-у-біт:** `parallel_matvec_is_bit_identical_to_serial`,
+  `parallel_matmul_is_bit_identical_to_serial` (порівняння з `*_serial`).
+- **Замір:** prefill A/B `RUSTY_THREADS=1` 45.6 с vs `12` 24.7 с (**1.85×**); decode
+  2.68 → **4.2–5.1 tok/s** (розкид — сусідні GSV-сервіси тримають ~60% CPU). Стеля 1.85× —
+  це 6 фізичних ядер під навантаженням, не 12.
+- **Інфра:** живий `:8090` піднімається **без вікна**: `wscript.exe` (GUI-підсистема, без консолі)
+  → `cmd /c` з `sh.Run(cmd, 0, False)` (window style 0). Скрипти: `target/live/launch_serve.vbs`,
+  `spawn_wscript.ps1`, `spawn_threads.ps1` (читає `target/live/threads.txt` → `RUSTY_THREADS`).
+  WMI `Win32_ProcessStartup.CreateFlags` дає rc=21 на цій машині — не використовувати.
+
+Gate: fmt 0, clippy `--all-targets -D warnings` 0, **200 тестів** green. **28 локальних комітів**
+(`e2646a4` parallel + `6336afb` matmul weight-row fix), без push (B11).

@@ -131,6 +131,29 @@ Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker р�
 - **Далі:** NEON (`PH-203` arm64, все ще без aarch64-тулчейну) **або** `PH-501` (axum serve)
   **або** `PH-502` (справжній per-token SSE) / B6/B7.
 
+### Продовження 7 (2026-10-18, PH-203e — row-parallel matvec/matmul)
+
+- **`QMat::matvec`/`matmul`** тепер розбивають проєкцію по рядках на воркерів
+  (`std::thread::scope`), коли робота ≥ `PAR_MAC_MIN` (2¹⁸ MAC). Старі тіла збережено як
+  `matvec_serial`/`matmul_serial` (fallback для типів без fused-ядра і малих проєкцій).
+  Кількість воркерів — `RUSTY_THREADS` (1–256) або `available_parallelism()`.
+- **`src/kernel.rs`**: `quant_row_bytes(ggml_type, n)` (страйд рядка), `quant_row_dot(t, row, x)`
+  (один рядок), `matmul_dispatch(t, w, m, n, x, rows)`.
+- **Головна пастка (виправлено):** перша версія ділила `matmul` по **вхідних** рядках — і кожен
+  воркер де-квантизував усю матрицю (`matmul_reuse` кешує блок на всі вхідні рядки), тобто
+  prefill не вигравав. Правильно ділити по **рядках ваг** (вихідних стовпцях) і збирати блоки
+  назад у row-major `Out`. Після фіксу: prefill 45.6→24.7 с.
+- **Біт-у-біт:** кожен рядок виконує ту саму скалярну послідовність, тож результат не залежить
+  від кількості потоків — 2 нові тести `parallel_matvec_is_bit_identical_to_serial`,
+  `parallel_matmul_is_bit_identical_to_serial`.
+- A/B (321-tok, той самий бінарник/модель): prefill `RUSTY_THREADS=1` 45.6 с → `12` 24.7 с
+  (**1.85×**); decode 2.68 → **4.2–5.1 tok/s**. Стеля = Ryzen 5 5500U (6 фіз. ядер / 12 потоків)
+  під ~60% навантаженням інших GSV-сервісів.
+- Gate: fmt 0, clippy `--all-targets -D warnings` 0, **200 тестів** green. **28 локальних
+  комітів** (`e2646a4` + `6336afb`), без push (B11).
+- **Далі (perf):** сталий thread-pool замість `thread::scope` на кожну проєкцію (~120 spawnів/токен,
+  оцінно ~20% часу) — дасть ще ~1.2–1.3×.
+
 ## AUTO-DIRECTIVE (owner, 2026-10-15; оновлено 2026-10-17) — на наступне `agi`
 
 Наступного `agi`: **НЕ питати вибору бенду** — одразу брати з черги.

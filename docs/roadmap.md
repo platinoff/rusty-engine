@@ -68,7 +68,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B2 — Quantized kernels + SIMD  **`[~]` (PH-201 / PH-201+ / PH-201c / PH-201d / PH-204 / PH-202 / PH-203(x86+AVX2/FMA) / PH-205 done, 2026-10-18)**
+## Band B2 — Quantized kernels + SIMD  **`[~]` (PH-201 / PH-201+ / PH-201c / PH-201d / PH-204 / PH-202 / PH-203(x86+AVX2/FMA) / PH-203e / PH-205 done, 2026-10-18)**
 
 > Мета: швидкі ядра для квантів, x86 + arm64, feature-gated dispatch.
 > Скалярний **reference-оракул** для Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K + fused dot/gemv
@@ -85,6 +85,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-202 | **repack** у compute-friendly layout (contiguous scales + de-interleaved nibble planes) | `[x]` | `src/repack.rs` — `RepackedQ4_0 {d,lo,hi}` + `RepackedQ8_0 {d,v}` + `repack_q{4,5}_*` + `dot_repacked_q{4,5}_*` + `matvec_repacked_q4_0`; **exact** vs `dot_q4_0` / `dot_q8_0` / `matvec(dequant, x)` (5 unit) |
 | PH-203 | **SSE/AVX/NEON dispatch** (x86: SSE2 Q4_0+Q8_0, AVX2 Q4_0/Q5_0/Q8_0/Q4_K/Q6_K; NEON → далі) | `[~]` | `src/kernel.rs` — `dot_*_sse2` (Q4_0/Q8_0) + `dot_*_avx2` (Q4_0/Q5_0/Q8_0/Q4_K/Q6_K) (`core::arch`, `#[target_feature]`, `hsum_ps_sse2`) + `dot/matvec/matmul_*_dispatch` (AVX2→SSE2→scalar ladder, runtime `is_x86_feature_detected!`) + `qmat.rs` wired у forward; `#[cfg(x86_64)]` parity SSE2/AVX2==scalar; bench `PH-205` 1.8–5.3×. Лише NEON лишився |
 | PH-203d | **AVX2+FMA fused dots** Q4_0/Q5_0/Q8_0 (2 accumulators, `_mm256_fmadd_ps`, Q8_0 `_mm256_cvtepi8_epi32` gather) | `[x]` | `src/kernel.rs` — `dot_q4_0/q5_0/q8_0_avx2` переписано на fused `fmadd` + подвійний акумулятор; dispatch (і parity-тести) гейтовано `avx2 && fma` (FMA є на кожному AVX2-хості з Haswell). Bench: dot q8_0 1.72→2.09×, q4_0 2.31→2.41×, q5_0 2.14→2.30×; matvec q8_0 1.77→2.06×; \|Δ\| без регресії (q8_0 1.34e-3→9.8e-4). Live `:8090` decode 2.27→2.68 tok/s |
+| PH-203e | **row-parallel projections** (std `thread::scope`, `RUSTY_THREADS`, `PAR_MAC_MIN` 2¹⁸) | `[x]` | `src/qmat.rs` — `QMat::matvec`/`matmul` розбивають роботу по рядках на воркерів (`matvec_serial`/`matmul_serial` лишаються як fallback і для малих проєкцій); `matmul` ділиться по **рядках ваг** (інакше `matmul_reuse` де-квантизує всю матрицю на кожного воркера). `src/kernel.rs` — `quant_row_bytes`/`quant_row_dot`/`matmul_dispatch`. Результат біт-у-біт той самий (2 тести `*_is_bit_identical_to_serial`). A/B 321-tok: prefill 45.6→24.7 с (1.85×); decode 2.68→4.2–5.1 tok/s. Стеля боксу: Ryzen 5 5500U 6C/12T під ~60% чужим навантаженням |
 | PH-205 | bench vs scalar (std-only, no criterion) | `[x]` | `benches/quant.rs` (`harness=false`) — scalar vs `*_dispatch`, ns + speedup + \|Δ\| (SIMD==scalar до f32-округлення, \|Δ\|≤4e-3): dot q4_0 2.41×, q8_0 2.09×, q5_0 2.30×, q4_k 3.98×, q6_k 5.32×; matvec q4_0 2.38×, q8_0 2.06× (Qwen 896², best-of-5) |
 
 ---
