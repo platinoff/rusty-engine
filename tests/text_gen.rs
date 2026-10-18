@@ -203,6 +203,11 @@ fn text_pipeline_roundtrips_symbol_text() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Slice the HTTP response body (everything after the header terminator).
+fn http_body(resp: &str) -> &str {
+    resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+}
+
 #[test]
 fn serve_with_model_completes_over_the_wire() {
     use std::io::{Read, Write};
@@ -224,26 +229,61 @@ fn serve_with_model_completes_over_the_wire() {
         rusty_engine::serve::serve_one(&listener, &mut m, Some(&tr)).expect("serve_one+model");
     });
 
+    // Declare `Content-Length` so the serve loop reads the body via the header (PH-507),
+    // not just whatever happened to arrive in the first segment.
+    let req_body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        req_body.len()
+    );
     let mut client = TcpStream::connect(addr).expect("connect");
-    client
-        .write_all(
-            b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
-        )
-        .expect("write");
+    client.write_all(head.as_bytes()).expect("write head");
+    client.write_all(req_body.as_bytes()).expect("write body");
     client.flush().expect("flush");
     let mut resp = String::new();
     client.read_to_string(&mut resp).expect("read");
     th.join().expect("server thread");
 
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
-    assert!(resp.contains("chat.completion"));
-    // monotone synth model generates '~' (token 126) greedily after "hi"
-    assert!(
-        resp.contains("\"content\":\"~~~"),
-        "generated text present: {resp}"
+    // PH-507 regression: the body must be a *complete* JSON object. Substring checks alone
+    // let the missing-root-`}` bug through (curl tolerated it, the GSV hub's `serde_json`
+    // did not, surfacing as a null proxy reply) — parse the body strictly instead.
+    let body = http_body(&resp);
+    let json = rusty_engine::worker::parse_json(body)
+        .unwrap_or_else(|e| panic!("response body is not valid JSON: {e}\n{body}"));
+    assert_eq!(
+        json.get("object").and_then(|v| v.as_str()),
+        Some("chat.completion")
     );
-    assert!(resp.contains("\"finish_reason\":\"stop\""));
-    assert!(resp.contains("\"usage\""));
+    assert_eq!(
+        json.get("model").and_then(|v| v.as_str()),
+        Some("rusty-engine")
+    );
+    let content = json
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|v| v.as_str())
+        .expect("choices[0].message.content");
+    // monotone synth model generates '~' (token 126) greedily after "hi"
+    assert!(content.contains("~~~"), "generated text present: {content}");
+    let finish = json
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|v| v.as_str());
+    assert_eq!(finish, Some("stop"));
+    let total = json
+        .get("usage")
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(|v| v.as_u64());
+    assert!(
+        total.is_some_and(|t| t > 0),
+        "usage.total_tokens: {total:?}"
+    );
 
     let _ = std::fs::remove_file(path);
 }
@@ -271,11 +311,13 @@ fn serve_with_model_streams_sse_over_the_wire() {
     });
 
     let mut client = TcpStream::connect(addr).expect("connect");
-    client
-        .write_all(
-            b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}",
-        )
-        .expect("write");
+    let req_body = r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        req_body.len()
+    );
+    client.write_all(head.as_bytes()).expect("write head");
+    client.write_all(req_body.as_bytes()).expect("write body");
     client.flush().expect("flush");
     let mut resp = String::new();
     client.read_to_string(&mut resp).expect("read");
@@ -291,6 +333,21 @@ fn serve_with_model_streams_sse_over_the_wire() {
         resp.ends_with("data: [DONE]\n\n"),
         "terminated by DONE: {resp}"
     );
+    // PH-507 regression for the stream path too: every `data:` chunk is itself a complete
+    // JSON object (a missing root `}` here would break streaming consumers).
+    let mut chunks = 0;
+    for line in resp.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if payload == "[DONE]" {
+            continue;
+        }
+        rusty_engine::worker::parse_json(payload)
+            .unwrap_or_else(|e| panic!("SSE chunk is not valid JSON: {e}\n{payload}"));
+        chunks += 1;
+    }
+    assert!(chunks >= 2, "expected delta + finish chunks, got {chunks}");
 
     let _ = std::fs::remove_file(path);
 }
