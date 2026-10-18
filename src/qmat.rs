@@ -8,6 +8,33 @@
 
 use crate::core::{EngineError, Result};
 
+/// Minimum MACs (`m × n`, and `rows × m × n` for [`QMat::matmul`]) before a projection is
+/// split across worker threads — below this the thread spawn costs more than it saves.
+const PAR_MAC_MIN: usize = 1 << 18;
+
+/// Requested worker count: `RUSTY_THREADS` when set (1–256), else the machine's
+/// available parallelism; never zero.
+fn requested_threads() -> usize {
+    if let Ok(v) = std::env::var("RUSTY_THREADS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n >= 1 {
+                return n.min(256);
+            }
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Worker count for a projection of `work` MACs, capped to `rows` (each worker needs ≥1 row).
+fn workers_for(work: usize, rows: usize) -> usize {
+    if work < PAR_MAC_MIN || rows < 2 {
+        return 1;
+    }
+    requested_threads().min(rows).max(1)
+}
+
 /// A row-major `m × n` weight matrix: either f32, or its stored quant blocks.
 #[derive(Debug, Clone)]
 pub enum QMat {
@@ -56,7 +83,51 @@ impl QMat {
     }
 
     /// `W[m×n] · x[n] → out[m]`, fused per row (no full f32 materialization for quant).
+    ///
+    /// Rows are independent, so a large enough quant projection is split across worker
+    /// threads (`RUSTY_THREADS` / available parallelism). Each row runs the identical
+    /// scalar sequence, so results are bit-for-bit independent of the thread count.
     pub fn matvec(&self, x: &[f32]) -> Vec<f32> {
+        match self {
+            Self::F32 { .. } => self.matvec_serial(x),
+            Self::Quant {
+                ggml_type,
+                bytes,
+                m,
+                n,
+            } => {
+                let Some(rb) = crate::kernel::quant_row_bytes(*ggml_type, *n) else {
+                    return self.matvec_serial(x);
+                };
+                let threads = workers_for(m * n, *m);
+                if threads <= 1 {
+                    return self.matvec_serial(x);
+                }
+                let mut out = vec![0f32; *m];
+                let chunk = (*m).div_ceil(threads);
+                let t = *ggml_type;
+                std::thread::scope(|s| {
+                    for (ci, part) in out.chunks_mut(chunk).enumerate() {
+                        let base = ci * chunk;
+                        s.spawn(move || {
+                            for (i, o) in part.iter_mut().enumerate() {
+                                let r = base + i;
+                                *o = crate::kernel::quant_row_dot(
+                                    t,
+                                    &bytes[r * rb..(r + 1) * rb],
+                                    x,
+                                );
+                            }
+                        });
+                    }
+                });
+                out
+            }
+        }
+    }
+
+    /// Serial body of [`QMat::matvec`] (also the fallback for types without a fused kernel).
+    fn matvec_serial(&self, x: &[f32]) -> Vec<f32> {
         match self {
             Self::F32 { data, m, n } => crate::moe::matvec(data, *m, *n, x),
             Self::Quant {
@@ -84,8 +155,41 @@ impl QMat {
 
     /// Batched `W[m×n] · X[rows×n] → Out[rows×m]` for prefill. Quant formats swap each
     /// block's dequant out of the row loop (see `kernel::matmul_*`), so the int→float
-    /// conversions that dominate `matvec` are paid once instead of once per row.
+    /// conversions that dominate `matvec` are paid once instead of once per row. Input
+    /// rows are independent, so the batch is split across workers the same way.
     pub fn matmul(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        let (m, n) = (self.rows(), self.cols());
+        let threads = workers_for(rows.saturating_mul(m).saturating_mul(n), rows);
+        if threads <= 1 {
+            return self.matmul_serial(x, rows);
+        }
+        let (ggml_type, bytes) = match self {
+            Self::Quant {
+                ggml_type, bytes, ..
+            } => (*ggml_type, bytes.as_slice()),
+            Self::F32 { .. } => return self.matmul_serial(x, rows),
+        };
+        let Some(_rb) = crate::kernel::quant_row_bytes(ggml_type, n) else {
+            return self.matmul_serial(x, rows);
+        };
+        let chunk = rows.div_ceil(threads);
+        let mut out = vec![0f32; rows * m];
+        std::thread::scope(|s| {
+            for (ci, part) in out.chunks_mut(chunk * m).enumerate() {
+                let start = ci * chunk;
+                let cnt = part.len() / m;
+                let xs = &x[start * n..(start + cnt) * n];
+                s.spawn(move || {
+                    let got = crate::kernel::matmul_dispatch(ggml_type, bytes, m, n, xs, cnt);
+                    part.copy_from_slice(&got);
+                });
+            }
+        });
+        out
+    }
+
+    /// Serial body of [`QMat::matmul`].
+    fn matmul_serial(&self, x: &[f32], rows: usize) -> Vec<f32> {
         match self {
             Self::F32 { data, m, n } => {
                 let mut out = Vec::with_capacity(rows * m);
@@ -177,5 +281,37 @@ mod tests {
             .flat_map(|r| qm.matvec(&x[r * 4..(r + 1) * 4]))
             .collect();
         assert_eq!(got, want);
+    }
+
+    /// Q8_0 blocks (34 B: f16 scale = 1.0, then 32 `i8`) for a row-major `m × n`.
+    fn q8_blocks(m: usize, n: usize) -> Vec<u8> {
+        let nb = m * n / 32;
+        let mut a = vec![0u8; nb * 34];
+        for (bi, blk) in a.chunks_mut(34).enumerate() {
+            blk[0] = 0x00;
+            blk[1] = 0x3C; // f16 1.0 (LE)
+            for j in 0..32 {
+                blk[2 + j] = (((bi * 31 + j * 7) % 251) as i32 - 125) as i8 as u8;
+            }
+        }
+        a
+    }
+
+    /// The threaded path is row-independent, so it must be bit-identical to the serial body
+    /// (work crosses `PAR_MAC_MIN`, so `matvec`/`matmul` take the parallel branch).
+    #[test]
+    fn parallel_matvec_is_bit_identical_to_serial() {
+        let (m, n) = (64usize, 4096usize);
+        let qm = QMat::from_bytes(8, q8_blocks(m, n), m, n);
+        let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001 - 2.0).collect();
+        assert_eq!(qm.matvec(&x), qm.matvec_serial(&x));
+    }
+
+    #[test]
+    fn parallel_matmul_is_bit_identical_to_serial() {
+        let (m, n, rows) = (64usize, 4096usize, 8usize);
+        let qm = QMat::from_bytes(8, q8_blocks(m, n), m, n);
+        let x: Vec<f32> = (0..rows * n).map(|i| (i as f32) * 0.0007 - 1.5).collect();
+        assert_eq!(qm.matmul(&x, rows), qm.matmul_serial(&x, rows));
     }
 }

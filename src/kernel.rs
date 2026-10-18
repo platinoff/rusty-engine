@@ -919,6 +919,56 @@ pub fn matmul_q6_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize
     })
 }
 
+/// Bytes of one `n`-wide row for a fused kernel type, or `None` when the type has no
+/// fused kernel (caller falls back to dequant + f32 matvec).
+pub fn quant_row_bytes(ggml_type: u32, n: usize) -> Option<usize> {
+    match ggml_type {
+        2 => Some(n / 32 * 18),
+        6 => Some(n / 32 * 22),
+        8 => Some(n / 32 * 34),
+        12 => Some(n / 256 * 144),
+        13 => Some(n / 256 * 176),
+        14 => Some(n / 256 * 210),
+        _ => None,
+    }
+}
+
+/// `dot(row, x)` for a single stored quantized row — the body every `matvec_*` repeats.
+/// Lets a caller drive row-parallel matvec/matmul without re-deriving per-type geometry.
+/// Panics when `ggml_type` has no fused kernel (guard with [`quant_row_bytes`]).
+pub fn quant_row_dot(ggml_type: u32, row: &[u8], x: &[f32]) -> f32 {
+    match ggml_type {
+        2 => dot_q4_0_dispatch(row, x),
+        6 => dot_q5_0_dispatch(row, x),
+        8 => dot_q8_0_dispatch(row, x),
+        12 => dot_q4_k_dispatch(row, x),
+        13 => dot_q5_k(row, x),
+        14 => dot_q6_k_dispatch(row, x),
+        t => panic!("quant_row_dot: no fused kernel for ggml type {t}"),
+    }
+}
+
+/// Batched dispatch `W[m×n] · X[rows×n]` for a fused kernel type.
+/// Panics when `ggml_type` has no fused kernel (guard with [`quant_row_bytes`]).
+pub fn matmul_dispatch(
+    ggml_type: u32,
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+) -> Vec<f32> {
+    match ggml_type {
+        2 => matmul_q4_0_dispatch(w, m, n, x, rows),
+        6 => matmul_q5_0_dispatch(w, m, n, x, rows),
+        8 => matmul_q8_0_dispatch(w, m, n, x, rows),
+        12 => matmul_q4_k_dispatch(w, m, n, x, rows),
+        13 => matmul_q5_k(w, m, n, x, rows),
+        14 => matmul_q6_k_dispatch(w, m, n, x, rows),
+        t => panic!("matmul_dispatch: no fused kernel for ggml type {t}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
