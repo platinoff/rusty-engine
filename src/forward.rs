@@ -109,6 +109,89 @@ fn rotate_heads(row: &mut [f32], heads: usize, head_dim: usize, pos: usize, freq
     }
 }
 
+/// Sequence length from which prefill attention is split across heads (below it the pool's
+/// job hand-off costs more than the work).
+const PAR_SEQ_MIN: usize = 32;
+
+/// Causal attention for **one** head over already-rotated K/V rows: `seq × head_dim` output.
+///
+/// `k_rows`/`v_rows` are `pos_end × kv_dim` row-major, where `pos_end = pos_start + seq`
+/// (the KV cache or a prompt-local buffer — same layout).
+#[allow(clippy::too_many_arguments)]
+fn attention_head_ctx(
+    q_all: &[f32],
+    k_rows: &[f32],
+    v_rows: &[f32],
+    g: &Geometry,
+    seq: usize,
+    pos_start: usize,
+    h: usize,
+) -> Vec<f32> {
+    let hd = g.head_dim;
+    let kv_dim = g.n_kv_heads * hd;
+    let q_dim = g.n_heads * hd;
+    let kv_h = (h * g.n_kv_heads / g.n_heads) * hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut out = vec![0.0f32; seq * hd];
+    let mut probs = vec![0.0f32; pos_start + seq];
+    for i in 0..seq {
+        let pos = pos_start + i;
+        let qh = &q_all[i * q_dim + h * hd..i * q_dim + h * hd + hd];
+        // Causal scores over 0..=pos against the already-rotated keys.
+        for (j, p) in probs[..=pos].iter_mut().enumerate() {
+            let kh = &k_rows[j * kv_dim + kv_h..j * kv_dim + kv_h + hd];
+            *p = qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() * scale;
+        }
+        softmax_in_place(&mut probs[..=pos]);
+        let o = &mut out[i * hd..(i + 1) * hd];
+        for (j, p) in probs[..=pos].iter().enumerate() {
+            let vh = &v_rows[j * kv_dim + kv_h..j * kv_dim + kv_h + hd];
+            for (x, vd) in o.iter_mut().zip(vh) {
+                *x += *p * *vd;
+            }
+        }
+    }
+    out
+}
+
+/// Per-head prefill attention assembled back into a `seq × q_dim` buffer. Heads are
+/// independent (each owns its own `head_dim` column block), so long prompts fan them out on
+/// the shared pool; the per-element summation order is unchanged either way.
+fn attention_prefill(
+    q_all: &[f32],
+    k_rows: &[f32],
+    v_rows: &[f32],
+    g: &Geometry,
+    seq: usize,
+    pos_start: usize,
+) -> Vec<f32> {
+    let hd = g.head_dim;
+    let q_dim = g.n_heads * hd;
+    let mut ctx = vec![0.0f32; seq * q_dim];
+    let scatter = |ctx: &mut [f32], h: usize, c: &[f32]| {
+        for i in 0..seq {
+            let (a, b) = (i * q_dim + h * hd, (i * q_dim + h * hd) + hd);
+            ctx[a..b].copy_from_slice(&c[i * hd..(i + 1) * hd]);
+        }
+    };
+    if seq >= PAR_SEQ_MIN && g.n_heads > 1 {
+        let parts = std::sync::Mutex::new(Vec::<(usize, Vec<f32>)>::with_capacity(g.n_heads));
+        crate::pool::parallel_for(g.n_heads, |h| {
+            let c = attention_head_ctx(q_all, k_rows, v_rows, g, seq, pos_start, h);
+            parts.lock().unwrap().push((h, c));
+        });
+        for (h, c) in parts.into_inner().unwrap() {
+            scatter(&mut ctx, h, &c);
+        }
+    } else {
+        for h in 0..g.n_heads {
+            let c = attention_head_ctx(q_all, k_rows, v_rows, g, seq, pos_start, h);
+            scatter(&mut ctx, h, &c);
+        }
+    }
+    ctx
+}
+
 /// Single-token causal attention (a decode step attending over a 1-position span): each
 /// head's softmax over its own key is 1.0, so the context equals the (GQA-broadcast) value.
 /// Q/K are still RoPE-rotated and scored, exercising the real path.
@@ -299,30 +382,7 @@ pub fn block_forward_seq(
             &freqs,
         );
     }
-    let scale = 1.0 / (g.head_dim as f32).sqrt();
-    let mut attn_ctx = vec![0.0f32; seq * q_dim];
-    let mut probs = vec![0.0f32; seq];
-    for h in 0..g.n_heads {
-        let hs = h * g.head_dim;
-        let kv_h = (h * g.n_kv_heads / g.n_heads) * g.head_dim;
-        for i in 0..seq {
-            let qh = &q_all[i * q_dim + hs..i * q_dim + hs + g.head_dim];
-            // Causal scores over 0..=i against the already-rotated keys.
-            for (j, p) in probs[..=i].iter_mut().enumerate() {
-                let kh = &k_all[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
-                *p = qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() * scale;
-            }
-            softmax_in_place(&mut probs[..=i]);
-            let out = &mut attn_ctx[i * q_dim + hs..i * q_dim + hs + g.head_dim];
-            out.fill(0.0);
-            for (j, p) in probs[..=i].iter().enumerate() {
-                let vh = &v_all[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
-                for (o, vd) in out.iter_mut().zip(vh) {
-                    *o += *p * *vd;
-                }
-            }
-        }
-    }
+    let attn_ctx = attention_prefill(&q_all, &k_all, &v_all, g, seq, pos_start);
     // Output projection (batched) + residual.
     let o_all = w.o.matmul(&attn_ctx, seq);
     let mut y = vec![0.0f32; seq * g.d_model];
@@ -408,31 +468,7 @@ pub fn block_forward_prefill_cached(
     cache.k.extend_from_slice(&k_all);
     cache.v.extend_from_slice(&v_all);
 
-    let scale = 1.0 / (g.head_dim as f32).sqrt();
-    let pos_end = pos_start + seq;
-    let mut attn_ctx = vec![0.0f32; seq * q_dim];
-    let mut probs = vec![0.0f32; pos_end];
-    for h in 0..g.n_heads {
-        let hs = h * g.head_dim;
-        let kv_h = (h * g.n_kv_heads / g.n_heads) * g.head_dim;
-        for i in 0..seq {
-            let pos = pos_start + i;
-            let qh = &q_all[i * q_dim + hs..i * q_dim + hs + g.head_dim];
-            for (j, p) in probs[..=pos].iter_mut().enumerate() {
-                let kh = &cache.k[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
-                *p = qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() * scale;
-            }
-            softmax_in_place(&mut probs[..=pos]);
-            let out = &mut attn_ctx[i * q_dim + hs..i * q_dim + hs + g.head_dim];
-            out.fill(0.0);
-            for (j, p) in probs[..=pos].iter().enumerate() {
-                let vh = &cache.v[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
-                for (o, vd) in out.iter_mut().zip(vh) {
-                    *o += *p * *vd;
-                }
-            }
-        }
-    }
+    let attn_ctx = attention_prefill(&q_all, &cache.k, &cache.v, g, seq, pos_start);
     let o_all = w.o.matmul(&attn_ctx, seq);
     let mut y = vec![0.0f32; seq * g.d_model];
     for i in 0..seq * g.d_model {
