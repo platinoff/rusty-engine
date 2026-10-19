@@ -453,3 +453,32 @@ spawn+join (секція в `benches/quant.rs`), а проєкцій на ток
 
 Gate: fmt 0, clippy `--all-targets -D warnings` 0, **203 тести** green. **30 локальних комітів**
 (`72b570a perf(pool): persistent worker pool for parallel projections (PH-203f)`), без push (B11).
+
+### Продовження 13 — PH-203g: RoPE раз на позицію, KV зберігає повернуті ключі
+
+Prefill стояв на 25 с для 321 токена навіть після того, як matmul став 4.08× швидшим. Причина
+була не в attention-математиці, а в RoPE: `block_forward_prefill_cached` викликав `rope()` на
+кожну пару (query, key) — ~723k разів, — і кожен виклик рахував `powf` **на елемент** плюс
+алокував `Vec`. Decode страждав тим самим, переобертаючи кожен кешований ключ на кожну голову.
+
+- **`src/infer.rs`**: `rope_freqs(d, base)` — таблиця частот один раз на модель;
+  `rope_in_place(head, pos, freqs)`; `rope()` тепер обгортка над ними (f32-результат той самий).
+- **`src/forward.rs`**: `LayerKv` зберігає **вже повернуті** ключі. Контракт змінено з «raw,
+  rotate on read» на «rotated, read as-is»; оновлено обидва письменники
+  (`attention_forward_cached`, `block_forward_prefill_cached`) і єдиного читача. Prefill
+  повертає цілі Q/K-рядки раз на позицію, а не раз на голову на query; один scratch-буфер для
+  scores/probs замість `Vec` на кожен query; V-накопичення `for j { for d }` (порядок сум на
+  елемент збережено, внутрішній цикл суміжний).
+- **`src/moe.rs`**: `softmax_in_place` (та сама послідовність операцій), `softmax` кличе його.
+- **Пастка:** при переписуванні `block_forward_seq` загубився `add_bias_rows(&mut v_all,
+  v_bias)` — усі швидкі тести були зелені, а зловив це `PH-405` fingerprint
+  (`cargo test --release -- --ignored`). **Висновок: після будь-якої зміни в forward завжди
+  ганяти `--ignored`**, не лише `cargo test`.
+- **Замір:** prefill 321 tok 25.5 → **5.89 s** (4.3×), 961 tok 190.9 → **29.1 s** (6.6×);
+  decode 7.4 → **10.35 tok/s** (накопичувально 2.27 → 10.35 = 4.6×).
+- **Що лишилось у prefill:** matmul + послідовний прохід по головах. Кандидати:
+  head-parallel attention через `pool::parallel_for`; окремо — q8_0-ядро (серial matvec 896²
+  = 0.55 ms ≈ 1.5 GMAC/s, підозріло мало для AVX2).
+
+Gate: fmt 0, clippy `--all-targets -D warnings` 0, **203 тести** green (+ усі `--ignored`).
+**32 локальні коміти** (`5f1641b`), без push (B11).

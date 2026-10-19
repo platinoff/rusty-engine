@@ -338,3 +338,32 @@ subagent-ах. Не тягну весь llama.cpp/vLLM у вікно за раз
 Global-first (`S:/rust/GSV/AGENTS.md`); MSYS2 bash; ratio 95–100%; Rust-MoE-ядро (не лінкуємо
 C++); Docker-only-Win/Linux + Android-no-Docker; GSV hub = master supervisor; dry-run default;
 push тільки B11.
+
+### Продовження 9 (2026-10-18, PH-203g — RoPE раз на позицію + повернутий KV)
+
+- **Знайшли справжнє вузьке місце prefill:** `block_forward_prefill_cached` кликав `rope()`
+  на кожну пару (query, key) — ~723k разів на 321 токен, — а `rope()` сам рахує `powf` **на
+  кожен елемент** і алокує `Vec`. Це і були ті ~19 з 25 секунд, а не attention-математика.
+- **`infer::rope_freqs(d, base)`** — таблиця `base^(-2i/d)` один раз на модель;
+  `rope_in_place` крутить голову з нею; `rope()` лишився обгорткою (той самий f32-результат).
+- **KV-кеш тепер зберігає вже повернуті ключі** (був контракт «raw, rotate on read»). Це
+  прибирає з decode повторне обертання кожного кешованого ключа на кожну голову на кожен
+  токен. Оновлено обидва письменники (`attention_forward_cached`,
+  `block_forward_prefill_cached`) і єдиного читача; еквівалентність тримає
+  `block_forward_cached_matches_seq_over_prefix`.
+- **Prefill attention:** Q/K-рядки повертаються цілком раз на позицію (а не раз на голову на
+  query), один scratch для scores/probs замість `Vec` на кожен query. V-накопичення
+  переставлено на `for j { for d }` — порядок сум на елемент той самий (j зростає), але
+  внутрішній цикл суміжний → векторизується.
+- **Gates:** оракул llama-rs (55/12/48) і `PH-405` greedy fingerprint (re-prefill **і**
+  incremental) проходять без змін. Fingerprint зловив реальний баг у середині зрізу —
+  загублений `add_bias_rows(v_all, v_bias)` у `block_forward_seq` (не в тому файлі, який я
+  правив останнім, тому «на око» не видно).
+- **Замір (свіжий процес, 12 потоків):** prefill 321 tok **25.5 → 5.89 s** (4.3×),
+  961 tok **190.9 → 29.1 s** (6.6×); decode **7.4 → 10.35 tok/s**. Накопичувально з початку
+  сесії: decode 2.27 → 10.35 (**4.6×**), prefill 45.6 → 5.9 s (**7.7×** на 321 токені).
+- Gate: fmt 0, clippy `--all-targets -D warnings` 0, **203 тести** green (+ `--ignored`:
+  dense_gen, 3× moe_parity, numeric_parity). **32 локальні коміти** (`5f1641b`), без push.
+- **Далі:** (а) паралелити attention по головах через `pool::parallel_for` (14 голів,
+  залишок prefill), (б) q8_0-ядро: seril matvec 896² = 0.55 ms ≈ 1.5 GMAC/s — значно нижче
+  очікуваного для AVX2, схоже на вузьке місце в конвертації i8→f32.
