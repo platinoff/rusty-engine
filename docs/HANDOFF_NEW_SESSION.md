@@ -482,3 +482,25 @@ Prefill стояв на 25 с для 321 токена навіть після т
 
 Gate: fmt 0, clippy `--all-targets -D warnings` 0, **203 тести** green (+ усі `--ignored`).
 **32 локальні коміти** (`5f1641b`), без push (B11).
+
+### Продовження 14 — PH-203h: head-parallel prefill attention
+
+- **`src/forward.rs`**: `attention_head_ctx(q_all, k_rows, v_rows, g, seq, pos_start, h)` —
+  єдиний per-head кернел. Його використовують **обидва** prefill-шляхи: `block_forward_seq`
+  (prompt-local K/V) і `block_forward_prefill_cached` (KV-кеш), бо layout однаковий
+  (`pos_end × kv_dim`, рядки вже повернуті RoPE). Два дубльовані inline-цикли прибрано.
+- **`attention_prefill(...)`** збирає голови в `seq × q_dim`; для `seq >= PAR_SEQ_MIN = 32`
+  роздає їх через `pool::parallel_for`, нижче — серially (hand-off у пул дорожчий за роботу).
+  Голови пишуть у власні `head_dim`-блоки, тому біт-у-біт збіг з серial збережено.
+- **Замір:** prefill 961 tok 29.1 → **23.5 s** (1.24×; від початку сесії 190.9 s = 8.1×),
+  321 tok 5.89 → 5.56 s; decode без змін (10.4–10.9 tok/s).
+- **Підсумок перф-серії за сесію:** decode 2.27 → **10.9 tok/s** (4.8×), prefill 961 tok
+  190.9 → **23.5 s** (8.1×). Коміти: `c2102bb` FMA, `e2646a4`/`6336afb` row-parallel,
+  `72b570a` pool, `5f1641b` RoPE/KV, `fecffa1` head-parallel.
+- **Що лишилось у prefill:** matmul (17 GMAC/s). Найбільший резерв — q8_0-ядро:
+  serial matvec 896² ≈ 0.55 ms ≈ 1.5 GMAC/s, що мало для AVX2 (конвертація i8→f32, немає
+  int8-множення). Це змінює числову схему → окремий зріз з оракулом і `RUSTY_CAPTURE_GOLDEN`
+  за потреби.
+
+Gate: fmt 0, clippy `--all-targets -D warnings` 0, **203 тести** green + усі `--ignored`.
+**34 локальні коміти** (`fecffa1`), без push (B11).

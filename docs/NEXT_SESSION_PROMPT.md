@@ -367,3 +367,22 @@ push тільки B11.
 - **Далі:** (а) паралелити attention по головах через `pool::parallel_for` (14 голів,
   залишок prefill), (б) q8_0-ядро: seril matvec 896² = 0.55 ms ≈ 1.5 GMAC/s — значно нижче
   очікуваного для AVX2, схоже на вузьке місце в конвертації i8→f32.
+
+### Продовження 10 (2026-10-18, PH-203h — head-parallel prefill attention)
+
+- Після `PH-203g` у prefill лишився **послідовний цикл по головах**. Голови незалежні й
+  пишуть у власні `head_dim`-блоки, тому їх можна роздати наявному пулу без зміни результату.
+- **`src/forward.rs`**: `attention_head_ctx(...)` — один per-head кернел; його ж
+  використовують обидва prefill-шляхи (`block_forward_seq` з prompt-local K/V і
+  `block_forward_prefill_cached` з KV-кешем), бо layout однаковий (`pos_end × kv_dim`).
+  `attention_prefill(...)` збирає голови в `seq × q_dim`; паралельно — від
+  `PAR_SEQ_MIN = 32` токенів (нижче hand-off у пул дорожчий за роботу).
+- Два дубльовані inline-цикли attention видалено; числовий порядок сум на елемент не змінено.
+- **Замір:** prefill 961 tok 29.1 → **23.5 s** (1.24×; від початку сесії 190.9 s = **8.1×**),
+  321 tok 5.89 → 5.56 s; decode без змін (10.4–10.9 tok/s).
+- Gate: fmt 0, clippy `-D warnings` 0, **203 тести** green + усі `--ignored` (dense_gen,
+  3× moe_parity, numeric_parity). **34 локальні коміти** (`fecffa1`), без push.
+- **Далі:** залишок prefill — сам matmul (17 GMAC/s). Великий резерв: q8_0-ядро
+  (serial matvec 896² ≈ 0.55 ms ≈ 1.5 GMAC/s — підозріло мало для AVX2; ймовірно конвертація
+  i8→f32 і відсутність int8-множення). Це вже зміна числової схеми, тому окремий зріз з
+  оракулом.
