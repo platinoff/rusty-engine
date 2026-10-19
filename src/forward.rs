@@ -7,8 +7,8 @@
 //! known greedy token). Real Qwen numeric parity vs llama.cpp is `PH-405` (needs a
 //! reference + tensor-layout confirmation); this slice proves the *plumbing* composes.
 
-use crate::infer::{gqa_repeat_kv, rmsnorm, rope};
-use crate::moe::softmax;
+use crate::infer::{gqa_repeat_kv, rmsnorm, rope_freqs, rope_in_place};
+use crate::moe::{softmax, softmax_in_place};
 use crate::qmat::QMat;
 
 /// Model geometry a block needs (dimensions + RoPE/norm knobs).
@@ -102,22 +102,35 @@ fn ffn_forward(x: &[f32], gate: &QMat, up: &QMat, down: &QMat) -> Vec<f32> {
     down.matvec(&a)
 }
 
+/// Rotate every head of a `heads × head_dim` row in place at absolute position `pos`.
+fn rotate_heads(row: &mut [f32], heads: usize, head_dim: usize, pos: usize, freqs: &[f32]) {
+    for h in 0..heads {
+        rope_in_place(&mut row[h * head_dim..(h + 1) * head_dim], pos, freqs);
+    }
+}
+
 /// Single-token causal attention (a decode step attending over a 1-position span): each
 /// head's softmax over its own key is 1.0, so the context equals the (GQA-broadcast) value.
 /// Q/K are still RoPE-rotated and scored, exercising the real path.
 fn attention_decode(x_norm: &[f32], w: &BlockWeights, g: &Geometry, pos: usize) -> Vec<f32> {
-    let q = add_bias(w.q.matvec(x_norm), &w.q_bias);
-    let k = add_bias(w.k.matvec(x_norm), &w.k_bias);
+    let freqs = rope_freqs(g.head_dim, g.rope_freq_base);
+    let mut q = add_bias(w.q.matvec(x_norm), &w.q_bias);
+    let mut k = add_bias(w.k.matvec(x_norm), &w.k_bias);
     let v = add_bias(w.v.matvec(x_norm), &w.v_bias);
+    rotate_heads(&mut q, g.n_heads, g.head_dim, pos, &freqs);
+    rotate_heads(&mut k, g.n_kv_heads, g.head_dim, pos, &freqs);
     let v_exp = gqa_repeat_kv(&v, 1, g.n_kv_heads, g.n_heads, g.head_dim);
     let scale = 1.0 / (g.head_dim as f32).sqrt();
     let mut ctx = vec![0.0f32; g.n_heads * g.head_dim];
     for h in 0..g.n_heads {
         let hs = h * g.head_dim;
-        let qh = rope(&q[hs..hs + g.head_dim], pos, g.rope_freq_base);
         let kh_src = (h * g.n_kv_heads / g.n_heads) * g.head_dim;
-        let kh = rope(&k[kh_src..kh_src + g.head_dim], pos, g.rope_freq_base);
-        let score = qh.iter().zip(&kh).map(|(a, b)| a * b).sum::<f32>() * scale;
+        let score = q[hs..hs + g.head_dim]
+            .iter()
+            .zip(&k[kh_src..kh_src + g.head_dim])
+            .map(|(a, b)| a * b)
+            .sum::<f32>()
+            * scale;
         // softmax over a single position is exactly [1.0], but compute it for the real path.
         let weight = softmax(&[score])[0];
         for (dst, src) in ctx[hs..hs + g.head_dim]
@@ -152,6 +165,9 @@ pub fn logits_from_hidden(x: &[f32], out_w: &QMat, g: &Geometry, n_vocab: usize)
 }
 
 /// Per-layer K/V cache (row-major `seq × kv_dim`), appended one position per decode step.
+/// Keys are stored **already RoPE-rotated** at their absolute position, so the attention
+/// loops below never re-rotate a cached key (they used to re-rotate every key once per head
+/// per token, which dominated decode at long contexts).
 /// This is the incremental-decoding substrate for `PH-307` (the paged version lives in
 /// `crate::infer::PagedKvCache`; a dense linear buffer is enough for the shape gate).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -161,8 +177,9 @@ pub struct LayerKv {
 }
 
 /// Head-only causal attention over the KV cache (no FFN, no residual): rmsnorm(`x`) → q/k/v
-/// → append K/V to `cache` → head-major causal attention over `0..=pos` → o-projection.
-/// Extracted so `block_forward_cached` and the MoE block (`PH-403b`) share one attention core.
+/// → rotate Q/K → append rotated K/V to `cache` → head-major causal attention over `0..=pos`
+/// → o-projection. Extracted so `block_forward_cached` and the MoE block (`PH-403b`) share
+/// one attention core.
 #[allow(clippy::needless_range_loop)]
 pub fn attention_forward_cached(
     x: &[f32],
@@ -174,33 +191,34 @@ pub fn attention_forward_cached(
     assert_eq!(x.len(), g.d_model, "attention_forward_cached: hidden width");
     let kv_dim = g.n_kv_heads * g.head_dim;
     let q_dim = g.n_heads * g.head_dim;
+    let freqs = rope_freqs(g.head_dim, g.rope_freq_base);
     let n = rmsnorm(x, &w.attn_norm, g.rms_eps);
-    let q = add_bias(w.q.matvec(&n), &w.q_bias);
-    let k = add_bias(w.k.matvec(&n), &w.k_bias);
+    let mut q = add_bias(w.q.matvec(&n), &w.q_bias);
+    let mut k = add_bias(w.k.matvec(&n), &w.k_bias);
     let v = add_bias(w.v.matvec(&n), &w.v_bias);
+    rotate_heads(&mut q, g.n_heads, g.head_dim, pos, &freqs);
+    rotate_heads(&mut k, g.n_kv_heads, g.head_dim, pos, &freqs);
     cache.k.extend_from_slice(&k);
     cache.v.extend_from_slice(&v);
     let scale = 1.0 / (g.head_dim as f32).sqrt();
     let mut ctx = vec![0.0f32; q_dim];
+    let mut probs = vec![0.0f32; pos + 1];
     for h in 0..g.n_heads {
         let hs = h * g.head_dim;
         let kv_h = (h * g.n_kv_heads / g.n_heads) * g.head_dim;
-        let q_r = rope(&q[hs..hs + g.head_dim], pos, g.rope_freq_base);
-        let probs = softmax(
-            &(0..=pos)
-                .map(|j| {
-                    let k_raw = &cache.k[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
-                    let k_r = rope(k_raw, j, g.rope_freq_base);
-                    q_r.iter().zip(&k_r).map(|(a, b)| a * b).sum::<f32>() * scale
-                })
-                .collect::<Vec<f32>>(),
-        );
-        for d in 0..g.head_dim {
-            let mut acc = 0.0f32;
-            for j in 0..=pos {
-                acc += probs[j] * cache.v[j * kv_dim + kv_h + d];
+        let qh = &q[hs..hs + g.head_dim];
+        for (j, p) in probs.iter_mut().enumerate() {
+            let kh = &cache.k[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
+            *p = qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() * scale;
+        }
+        softmax_in_place(&mut probs);
+        let out = &mut ctx[hs..hs + g.head_dim];
+        out.fill(0.0);
+        for (j, p) in probs.iter().enumerate() {
+            let vh = &cache.v[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
+            for (o, vd) in out.iter_mut().zip(vh) {
+                *o += *p * *vd;
             }
-            ctx[hs + d] = acc;
         }
     }
     w.o.matvec(&ctx)
@@ -263,31 +281,45 @@ pub fn block_forward_seq(
     add_bias_rows(&mut q_all, &w.q_bias);
     add_bias_rows(&mut k_all, &w.k_bias);
     add_bias_rows(&mut v_all, &w.v_bias);
+    let freqs = rope_freqs(g.head_dim, g.rope_freq_base);
+    for i in 0..seq {
+        let pos = pos_start + i;
+        rotate_heads(
+            &mut q_all[i * q_dim..(i + 1) * q_dim],
+            g.n_heads,
+            g.head_dim,
+            pos,
+            &freqs,
+        );
+        rotate_heads(
+            &mut k_all[i * kv_dim..(i + 1) * kv_dim],
+            g.n_kv_heads,
+            g.head_dim,
+            pos,
+            &freqs,
+        );
+    }
     let scale = 1.0 / (g.head_dim as f32).sqrt();
     let mut attn_ctx = vec![0.0f32; seq * q_dim];
+    let mut probs = vec![0.0f32; seq];
     for h in 0..g.n_heads {
         let hs = h * g.head_dim;
         let kv_h = (h * g.n_kv_heads / g.n_heads) * g.head_dim;
-        // Pre-rotate K once per head; V needs no rotation.
-        let mut k_rot: Vec<Vec<f32>> = Vec::with_capacity(seq);
-        for j in 0..seq {
-            let k_raw = &k_all[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
-            k_rot.push(rope(k_raw, pos_start + j, g.rope_freq_base));
-        }
         for i in 0..seq {
-            let q_raw = &q_all[i * q_dim + hs..i * q_dim + hs + g.head_dim];
-            let q_r = rope(q_raw, pos_start + i, g.rope_freq_base);
-            // Causal scores over 0..=i, softmax, then weighted sum of v-rows.
-            let scores: Vec<f32> = (0..=i)
-                .map(|j| q_r.iter().zip(&k_rot[j]).map(|(a, b)| a * b).sum::<f32>() * scale)
-                .collect();
-            let probs = softmax(&scores);
-            for d in 0..g.head_dim {
-                let mut acc = 0.0f32;
-                for (j, p) in probs.iter().enumerate() {
-                    acc += *p * v_all[j * kv_dim + kv_h + d];
+            let qh = &q_all[i * q_dim + hs..i * q_dim + hs + g.head_dim];
+            // Causal scores over 0..=i against the already-rotated keys.
+            for (j, p) in probs[..=i].iter_mut().enumerate() {
+                let kh = &k_all[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
+                *p = qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() * scale;
+            }
+            softmax_in_place(&mut probs[..=i]);
+            let out = &mut attn_ctx[i * q_dim + hs..i * q_dim + hs + g.head_dim];
+            out.fill(0.0);
+            for (j, p) in probs[..=i].iter().enumerate() {
+                let vh = &v_all[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
+                for (o, vd) in out.iter_mut().zip(vh) {
+                    *o += *p * *vd;
                 }
-                attn_ctx[i * q_dim + hs + d] = acc;
             }
         }
     }
@@ -316,7 +348,8 @@ pub fn block_forward_seq(
 
 /// Batched prefill that also fills the KV cache: one pass over the `seq`-row prompt with
 /// the same attention as [`block_forward_seq`], but every row's K/V is appended to
-/// `cache` (raw — RoPE is applied on read, matching [`attention_forward_cached`]). This
+/// `cache` **already RoPE-rotated**, matching [`attention_forward_cached`]'s on-read-free
+/// contract. This
 /// turns an O(`seq`) sequence of single-token decode steps into one batched pass, so the
 /// quant dequant cost is paid once instead of `seq×`. Returns the `seq × d_model` hidden
 /// state; the caller keeps the last row for logits. `cache` must already hold `pos_start`
@@ -354,35 +387,49 @@ pub fn block_forward_prefill_cached(
     add_bias_rows(&mut q_all, &w.q_bias);
     add_bias_rows(&mut k_all, &w.k_bias);
     add_bias_rows(&mut v_all, &w.v_bias);
+    let freqs = rope_freqs(g.head_dim, g.rope_freq_base);
+    for i in 0..seq {
+        let pos = pos_start + i;
+        rotate_heads(
+            &mut q_all[i * q_dim..(i + 1) * q_dim],
+            g.n_heads,
+            g.head_dim,
+            pos,
+            &freqs,
+        );
+        rotate_heads(
+            &mut k_all[i * kv_dim..(i + 1) * kv_dim],
+            g.n_kv_heads,
+            g.head_dim,
+            pos,
+            &freqs,
+        );
+    }
     cache.k.extend_from_slice(&k_all);
     cache.v.extend_from_slice(&v_all);
 
     let scale = 1.0 / (g.head_dim as f32).sqrt();
+    let pos_end = pos_start + seq;
     let mut attn_ctx = vec![0.0f32; seq * q_dim];
+    let mut probs = vec![0.0f32; pos_end];
     for h in 0..g.n_heads {
         let hs = h * g.head_dim;
         let kv_h = (h * g.n_kv_heads / g.n_heads) * g.head_dim;
         for i in 0..seq {
             let pos = pos_start + i;
-            let q_r = rope(
-                &q_all[i * q_dim + hs..i * q_dim + hs + g.head_dim],
-                pos,
-                g.rope_freq_base,
-            );
-            let scores: Vec<f32> = (0..=pos)
-                .map(|j| {
-                    let k_raw = &cache.k[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
-                    let k_r = rope(k_raw, j, g.rope_freq_base);
-                    q_r.iter().zip(&k_r).map(|(a, b)| a * b).sum::<f32>() * scale
-                })
-                .collect();
-            let probs = softmax(&scores);
-            for d in 0..g.head_dim {
-                let mut acc = 0.0f32;
-                for j in 0..=pos {
-                    acc += probs[j] * cache.v[j * kv_dim + kv_h + d];
+            let qh = &q_all[i * q_dim + hs..i * q_dim + hs + g.head_dim];
+            for (j, p) in probs[..=pos].iter_mut().enumerate() {
+                let kh = &cache.k[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
+                *p = qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() * scale;
+            }
+            softmax_in_place(&mut probs[..=pos]);
+            let out = &mut attn_ctx[i * q_dim + hs..i * q_dim + hs + g.head_dim];
+            out.fill(0.0);
+            for (j, p) in probs[..=pos].iter().enumerate() {
+                let vh = &cache.v[j * kv_dim + kv_h..j * kv_dim + kv_h + g.head_dim];
+                for (o, vd) in out.iter_mut().zip(vh) {
+                    *o += *p * *vd;
                 }
-                attn_ctx[i * q_dim + hs + d] = acc;
             }
         }
     }

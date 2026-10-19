@@ -52,13 +52,23 @@ pub fn silu(x: f32) -> f32 {
 
 /// Numerically stable softmax.
 pub fn softmax(scores: &[f32]) -> Vec<f32> {
-    let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = scores.iter().map(|x| (x - max).exp()).collect();
-    let sum: f32 = exps.iter().sum();
-    if sum == 0.0 {
-        return exps;
+    let mut out = scores.to_vec();
+    softmax_in_place(&mut out);
+    out
+}
+
+/// Numerically stable softmax over a scratch buffer (attention reuses one per layer).
+pub fn softmax_in_place(x: &mut [f32]) {
+    let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    for v in x.iter_mut() {
+        *v = (*v - max).exp();
     }
-    exps.iter().map(|e| e / sum).collect()
+    let sum: f32 = x.iter().sum();
+    if sum != 0.0 {
+        for v in x.iter_mut() {
+            *v /= sum;
+        }
+    }
 }
 
 /// Keep the `k` highest-scoring experts, renormalized (softmax) so weights sum to 1.
