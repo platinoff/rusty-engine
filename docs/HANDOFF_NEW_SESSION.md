@@ -525,3 +525,27 @@ Gate: fmt 0, clippy `--all-targets -D warnings` 0, **203 тести** green + у
   down — піднято так само через новий `telenetis/target/live/launch_live.vbs` (wscript, без консолі);
   `:9800/health` = 0.2.0. keep-live після цього: gsv + telenetis + llama_rs + rusty up, omniroute
   policy-down. **Не запускати `cmd.exe /c` через WMI напряму** — з'являється консоль.
+
+### Продовження 16 — 2026-10-21: PH-203i — f16-widening + q8_0 integer-dot probe
+
+- **Справжній ботлнек «підозріло низьких» 1.5 GMAC/s знайдено:** `quant::f16_to_f32` рахував
+  через `f64` + `powi` на **кожен блок** (32 значення для q8_0, 256 для K-quant). Замінено на
+  бітове розширення (`sign/exp/frac → f32::from_bits`); subnormal/Inf/NaN збережено, тест
+  `f16_bit_exact_against_f64_reference` перевіряє всі 65 536 `u16`. Числова схема **не змінилась**:
+  `cargo test --release -- --ignored` (dense_real, 3× moe_parity, numeric_parity) зелений без
+  `RUSTY_CAPTURE_GOLDEN`.
+- **Бенч (`cargo bench --bench quant`, release):** dot_q8_0 5.34 → **0.64 µs** (9.55×), matvec 896²
+  527 → **68.5 µs = 11.8 GMAC/s**; dot_q4_0 2.03×→9.06×, dot_q5_0 2.48×→5.38×, q4_k 3.92×→7.63×,
+  q6_k 5.36×→8.15×; matvec q4_0 dispatch 8.60×; QMat prefill matmul 179 → **156 ms** (5.44× над
+  serial), gate/up Q5_0 0.968 → 0.309 ms.
+- **Live `:8090` (свіжий рестарт, `RUSTY_THREADS=12`):** decode **27.6 tok/s** (64-токен probe:
+  64 / 2.316 s; було 10.9) — фінальна q8_0-проєкція більше не домінує. Prefill 961 tok
+  **23.46 s** (було 23.5 — q8_0 задіяний лише на останній позиції), 321 tok 5.23 s.
+- **q8_0 integer-dot (за тікетом):** `Q8Activation` (f32 scale на 32 + i8), scalar `dot_q8_0_i8`,
+  SSE2/AVX2 (`cvtepi8_epi16` + `madd_epi16`, `dot_q8_0_i8_{sse2,avx2,dispatch}`),
+  `matvec_q8_0_i8`/`matmul_q8_0_i8`; SIMD **біт-у-біт** з scalar-оракулом. Після f16-фіксу
+  int8-шлях **повільніший** за float (0.89×: 76.7 vs 68.3 µs на matvec 896²), тому в `QMat`
+  **не підключений** — лишається протестованою альтернативою (i8-кеші активацій / майбутній
+  int8-matmul); forward-числа не змінені.
+- Gate: fmt 0, clippy `--all-targets -D warnings` 0, **193 lib + 19 інтеграційних** зелені,
+  `--ignored` 5/5. **36 локальних комітів**, push у кінці сесії.

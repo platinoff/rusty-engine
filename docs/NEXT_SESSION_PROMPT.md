@@ -400,3 +400,18 @@ push тільки B11.
   конверсія i8→f32 на блок); або matmul throughput (~17 GMAC/s). Зміна числової схеми →
   оракул + `RUSTY_CAPTURE_GOLDEN=1`, і **завжди** `cargo test --release -- --ignored` після правок
   `src/forward.rs`. Decode міряти лише після свіжого рестарту `:8090`.
+
+### Продовження 12 (2026-10-21, PH-203i — f16-widening + q8_0 integer-dot)
+
+- Міф про «i8→f32 конвертацію» розвіяно: вузьким місцем був `quant::f16_to_f32` з `f64`+`powi`
+  **на блок**. Точне бітове розширення (subnormal/Inf/NaN збережено, enumeration-тест на всі
+  `u16`) дало dot_q8_0 **9.55×** (5.34 → 0.64 µs), matvec 896² **11.8 GMAC/s** (було 1.5),
+  QMat-prefill matmul 5.44×; числа forward **не змінились** (`--ignored` 5/5 без recapture).
+- Live `:8090` після свіжого рестарту: decode **27.6 tok/s** (було 10.9), prefill 961 tok
+  **23.46 s** (без змін — q8_0 лише фінальна проєкція).
+- Для тікета додано `Q8Activation` + `dot_q8_0_i8` (scalar/SSE2/AVX2, біт-у-біт) і
+  `matvec_q8_0_i8`/`matmul_q8_0_i8`; після f16-фіксу int8 **повільніший** за float (0.89×), тому
+  в `QMat` не підключений. Див. `benches/quant.rs`, HANDOFF §Продовження 16.
+- **Далі:** залишок prefill — q5_0/q4_k matmul (QMat 5.4× над serial) і, за потреби,
+  head-parallel matmul; decode-стеля тепер інша — профілювати наступний домінантний блок.
+- Gate: fmt 0, clippy `-D warnings` 0, **193 lib + 19 інтеграційних** + 5 `--ignored`.
