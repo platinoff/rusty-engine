@@ -518,4 +518,10 @@ Gate: fmt 0, clippy `--all-targets -D warnings` 0, **203 тести** green + у
   випадково виставленим `CARGO_TARGET_DIR`).
 - Наступна сесія (GSV + двигуни): тікети `t-1792585619484828300` (екосистема: `rusty-serve` у
   `routing.fallback_order` хаба) і `t-1792585623805073700` (двигуни: q8_0 integer-dot kernel).
-  Рантайм двигуна лишається живим на `:8090` (`target/release/rusty.exe`), heartbeat свіжий.
+- **Рантайм на момент синку був мертвий:** `rusty.exe` не існувало в процесах, `rusty_heartbeat.json`
+  стояв з 2026-10-19 → keep-live показував rusty down. Піднято **windowless** за каноном
+  (`target/live/spawn_threads.ps1 -Threads 12` → WMI `wscript.exe launch_serve.vbs`, `RUSTY_THREADS=12`);
+  `GET :8090/health` = 0.1.0, `/v1/chat/completions` відповідає, heartbeat свіжий. Telenetis теж був
+  down — піднято так само через новий `telenetis/target/live/launch_live.vbs` (wscript, без консолі);
+  `:9800/health` = 0.2.0. keep-live після цього: gsv + telenetis + llama_rs + rusty up, omniroute
+  policy-down. **Не запускати `cmd.exe /c` через WMI напряму** — з'являється консоль.
