@@ -9,14 +9,14 @@ serve/heartbeat → **PH-405b forward-parity з llama-rs ✅** → **PH-507 hub 
 (decode 4.4→7.2–7.9 tok/s, matvec 5.1×, prefill matmul 4.08×)** → **`PH-203g` RoPE once per
 position + rotated KV cache ✅ (decode 7.4→10.4 tok/s, prefill 321 tok 25.5→5.9 s, 961 tok
 190.9→29.1 s)** → **`PH-203h` head-parallel prefill attention ✅ (961 tok 29.1→23.5 s))** ·
-**без push** (remote-only у B11).
+**запушено 2026-10-21** (owner зняв B11 remote-only: `origin/main` = `ef0378a`).
 
 ## Верифікований стан (zmіряно цього сеансу, не «на памʼять»)
 
 | Метрика | Значення |
 |---------|----------|
 | `git status` | **clean** (0 drift) |
-| Локальні коміти | **34** (ahead of `origin/main`; B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn, без push — remote = B11) |
+| Локальні коміти | **35** (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn; **pushed 2026-10-21** → `origin/main` `ef0378a`) |
 | Тести | **203** (184 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |

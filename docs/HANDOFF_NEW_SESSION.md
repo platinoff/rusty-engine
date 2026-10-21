@@ -504,3 +504,18 @@ Gate: fmt 0, clippy `--all-targets -D warnings` 0, **203 тести** green (+ �
 
 Gate: fmt 0, clippy `--all-targets -D warnings` 0, **203 тести** green + усі `--ignored`.
 **34 локальні коміти** (`fecffa1`), без push (B11).
+
+### Продовження 15 — 2026-10-21: синк доків/боксів + push (старт наступної сесії)
+
+- Власник 2026-10-21 зняв B11-обмеження: **сесію закрито push-ом** — `origin/main` = `ef0378a`
+  (**35 комітів**, PH-203f/g/h + доки). Далі звичайний контур: один коміт на зріз + `git push`
+  у кінці сесії; MIT/license/CHANGELOG лишаються за B11 (`PH-1105`).
+- GSV-бік (2026-10-21): бокси синхронізовано зі станом репо — `cargo test` **480 s ok**
+  (41 `gsv_watchdog_contracts`), clippy **0/0**, `docs/vision/speed_index.json` +
+  `rust_diagnostics.json` перезаписані на `36e5eca`, vision rev **516**, drift `ok`. Знайдено й
+  виправлено контракт-баг `debug_newer_telenetis_compares_telenetis_crate` (фікстура без
+  `telenetis/Cargo.toml` → `telenetis_crate_dir` свідомо йшла в sibling; тест проходив лише з
+  випадково виставленим `CARGO_TARGET_DIR`).
+- Наступна сесія (GSV + двигуни): тікети `t-1792585619484828300` (екосистема: `rusty-serve` у
+  `routing.fallback_order` хаба) і `t-1792585623805073700` (двигуни: q8_0 integer-dot kernel).
+  Рантайм двигуна лишається живим на `:8090` (`target/release/rusty.exe`), heartbeat свіжий.
