@@ -158,6 +158,29 @@ fn main() {
         iters,
     );
 
+    // `PH-203i`: integer dot (i8 weights × i8 activations) vs the float dequant-in-register
+    // path. Scalar and dispatch must agree exactly (same per-block `i32` sum, one scale step).
+    println!("\n== q8_0 integer dot (i8 activations) ==");
+    let xq8 = k::quantize_q8_0(&b32);
+    let s_int = k::dot_q8_0_i8(&a8, &xq8);
+    let d_int = k::dot_q8_0_i8_dispatch(&a8, &xq8);
+    let s_ns = time(iters, || {
+        black_box(k::dot_q8_0_i8(&a8, &xq8));
+    })
+    .as_nanos() as f64
+        / iters as f64;
+    let d_ns = time(iters, || {
+        black_box(k::dot_q8_0_i8_dispatch(&a8, &xq8));
+    })
+    .as_nanos() as f64
+        / iters as f64;
+    println!(
+        "{:<16} scalar {s_ns:>10.1} ns | dispatch {d_ns:>10.1} ns | speedup {:>5.2}x | |Δ|={:.2e}",
+        "dot_q8_0_i8",
+        s_ns / d_ns,
+        (s_int - d_int).abs()
+    );
+
     let a5 = blocks(5, n_blocks, 22, 0, None);
     bench_dot(
         "dot_q5_0",
@@ -216,6 +239,28 @@ fn main() {
         k::matvec_q8_0,
         k::matvec_q8_0_dispatch,
         200,
+    );
+
+    // `PH-203i`: serial 896² matvec, float fused dot vs the i8 dot (activation quantized
+    // once per call, exactly like `QMat::matvec`). GMAC/s = m·n / ns.
+    let xq = k::quantize_q8_0(&x);
+    let float_ns = time(200, || {
+        black_box(k::matvec_q8_0_dispatch(&w8, m, n, &x));
+    })
+    .as_nanos() as f64
+        / 200.0;
+    let int_ns = time(200, || {
+        black_box(k::matvec_q8_0_i8(&w8, m, n, &xq));
+    })
+    .as_nanos() as f64
+        / 200.0;
+    let macs = (m * n) as f64;
+    println!(
+        "{:<16} float {float_ns:>10.1} ns ({:.2} GMAC/s) | i8 {int_ns:>10.1} ns ({:.2} GMAC/s) | speedup {:>5.2}x",
+        "matvec_q8_0_i8",
+        macs / float_ns,
+        macs / int_ns,
+        float_ns / int_ns
     );
 
     // `PH-203e` follow-up: is a persistent pool worth it? Compare one decode-shaped

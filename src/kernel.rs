@@ -67,6 +67,104 @@ pub fn matvec_q8_0(w: &[u8], m: usize, n: usize, x: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// Q8_0-quantized **activation** row (`PH-203i`): one `f32` scale per 32-value block plus
+/// the `i8` values. GGML's `block_q8_0` stores the scale as f16; keeping it `f32` here means
+/// the integer dot only pays one scale multiply per block and the scalar/SSE2/AVX2 paths
+/// agree bit-for-bit (`f32(isum) * dw * dx`, same association everywhere).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Q8Activation {
+    pub scales: Vec<f32>,
+    pub qs: Vec<i8>,
+}
+
+impl Q8Activation {
+    /// Quantize a whole number of 32-value blocks: `d = max|x| / 127` (GGML `q8_0`), values
+    /// `round(x / d)` clamped to `[-127, 127]`. An all-zero block gets `d = 0`, `qs = 0`.
+    pub fn from_f32(x: &[f32]) -> Self {
+        assert_eq!(
+            x.len() % 32,
+            0,
+            "Q8Activation::from_f32: length must be a multiple of 32"
+        );
+        let mut qs = vec![0i8; x.len()];
+        let mut scales = Vec::with_capacity(x.len() / 32);
+        for (blk, out) in x.chunks_exact(32).zip(qs.chunks_exact_mut(32)) {
+            let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let d = amax / 127.0;
+            let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+            for (q, v) in out.iter_mut().zip(blk) {
+                *q = (v * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+            scales.push(d);
+        }
+        Self { scales, qs }
+    }
+
+    /// Number of 32-value blocks (the weight row must carry the same count).
+    pub fn blocks(&self) -> usize {
+        self.scales.len()
+    }
+}
+
+/// Quantize a whole number of 32-value blocks for the `PH-203i` integer q8_0 dot.
+pub fn quantize_q8_0(x: &[f32]) -> Q8Activation {
+    Q8Activation::from_f32(x)
+}
+
+/// Scalar integer `dot(dequant_q8_0(a), dequant_q8_0(x))` — the oracle for the `PH-203i`
+/// i8 kernels. `a` is whole 34-byte Q8_0 weight blocks, `x` the matching quantized
+/// activation: per block the exact `i32` sum of `w_i · x_i`, then one `f32` scale step.
+///
+/// Measured after the exact `f16_to_f32` widening fix, the float AVX2 path is **faster**
+/// (0.64 µs vs 0.74 µs per 8k-element dot): the per-block `i32` horizontal reduction costs
+/// more than the i8→f32 conversion it removes. The kernel stays as a bit-exact, oracle-
+/// tested alternative (i8 activation caches, future int8 matmul) and is deliberately not
+/// wired into `QMat` — see `benches/quant.rs` and the handoff.
+pub fn dot_q8_0_i8(a: &[u8], x: &Q8Activation) -> f32 {
+    let nb = a.len() / 34;
+    debug_assert_eq!(a.len(), nb * 34, "dot_q8_0_i8: partial block");
+    debug_assert_eq!(
+        x.qs.len(),
+        nb * 32,
+        "dot_q8_0_i8: activation length mismatch"
+    );
+    debug_assert_eq!(x.scales.len(), nb, "dot_q8_0_i8: scale count mismatch");
+    let mut s = 0.0f32;
+    for (blk, (qs, &dx)) in a.chunks_exact(34).zip(x.qs.chunks_exact(32).zip(&x.scales)) {
+        let dw = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let mut isum = 0i32;
+        for (&w, &q) in blk[2..].iter().zip(qs) {
+            isum += (w as i8 as i32) * (q as i32);
+        }
+        s += (isum as f32) * dw * dx;
+    }
+    s
+}
+
+/// Row-major `W[m×n]` Q8_0 times a pre-quantized activation (`PH-203i`).
+pub fn matvec_q8_0_i8(w: &[u8], m: usize, n: usize, x: &Q8Activation) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matvec_q8_0_i8: n must be a multiple of 32");
+    let row_bytes = n / 32 * 34;
+    debug_assert_eq!(
+        w.len(),
+        m * row_bytes,
+        "matvec_q8_0_i8: weight size mismatch"
+    );
+    (0..m)
+        .map(|r| dot_q8_0_i8_dispatch(&w[r * row_bytes..(r + 1) * row_bytes], x))
+        .collect()
+}
+
+/// Batched Q8_0 `W[m×n] · X[rows×n]` over pre-quantized activation rows (`PH-203i`).
+/// Row-wise, so it matches [`matvec_q8_0_i8`] on every output row.
+pub fn matmul_q8_0_i8(w: &[u8], m: usize, n: usize, x: &[Q8Activation], rows: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rows * m);
+    for xq in x.iter().take(rows) {
+        out.extend_from_slice(&matvec_q8_0_i8(w, m, n, xq));
+    }
+    out
+}
+
 /// `dot(dequant_q5_0(a), b)` fused. `a` is a whole number of 22-byte Q5_0 blocks
 /// (`d`@0, `qh`@2, `qs`@6); `b` is `a.len()/22*32` floats. Mirrors `quant::dequant_q5_0`
 /// exactly (bias −16, 5th bit from `qh`), so it equals the `dequant → dot` oracle.
@@ -429,6 +527,105 @@ pub fn dot_q8_0_dispatch(a: &[u8], b: &[f32]) -> f32 {
         }
     }
     dot_q8_0(a, b)
+}
+
+/// SSE2 integer `dot(dequant_q8_0(a), dequant_q8_0(x))` — `PH-203i`. Sign-extends eight
+/// `i8` per `__m128i` (`unpack` with the sign mask from `pcmpgtb`) and folds pairs with
+/// `_mm_madd_epi16`, so no element ever becomes `f32`. Scale is applied once per block;
+/// the result is bit-identical to [`dot_q8_0_i8`].
+///
+/// # Safety
+/// Requires SSE2 (x86_64 baseline; runtime-detected in [`dot_q8_0_i8_dispatch`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+pub unsafe fn dot_q8_0_i8_sse2(a: &[u8], x: &Q8Activation) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = a.len() / 34;
+    debug_assert_eq!(a.len(), nb * 34, "dot_q8_0_i8_sse2: partial block");
+    debug_assert_eq!(
+        x.qs.len(),
+        nb * 32,
+        "dot_q8_0_i8_sse2: activation length mismatch"
+    );
+    let mut s = 0.0f32;
+    let zero = _mm_setzero_si128();
+    for (k, blk) in a.chunks_exact(34).enumerate() {
+        let dw = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dx = x.scales[k];
+        let mut acc = _mm_setzero_si128();
+        for jj in (0..32).step_by(16) {
+            let w8 = _mm_loadu_si128(blk.as_ptr().add(2 + jj).cast());
+            let q8 = _mm_loadu_si128(x.qs.as_ptr().add(k * 32 + jj).cast());
+            let ws = _mm_cmpgt_epi8(zero, w8);
+            let qs = _mm_cmpgt_epi8(zero, q8);
+            let prod = _mm_add_epi32(
+                _mm_madd_epi16(_mm_unpacklo_epi8(w8, ws), _mm_unpacklo_epi8(q8, qs)),
+                _mm_madd_epi16(_mm_unpackhi_epi8(w8, ws), _mm_unpackhi_epi8(q8, qs)),
+            );
+            acc = _mm_add_epi32(acc, prod);
+        }
+        let t = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, 0b10_11_00_01));
+        let t = _mm_add_epi32(t, _mm_shuffle_epi32(t, 0b01_00_11_10));
+        let isum = _mm_cvtsi128_si32(t);
+        s += (isum as f32) * dw * dx;
+    }
+    s
+}
+
+/// AVX2 integer `dot(dequant_q8_0(a), dequant_q8_0(x))` — `PH-203i`. Sixteen `i8` per
+/// `__m256i` (`_mm256_cvtepi8_epi16`), `_mm256_madd_epi16` pairs into eight `i32` lanes.
+/// One scale step per block; bit-identical to [`dot_q8_0_i8`].
+///
+/// # Safety
+/// Requires AVX2 (runtime-detected in [`dot_q8_0_i8_dispatch`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn dot_q8_0_i8_avx2(a: &[u8], x: &Q8Activation) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = a.len() / 34;
+    debug_assert_eq!(a.len(), nb * 34, "dot_q8_0_i8_avx2: partial block");
+    debug_assert_eq!(
+        x.qs.len(),
+        nb * 32,
+        "dot_q8_0_i8_avx2: activation length mismatch"
+    );
+    let mut s = 0.0f32;
+    for (k, blk) in a.chunks_exact(34).enumerate() {
+        let dw = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dx = x.scales[k];
+        let mut acc = _mm256_setzero_si256();
+        for jj in (0..32).step_by(16) {
+            let w8 = _mm_loadu_si128(blk.as_ptr().add(2 + jj).cast());
+            let q8 = _mm_loadu_si128(x.qs.as_ptr().add(k * 32 + jj).cast());
+            let prod = _mm256_madd_epi16(_mm256_cvtepi8_epi16(w8), _mm256_cvtepi8_epi16(q8));
+            acc = _mm256_add_epi32(acc, prod);
+        }
+        let t = _mm_add_epi32(
+            _mm256_castsi256_si128(acc),
+            _mm256_extracti128_si256(acc, 1),
+        );
+        let t = _mm_hadd_epi32(t, t);
+        let t = _mm_hadd_epi32(t, t);
+        let isum = _mm_cvtsi128_si32(t);
+        s += (isum as f32) * dw * dx;
+    }
+    s
+}
+
+/// Runtime-dispatched integer Q8_0 dot: AVX2 → SSE2 → scalar.
+pub fn dot_q8_0_i8_dispatch(a: &[u8], x: &Q8Activation) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: gated by the runtime AVX2 check above.
+            return unsafe { dot_q8_0_i8_avx2(a, x) };
+        }
+        if std::is_x86_feature_detected!("sse2") {
+            // SAFETY: gated by the runtime SSE2 check above.
+            return unsafe { dot_q8_0_i8_sse2(a, x) };
+        }
+    }
+    dot_q8_0_i8(a, x)
 }
 
 /// Row-major `W[m×n]` Q8_0, times `x[n]`, via the dispatched dot.
@@ -1132,6 +1329,138 @@ mod tests {
         let simd = unsafe { dot_q8_0_avx2(&a, &b) };
         let scalar = dot_q8_0(&a, &b);
         assert!((simd - scalar).abs() < 1e-2, "avx2={simd} scalar={scalar}");
+    }
+
+    fn q8_test_vector(n: usize) -> Vec<f32> {
+        (0..n).map(|i| (i as f32) * 0.037 - 7.0).collect()
+    }
+
+    /// Dequantize a [`Q8Activation`] back to f32 (`q · d`) — the exact reference the integer
+    /// dot must reproduce (it isolates the kernel from the quantization loss itself).
+    fn dequant_activation(xq: &Q8Activation) -> Vec<f32> {
+        xq.qs
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (*q as f32) * xq.scales[i / 32])
+            .collect()
+    }
+
+    #[test]
+    fn q8_activation_roundtrip_error_is_bounded() {
+        let x = q8_test_vector(96);
+        let xq = Q8Activation::from_f32(&x);
+        assert_eq!(xq.blocks(), 3);
+        assert_eq!(xq.qs.len(), x.len());
+        for ((blk, qb), &d) in x
+            .chunks_exact(32)
+            .zip(xq.qs.chunks_exact(32))
+            .zip(&xq.scales)
+        {
+            let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                (d - amax / 127.0).abs() < 1e-6,
+                "scale {d} vs {}",
+                amax / 127.0
+            );
+            for (v, q) in blk.iter().zip(qb) {
+                assert!(((*q as f32) * d - v).abs() <= d / 2.0 + 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn q8_activation_zero_block_stays_zero() {
+        let xq = Q8Activation::from_f32(&vec![0.0f32; 64]);
+        assert_eq!(xq.scales, vec![0.0, 0.0]);
+        assert!(xq.qs.iter().all(|&q| q == 0));
+    }
+
+    #[test]
+    fn dot_q8_0_i8_matches_dequantized_activation_dot() {
+        let a = q8_blocks(6);
+        let xq = Q8Activation::from_f32(&q8_test_vector(a.len() / 34 * 32));
+        let x = dequant_activation(&xq);
+        let int = dot_q8_0_i8(&a, &xq);
+        let float = dot_q8_0(&a, &x);
+        let rel = (int - float).abs() / float.abs().max(1.0);
+        assert!(rel < 1e-3, "int={int} float={float} rel={rel}");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dot_q8_0_i8_sse2_is_bit_exact_with_scalar() {
+        if !std::is_x86_feature_detected!("sse2") {
+            return;
+        }
+        let a = q8_blocks(7);
+        let xq = Q8Activation::from_f32(&q8_test_vector(a.len() / 34 * 32));
+        let simd = unsafe { dot_q8_0_i8_sse2(&a, &xq) };
+        let scalar = dot_q8_0_i8(&a, &xq);
+        assert_eq!(
+            simd.to_bits(),
+            scalar.to_bits(),
+            "sse2={simd} scalar={scalar}"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dot_q8_0_i8_avx2_is_bit_exact_with_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("PH-203i: AVX2 absent on this host; skipping explicit avx2 check");
+            return;
+        }
+        let a = q8_blocks(7);
+        let xq = Q8Activation::from_f32(&q8_test_vector(a.len() / 34 * 32));
+        let simd = unsafe { dot_q8_0_i8_avx2(&a, &xq) };
+        let scalar = dot_q8_0_i8(&a, &xq);
+        assert_eq!(
+            simd.to_bits(),
+            scalar.to_bits(),
+            "avx2={simd} scalar={scalar}"
+        );
+    }
+
+    #[test]
+    fn dot_q8_0_i8_dispatch_is_bit_exact_with_scalar() {
+        let a = q8_blocks(9);
+        let xq = Q8Activation::from_f32(&q8_test_vector(a.len() / 34 * 32));
+        let dispatch = dot_q8_0_i8_dispatch(&a, &xq);
+        let scalar = dot_q8_0_i8(&a, &xq);
+        assert_eq!(
+            dispatch.to_bits(),
+            scalar.to_bits(),
+            "dispatch={dispatch} scalar={scalar}"
+        );
+    }
+
+    #[test]
+    fn matvec_q8_0_i8_matches_float_matvec() {
+        let (m, n) = (3usize, 64usize);
+        let w = q8_blocks(m * n / 32);
+        let xq = Q8Activation::from_f32(&q8_test_vector(n));
+        let x = dequant_activation(&xq);
+        let int = matvec_q8_0_i8(&w, m, n, &xq);
+        let float = matvec_q8_0(&w, m, n, &x);
+        assert_eq!(int.len(), m);
+        for (i, f) in int.iter().zip(&float) {
+            let rel = (i - f).abs() / f.abs().max(1.0);
+            assert!(rel < 1e-3, "int={i} float={f} rel={rel}");
+        }
+    }
+
+    #[test]
+    fn matmul_q8_0_i8_matches_rowwise_matvec() {
+        let (m, n, rows) = (3usize, 64usize, 2usize);
+        let w = q8_blocks(m * n / 32);
+        let x = q8_test_vector(rows * n);
+        let xq: Vec<_> = x.chunks_exact(n).map(Q8Activation::from_f32).collect();
+        let got = matmul_q8_0_i8(&w, m, n, &xq, rows);
+        let want: Vec<f32> = xq
+            .iter()
+            .flat_map(|x| matvec_q8_0_i8(&w, m, n, x))
+            .collect();
+        assert_eq!(got, want);
     }
 
     #[test]

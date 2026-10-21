@@ -17,22 +17,31 @@ pub struct BlockInfo {
 }
 
 /// IEEE-754 binary16 → f32 (scale fields are little-endian `u16`).
+///
+/// `PH-203i`: this used to go through `f64` + `powi`, which cost more than the dot itself
+/// (one call per 32-value block; q4_k amortizes it over 256 values, q8_0 does not — the
+/// 1.5 GMAC/s mystery). The bit widening below is exact (same bits as IEEE, including
+/// subnormals / Inf / NaN) and lowers to a handful of integer ops.
 pub fn f16_to_f32(h: u16) -> f32 {
-    let sign = if (h >> 15) & 1 == 1 { -1.0f64 } else { 1.0f64 };
-    let exp = ((h >> 10) & 0x1F) as i32;
-    let frac = (h & 0x3FF) as f64;
-    let v = match exp {
-        0 => frac / 1024.0 * 2f64.powi(-14), // subnormal (frac 0 → ±0)
-        31 => {
-            if (h & 0x3FF) == 0 {
-                f64::INFINITY
-            } else {
-                f64::NAN
+    let sign = ((h as u32) & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1F;
+    let frac = (h & 0x3FF) as u32;
+    let bits = match exp {
+        0 if frac == 0 => sign, // ±0
+        0 => {
+            // Subnormal: frac · 2^-24. Normalize so bit 10 is the implicit leading 1.
+            let mut e: u32 = 113; // 127 - 14
+            let mut f = frac;
+            while f & 0x400 == 0 {
+                f <<= 1;
+                e -= 1;
             }
+            sign | (e << 23) | ((f & 0x3FF) << 13)
         }
-        _ => (1.0 + frac / 1024.0) * 2f64.powi(exp - 15),
+        0x1F => sign | 0x7F80_0000 | (frac << 13), // ±Inf (frac 0) / NaN payload
+        _ => sign | (((exp as u32) + 112) << 23) | (frac << 13),
     };
-    (sign * v) as f32
+    f32::from_bits(bits)
 }
 
 /// `GGML_TYPE_*` code → block geometry (`None` for formats we don't size yet).
@@ -326,6 +335,38 @@ mod tests {
         assert_eq!(f16_to_f32(0x0000), 0.0);
         assert_eq!(f16_to_f32(0xC000), -2.0);
         assert!(f16_to_f32(0x7C00).is_infinite());
+        assert_eq!(f16_to_f32(0x8000).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24)); // smallest subnormal
+        assert_eq!(f16_to_f32(0x03FF), 1023.0 * 2f32.powi(-24)); // largest subnormal
+        assert!(f16_to_f32(0x7E00).is_nan());
+        assert!(f16_to_f32(0xFE00).is_nan());
+    }
+
+    /// `PH-203i`: the fast widening must be bit-exact with the slow f64 reference for every
+    /// `u16` pattern (subnormals, Inf, NaN included).
+    #[test]
+    fn f16_bit_exact_against_f64_reference() {
+        fn slow(h: u16) -> f32 {
+            let sign = if (h >> 15) & 1 == 1 { -1.0f64 } else { 1.0f64 };
+            let exp = ((h >> 10) & 0x1F) as i32;
+            let frac = (h & 0x3FF) as f64;
+            let v = match exp {
+                0 => frac / 1024.0 * 2f64.powi(-14),
+                31 if (h & 0x3FF) == 0 => f64::INFINITY,
+                31 => f64::NAN,
+                _ => (1.0 + frac / 1024.0) * 2f64.powi(exp - 15),
+            };
+            (sign * v) as f32
+        }
+        for h in 0..=u16::MAX {
+            let got = f16_to_f32(h);
+            let want = slow(h);
+            if want.is_nan() {
+                assert!(got.is_nan(), "h={h:#06x}: {got} not NaN");
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "h={h:#06x}");
+            }
+        }
     }
 
     #[test]
