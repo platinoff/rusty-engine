@@ -1036,16 +1036,96 @@ fn dot_f32_dispatch(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Activation rows per cache tile. One weight row scans `tile * n * 4` bytes of `X` before
-/// moving to the next weight row, so the tile must stay well inside L2 (16 rows × 896 × 4 B
-/// = 57 KiB; 32 rows = 114 KiB is ~8% slower, and no tiling costs ~33%) — at `rows = 961`
-/// the untiled walk re-reads a 3.3 MiB activation matrix per weight row (`PH-203k`).
-const MATMUL_ROW_TILE: usize = 16;
+/// Four f32 dots that share the `a` load: `out[k] = a · b[k]`.
+///
+/// The weight row is loaded once per 8-element chunk and reused by four accumulators, so the
+/// FMA:load ratio goes from 1:2 to 4:5 — the single dot is load-port bound (`PH-203m`), and a
+/// 4-row block is the cheapest way past it. Each `out[k]` keeps the exact accumulation order of
+/// [`dot_f32_avx2`] (one 8-lane accumulator, ascending, scalar tail), so the result is
+/// bit-identical to four independent dots.
+///
+/// # Safety
+/// Requires AVX2+FMA (gated by [`dot_f32_x4_dispatch`]); every slice must be `a.len()` long.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2_x4(a: &[f32], b: [&[f32]; 4]) -> [f32; 4] {
+    use std::arch::x86_64::*;
+    let n = a.len();
+    for s in b {
+        debug_assert_eq!(s.len(), n, "dot_f32_avx2_x4: length mismatch");
+    }
+    let mut acc = [
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+    ];
+    let mut i = 0;
+    while i + 8 <= n {
+        let av = _mm256_loadu_ps(a.as_ptr().add(i));
+        for (k, bs) in b.iter().enumerate() {
+            acc[k] = _mm256_fmadd_ps(av, _mm256_loadu_ps(bs.as_ptr().add(i)), acc[k]);
+        }
+        i += 8;
+    }
+    let mut out = [0.0f32; 4];
+    for k in 0..4 {
+        out[k] = hsum_ps_sse2(_mm_add_ps(
+            _mm256_castps256_ps128(acc[k]),
+            _mm256_extractf128_ps(acc[k], 1),
+        ));
+        while i < n {
+            out[k] += a[i] * b[k][i];
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Runtime-dispatched [`dot_f32_avx2_x4`]: AVX2+FMA when reported, else four scalar folds.
+fn dot_f32_x4_dispatch(a: &[f32], b: [&[f32]; 4]) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: gated by the runtime AVX2+FMA check above.
+            return unsafe { dot_f32_avx2_x4(a, b) };
+        }
+    }
+    let mut out = [0.0f32; 4];
+    for (k, bs) in b.iter().enumerate() {
+        out[k] = a.iter().zip(*bs).map(|(x, y)| x * y).sum();
+    }
+    out
+}
+
+/// Activation rows per matmul cache tile (see [`matmul_reuse`]).
+///
+/// This is a dequant-amortization knob first and a cache knob second: a weight row is
+/// dequantized once per tile, so `n / (tile · n)` ≈ `1/tile` of the MACs are spent on dequant.
+/// Measured on Q5_0 961 × 896 × 4864 and 961 × 4864 × 896 (`PH-203n`): 96 and 128 are within
+/// noise of the optimum (~20 GMAC/s single thread), 16 costs 30 % and 192+ collapses on the
+/// wide shape once a tile stops fitting the core's L2.
+const MATMUL_ROW_TILE: usize = 96;
+
+/// Activation rows sharing one weight-row load in [`matmul_reuse`] (register blocking).
+const MATMUL_ROW_GROUP: usize = 4;
+
+/// Weight rows per pass over the activation tile. Without this the walk is
+/// `for r { for every row }`, so the whole `X` (18.7 MiB at 961 rows × 4864 wide) is re-read
+/// from DRAM for **every** weight row — 16.8 GiB for one down projection (`PH-203n`).
+///
+/// The measured optimum is "one block", because the activation tile is what has to stay
+/// resident: at 96 rows the tile is ~1.9 MiB on the wide shape and lives in L3 across the whole
+/// weight sweep (`rb = m` was 19.2 GMAC/s against 7.5 at `rb = 64`, tile 6). The knob stays
+/// explicit so the bench can still A/B a smaller block.
+const MATMUL_R_BLOCK: usize = 1024;
 
 /// Batched `W[m×n] · X[rows×n] → Out[rows×m]`. Each weight row is dequantized **once per
-/// output row** (`dq` over the whole `n`) and then dotted against every activation row with a
-/// single f32 reduction, so a `(row, r)` pair pays one horizontal sum instead of one per
-/// quant block. `X` is walked in `tile`-row cache blocks to keep the activation slice in L2.
+/// activation tile** (`dq` over the whole `n`) and then dotted against every activation row of
+/// that tile with a single f32 reduction, so a `(row, r)` pair pays one horizontal sum instead
+/// of one per quant block. Activation rows are processed 4 at a time against one weight load
+/// ([`dot_f32_x4_dispatch`]) and the tile loop sits **outside** the weight loop, so a tile of
+/// `X` is streamed once per weight block instead of once per weight row.
 ///
 /// Summation order per `(row, r)` is the row-wide 8-lane partial accumulation inside
 /// [`dot_f32_dispatch`] — that is *not* the block-wise order the pre-`PH-203l` kernel used, so
@@ -1058,34 +1138,61 @@ fn matmul_reuse(
     x: &[f32],
     rows: usize,
     tile: usize,
+    group: usize,
+    r_block: usize,
     block_bytes: usize,
     block_vals: usize,
     dq: impl Fn(&[u8], &mut [f32]),
 ) -> Vec<f32> {
     debug_assert_eq!(x.len(), rows * n, "matmul: X rows × n");
     let tile = tile.max(1);
+    let group = group.clamp(1, 4);
+    let r_block = r_block.max(1);
     let blocks = n / block_vals;
     let row_bytes = blocks * block_bytes;
     debug_assert_eq!(w.len(), m * row_bytes, "matmul: weight size");
     let mut out = vec![0.0f32; rows * m];
     let mut rowbuf = vec![0.0f32; n];
-    for r in 0..m {
-        dequant_row(
-            &w[r * row_bytes..(r + 1) * row_bytes],
-            &mut rowbuf,
-            block_bytes,
-            block_vals,
-            &dq,
-        );
+    let mut rb0 = 0;
+    while rb0 < m {
+        let rb1 = (rb0 + r_block).min(m);
         let mut r0 = 0;
         while r0 < rows {
             let r1 = (r0 + tile).min(rows);
-            for row in r0..r1 {
-                let xs = row * n;
-                out[row * m + r] = dot_f32_dispatch(&rowbuf, &x[xs..xs + n]);
+            for r in rb0..rb1 {
+                dequant_row(
+                    &w[r * row_bytes..(r + 1) * row_bytes],
+                    &mut rowbuf,
+                    block_bytes,
+                    block_vals,
+                    &dq,
+                );
+                let mut row = r0;
+                if group == 4 {
+                    while row + 4 <= r1 {
+                        let s = row * n;
+                        let b = [
+                            &x[s..s + n],
+                            &x[s + n..s + 2 * n],
+                            &x[s + 2 * n..s + 3 * n],
+                            &x[s + 3 * n..s + 4 * n],
+                        ];
+                        let got = dot_f32_x4_dispatch(&rowbuf, b);
+                        for (k, v) in got.into_iter().enumerate() {
+                            out[(row + k) * m + r] = v;
+                        }
+                        row += 4;
+                    }
+                }
+                while row < r1 {
+                    let xs = row * n;
+                    out[row * m + r] = dot_f32_dispatch(&rowbuf, &x[xs..xs + n]);
+                    row += 1;
+                }
             }
             r0 = r1;
         }
+        rb0 = rb1;
     }
     out
 }
@@ -1157,18 +1264,42 @@ fn matmul_reuse_blocks(
 /// Batched Q4_0 `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q4_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 32, 0, "matmul_q4_0_dispatch: n%32");
-    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 18, 32, dq_q4_0_block)
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        MATMUL_ROW_TILE,
+        MATMUL_ROW_GROUP,
+        MATMUL_R_BLOCK,
+        18,
+        32,
+        dq_q4_0_block,
+    )
 }
 
 /// Batched Q5_0 `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q5_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 32, 0, "matmul_q5_0_dispatch: n%32");
-    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 22, 32, dq_q5_0_block)
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        MATMUL_ROW_TILE,
+        MATMUL_ROW_GROUP,
+        MATMUL_R_BLOCK,
+        22,
+        32,
+        dq_q5_0_block,
+    )
 }
 
 /// Batched Q5_0 `W[m×n] · X[rows×n]` with an explicit activation tile: bench hook for the
 /// cache-blocking A/B (`PH-203k`). Production goes through [`matmul_q5_0_dispatch`], which
-/// pins [`MATMUL_ROW_TILE`].
+/// pins [`MATMUL_ROW_TILE`], [`MATMUL_ROW_GROUP`] and [`MATMUL_R_BLOCK`].
 #[doc(hidden)]
 pub fn matmul_q5_0_tiled(
     w: &[u8],
@@ -1179,7 +1310,101 @@ pub fn matmul_q5_0_tiled(
     tile: usize,
 ) -> Vec<f32> {
     debug_assert_eq!(n % 32, 0, "matmul_q5_0_tiled: n%32");
-    matmul_reuse(w, m, n, x, rows, tile, 22, 32, dq_q5_0_block)
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        tile,
+        MATMUL_ROW_GROUP,
+        MATMUL_R_BLOCK,
+        22,
+        32,
+        dq_q5_0_block,
+    )
+}
+
+/// Batched Q5_0 with the register blocking turned off (one row per weight load): the A/B
+/// pair for [`MATMUL_ROW_GROUP`] (`PH-203n`). Bit-identical to the production path.
+#[doc(hidden)]
+pub fn matmul_q5_0_rows1(
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    tile: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matmul_q5_0_rows1: n%32");
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        tile,
+        1,
+        MATMUL_R_BLOCK,
+        22,
+        32,
+        dq_q5_0_block,
+    )
+}
+
+/// Batched Q5_0 with an explicit activation tile *and* weight-row block: the 2-D cache sweep
+/// hook for [`MATMUL_ROW_TILE`] / [`MATMUL_R_BLOCK`] (`PH-203n`). Bit-identical to production.
+#[doc(hidden)]
+pub fn matmul_q5_0_blocked(
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    tile: usize,
+    r_block: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matmul_q5_0_blocked: n%32");
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        tile,
+        MATMUL_ROW_GROUP,
+        r_block,
+        22,
+        32,
+        dq_q5_0_block,
+    )
+}
+
+/// Batched Q5_0 with weight-row blocking off (`for r { for every row }`): the A/B pair for
+/// [`MATMUL_R_BLOCK`] (`PH-203n`). Bit-identical to the production path.
+#[doc(hidden)]
+pub fn matmul_q5_0_rb1(
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    tile: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matmul_q5_0_rb1: n%32");
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        tile,
+        MATMUL_ROW_GROUP,
+        1,
+        22,
+        32,
+        dq_q5_0_block,
+    )
 }
 
 /// Batched Q5_0 through the per-block accumulator ([`matmul_reuse_blocks`]): the numeric
@@ -1200,31 +1425,73 @@ pub fn matmul_q5_0_blockwise(
 /// Batched Q8_0 `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q8_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 32, 0, "matmul_q8_0_dispatch: n%32");
-    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 34, 32, dq_q8_0_block)
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        MATMUL_ROW_TILE,
+        MATMUL_ROW_GROUP,
+        MATMUL_R_BLOCK,
+        34,
+        32,
+        dq_q8_0_block,
+    )
 }
 
 /// Batched Q4_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q4_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 256, 0, "matmul_q4_k_dispatch: n%256");
-    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 144, 256, |b, o| {
-        dq_q4_k_block(b, o.try_into().expect("q4_k block buffer is 256"))
-    })
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        MATMUL_ROW_TILE,
+        MATMUL_ROW_GROUP,
+        MATMUL_R_BLOCK,
+        144,
+        256,
+        |b, o| dq_q4_k_block(b, o.try_into().expect("q4_k block buffer is 256")),
+    )
 }
 
 /// Batched Q5_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q5_k(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 256, 0, "matmul_q5_k: n%256");
-    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 176, 256, |b, o| {
-        dq_q5_k_block(b, o.try_into().expect("q5_k block buffer is 256"))
-    })
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        MATMUL_ROW_TILE,
+        MATMUL_ROW_GROUP,
+        MATMUL_R_BLOCK,
+        176,
+        256,
+        |b, o| dq_q5_k_block(b, o.try_into().expect("q5_k block buffer is 256")),
+    )
 }
 
 /// Batched Q6_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q6_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 256, 0, "matmul_q6_k_dispatch: n%256");
-    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 210, 256, |b, o| {
-        dq_q6_k_block(b, o.try_into().expect("q6_k block buffer is 256"))
-    })
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        MATMUL_ROW_TILE,
+        MATMUL_ROW_GROUP,
+        MATMUL_R_BLOCK,
+        210,
+        256,
+        |b, o| dq_q6_k_block(b, o.try_into().expect("q6_k block buffer is 256")),
+    )
 }
 
 /// Bytes of one `n`-wide row for a fused kernel type, or `None` when the type has no
@@ -1845,6 +2112,34 @@ mod tests {
             let got = matmul_q5_0_tiled(&w, m, n, &x, rows, tile);
             assert_eq!(got, untiled, "tile {tile} changed the result");
         }
+    }
+
+    #[test]
+    fn matmul_row_grouping_is_bit_identical() {
+        // PH-203n: sharing one weight-row load across 4 activations must not change a single
+        // bit — the tail rows (70 = 4×17 + 2) fall back to the single-row dot.
+        let (m, n, rows) = (5usize, 64usize, 70usize);
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i as i32 * 7 % 23) as f32) * 0.04 - 0.5)
+            .collect();
+        let w = q5_blocks(m * n / 32);
+        let grouped = matmul_q5_0_tiled(&w, m, n, &x, rows, MATMUL_ROW_TILE);
+        let single = matmul_q5_0_rows1(&w, m, n, &x, rows, MATMUL_ROW_TILE);
+        assert_eq!(grouped, single);
+    }
+
+    #[test]
+    fn matmul_weight_row_blocking_is_bit_identical() {
+        // PH-203n: walking weight rows in blocks (so a tile of X is streamed once per block)
+        // only reorders independent output writes — m = 70 = 64 + 6 covers the block tail.
+        let (m, n, rows) = (70usize, 96usize, 13usize);
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i as i32 * 11 % 17) as f32) * 0.05 - 0.4)
+            .collect();
+        let w = q5_blocks(m * n / 32);
+        let blocked = matmul_q5_0_tiled(&w, m, n, &x, rows, MATMUL_ROW_TILE);
+        let per_row = matmul_q5_0_rb1(&w, m, n, &x, rows, MATMUL_ROW_TILE);
+        assert_eq!(blocked, per_row);
     }
 
     #[test]

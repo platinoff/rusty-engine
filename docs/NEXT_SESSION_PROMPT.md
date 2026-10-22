@@ -486,4 +486,21 @@ push тільки B11.
 - Логи профілю: `target/live/rusty_prof.{out,err}.log`; `target/live/profile.txt` вмикає профіль
   у `launch_serve.vbs` (видалити файл = вимкнути).
 
+### Продовження 17 (2026-10-22, PH-203n — prefill 15.2 → 10.4 s, усе біт-у-біт)
+
+- **4-рядковий мікрокернел** `dot_f32_avx2_x4` (`dot_f32_x4_dispatch`, `MATMUL_ROW_GROUP = 4`):
+  1 FMA / 2 loads → 4 FMA / 5 loads. Хвіст падає на одиночний `dot_f32_dispatch`.
+- **Двовимірне блокування** `matmul_reuse`: `MATMUL_ROW_TILE = 96` тепер **зовні** циклу ваг,
+  `MATMUL_R_BLOCK = 1024`. Тайл = амортизація дейкванту (`MAC/tile`), не L2-трюк; старий
+  порядок перечитував `X` з DRAM на кожен ваговий рядок (16.8 GiB на down-проєкцію).
+- **Вісь паралелізму за розміром `X`** (`QMat::matmul`, `MATMUL_X_L3_BUDGET = 6 MiB`): рядки,
+  поки `X` влазить у L3; інакше вихідні рядки (`matmul_out_rows`).
+- Один потік: gate/up 606 → **199 ms** (21.0 GMAC/s), down 688–914 → **218 ms** (18.9).
+  Пул: gate/up рядки **74.5 GMAC/s**, down вихідні рядки **57.7** (рядковий поділ там 16.3).
+- **Лайв 961 tok: 10.44 s** (matmul 69.2 %, attention 19.3 %, форми 36–60 GMAC/s).
+- Гейт: 199 lib + integration, clippy 0, `--ignored` (fingerprint + moe_parity + real qwen) ok,
+  golden не перезахоплювався.
+- **Далі:** attention (2.0 s, 19.3 %) — вже head-parallel, дивитись `attention_prefill_inner`;
+  `other` ~11 %; NEON; `rb` для `m > 1024`.
+
 

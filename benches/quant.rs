@@ -371,4 +371,120 @@ fn main() {
         "prefill accumulator A/B (min of 7, single thread):  row {row_best:>7.1} ms | block {block_best:>7.1} ms | row/block {:>5.2}x",
         block_best / row_best
     );
+
+    // PH-203n: register blocking. `rows1` = one activation per weight load, `x4` = four.
+    // Measured on both the narrow (n = 896, gate/up) and the wide (n = 4864, down) shape,
+    // because the profiler showed the wide one at 10 GMAC/s against 35 for the rest.
+    let shapes = [("gate/up 4864x896", gm, n), ("down    896x4864", n, gm)];
+    for (label, mm, nn) in shapes {
+        let w_s: Vec<u8> = (0..mm * nn / 32 * 22).map(|i| (i % 251) as u8).collect();
+        let x_s = fill_floats(31, rows * nn);
+        let mac = rows as f64 * mm as f64 * nn as f64 / 1e9;
+
+        // Through the real 12-thread pool: row split vs output-row split. The row split only
+        // wins while the activation matrix as a whole stays in L3.
+        let qs = rusty_engine::qmat::QMat::from_bytes(6, w_s.clone(), mm, nn);
+        let (mut rsplit, mut csplit) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..5 {
+            let t = time(1, || {
+                black_box(qs.matmul(&x_s, rows));
+            });
+            rsplit = rsplit.min(t.as_secs_f64() * 1e3);
+            let t = time(1, || {
+                black_box(qs.matmul_split_cols(&x_s, rows));
+            });
+            csplit = csplit.min(t.as_secs_f64() * 1e3);
+        }
+        println!(
+            "pool split A/B {label} (12 threads, min of 5):  rows {rsplit:>7.1} ms ({:>5.2} GMAC/s) | out-rows {csplit:>7.1} ms ({:>5.2} GMAC/s) | {:>5.2}x",
+            mac / (rsplit / 1e3),
+            mac / (csplit / 1e3),
+            rsplit / csplit
+        );
+        let (mut g1, mut g4) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..7 {
+            let t = time(1, || {
+                black_box(k::matmul_q5_0_rows1(&w_s, mm, nn, &x_s, rows, 16));
+            });
+            g1 = g1.min(t.as_secs_f64() * 1e3);
+            let t = time(1, || {
+                black_box(k::matmul_q5_0_tiled(&w_s, mm, nn, &x_s, rows, 16));
+            });
+            g4 = g4.min(t.as_secs_f64() * 1e3);
+        }
+        println!(
+            "prefill row blocking {label} (min of 7, single thread):  1 row {g1:>7.1} ms ({:>5.2} GMAC/s) | 4 rows {g4:>7.1} ms ({:>5.2} GMAC/s) | {:>5.2}x",
+            mac / (g1 / 1e3),
+            mac / (g4 / 1e3),
+            g1 / g4
+        );
+        // Tile size now only buys down the dequant pass count (one dequant per weight row per
+        // tile), so sweep upwards on both shapes.
+        let tiles = [16usize, 24, 32, 48, 64, 96];
+        let mut best = vec![f64::INFINITY; tiles.len()];
+        for _ in 0..5 {
+            for (i, &tile) in tiles.iter().enumerate() {
+                let t = time(1, || {
+                    black_box(k::matmul_q5_0_tiled(&w_s, mm, nn, &x_s, rows, tile));
+                });
+                best[i] = best[i].min(t.as_secs_f64() * 1e3);
+            }
+        }
+        println!("  tile sweep on {label} (min of 5, single thread):");
+        for (i, &tile) in tiles.iter().enumerate() {
+            println!(
+                "    tile {tile:>3}  {:>8.1} ms  {:>6.2} GMAC/s",
+                best[i],
+                mac / (best[i] / 1e3)
+            );
+        }
+        // Weight-row blocking: `rb1` re-reads the whole X for every weight row.
+        let (mut rb1, mut rbn) = (f64::INFINITY, f64::INFINITY);
+        let tile = 96usize;
+        for _ in 0..5 {
+            let t = time(1, || {
+                black_box(k::matmul_q5_0_rb1(&w_s, mm, nn, &x_s, rows, tile));
+            });
+            rb1 = rb1.min(t.as_secs_f64() * 1e3);
+            let t = time(1, || {
+                black_box(k::matmul_q5_0_tiled(&w_s, mm, nn, &x_s, rows, tile));
+            });
+            rbn = rbn.min(t.as_secs_f64() * 1e3);
+        }
+        println!(
+            "  weight-row blocking on {label} (min of 5, single thread, tile {tile}):  1 row {rb1:>7.1} ms ({:>5.2} GMAC/s) | 64 rows {rbn:>7.1} ms ({:>5.2} GMAC/s) | {:>5.2}x",
+            mac / (rb1 / 1e3),
+            mac / (rbn / 1e3),
+            rb1 / rbn
+        );
+        // Two-dimensional sweep: tile fixes the dequant pass count (MAC/tile) and the weight
+        // block fixes how often the activation tile is re-streamed (m/rb passes).
+        let combos = [
+            (96usize, 64usize),
+            (96, 256),
+            (96, 1024),
+            (128, 64),
+            (128, 256),
+            (128, 1024),
+            (192, 1024),
+            (256, 1024),
+        ];
+        let mut bc = vec![f64::INFINITY; combos.len()];
+        for _ in 0..5 {
+            for (i, &(tile, rb)) in combos.iter().enumerate() {
+                let t = time(1, || {
+                    black_box(k::matmul_q5_0_blocked(&w_s, mm, nn, &x_s, rows, tile, rb));
+                });
+                bc[i] = bc[i].min(t.as_secs_f64() * 1e3);
+            }
+        }
+        println!("  2-D sweep on {label} (min of 5, single thread):");
+        for (i, &(tile, rb)) in combos.iter().enumerate() {
+            println!(
+                "    tile {tile:>3} rb {rb:>4}  {:>8.1} ms  {:>6.2} GMAC/s",
+                bc[i],
+                mac / (bc[i] / 1e3)
+            );
+        }
+    }
 }

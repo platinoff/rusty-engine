@@ -12,6 +12,11 @@ use crate::core::{EngineError, Result};
 /// split across worker threads — below this the thread spawn costs more than it saves.
 const PAR_MAC_MIN: usize = 1 << 18;
 
+/// Largest activation matrix (bytes) a row-split prefill may hand to the shared cache. The
+/// box's L3 is 8 MiB; past ~6 MiB the twelve per-worker slices evict each other and
+/// [`QMat::matmul`] switches to splitting output rows instead (`PH-203n`).
+const MATMUL_X_L3_BUDGET: usize = 6 * 1024 * 1024;
+
 /// Worker count for a projection of `work` MACs, capped to `rows` (each worker needs ≥1 row).
 fn workers_for(work: usize, rows: usize) -> usize {
     if work < PAR_MAC_MIN || rows < 2 {
@@ -152,12 +157,15 @@ impl QMat {
     /// block's dequant out of the row loop (see `kernel::matmul_*`), so the int→float
     /// conversions that dominate `matvec` are paid once instead of once per row.
     ///
-    /// Split by **input rows**: every worker streams the same weights (a few MiB, re-read
-    /// `threads` times) while each owns a `rows/threads` slice of `X` (~290 KiB, L2-sized).
-    /// Splitting by output columns instead makes all workers walk the whole activation
-    /// matrix per weight row — a shared 16 GiB `X` stream per projection against ~36 MiB of
-    /// weight re-reads — which pins the projection to L3 bandwidth (`PH-203k`). Each
-    /// worker's rows are contiguous in the row-major `Out`.
+    /// Split axis follows the activation working set (`PH-203n`):
+    ///
+    /// - `X` fits [`MATMUL_X_L3_BUDGET`] (gate/up, q/k/v/o — 3.4 MiB at 961 × 896): split by
+    ///   **input rows**, so every worker owns a slice of `X` that stays in cache while the
+    ///   weights stream past it (`74.5 GMAC/s` measured against `62.4` for the other axis).
+    /// - `X` does not fit (down, 18.7 MiB at 961 × 4864): split by **output rows** instead.
+    ///   Every worker then streams `X` once on its own and keeps only `m/threads` weight rows
+    ///   hot; the row split loses 3.5× there (`16.3` against `57.7 GMAC/s`) because twelve
+    ///   slices of 18.7 MiB evict each other from the 8 MiB L3.
     pub fn matmul(&self, x: &[f32], rows: usize) -> Vec<f32> {
         if !crate::profile::enabled() {
             return self.matmul_inner(x, rows);
@@ -176,6 +184,9 @@ impl QMat {
     /// Untimed body of [`QMat::matmul`].
     fn matmul_inner(&self, x: &[f32], rows: usize) -> Vec<f32> {
         let (m, n) = (self.rows(), self.cols());
+        if rows.saturating_mul(n).saturating_mul(4) > MATMUL_X_L3_BUDGET {
+            return self.matmul_out_rows(x, rows);
+        }
         let threads = workers_for(rows.saturating_mul(m).saturating_mul(n), rows);
         let (ggml_type, bytes) = match self {
             Self::Quant {
@@ -214,11 +225,17 @@ impl QMat {
         out
     }
 
-    /// Bench A/B (`PH-203k`): the previous prefill decomposition, split by **output
-    /// columns**. Kept behind `#[doc(hidden)]` so one process can compare it against the
-    /// row split under identical machine noise; production always uses [`QMat::matmul`].
+    /// Bench A/B (`PH-203k`/`PH-203n`): split by **output rows**, which is what
+    /// [`QMat::matmul`] picks once `X` outgrows the shared L3. Kept behind `#[doc(hidden)]`
+    /// so one process can compare both axes under identical machine noise.
     #[doc(hidden)]
     pub fn matmul_split_cols(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        self.matmul_out_rows(x, rows)
+    }
+
+    /// Split `Out` by weight rows: each worker dequantizes and streams only its own slice of
+    /// `W`, walking the whole (shared, sequentially streamed) `X`.
+    fn matmul_out_rows(&self, x: &[f32], rows: usize) -> Vec<f32> {
         let (m, n) = (self.rows(), self.cols());
         let threads = workers_for(rows.saturating_mul(m).saturating_mul(n), m);
         let (ggml_type, bytes) = match self {
