@@ -3,6 +3,23 @@
 **Продукт:** `rusty-engine` · Сесійна мова: «концепція → роадмеп → тікети → drain».
 **Host:** GSV hub (`S:/rust/GSV`, `:9999`) = master; це — portable plugin.
 
+## Сталий стан (2026-10-22, перевірено в репо)
+
+| Що | Значення |
+|----|----------|
+| HEAD / origin | `e44695d` (PH-203o), `origin/main` синхронний, `git status` clean |
+| Гейт | fmt ok · clippy `-D` **0** · **220** тестів (201 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
+| Код | Rust **13738** LOC (src 11612 / tests 1317 / xtask 319 / benches 490), UI 157 → ratio **98.9 %** · 66 tracked files · docs 2339 LOC |
+| Prefill (live `:8090`, 12 потоків, 961 tok) | **9.12–9.90 s** (було 190.9 s на старті перф-серії) · matmul 7.1–8.0 s (~77 %) · attention 0.81–0.88 s · other ~11 % |
+| Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
+| Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…o (recapture не робився) |
+| Живий білд | `target/release/rusty.exe` + `target/live/launch_serve.vbs` (CRLF!), `threads.txt`=12, `profile.txt`=1, звіт `target/live/rusty_prof.err.log` |
+
+**Далі:** `PH-203p` — ~11 % «other» у prefill (rmsnorm, RoPE, KV-copy, swiglu): спершу додати
+`Stage::Other`/лічильник у `src/profile.rs`, потім різати найбільший шматок. Після того —
+K-квантовий dequant-once на кратному 256 тайлі й NEON (B2). Матмул уже близько стелі
+(~74 GMAC/s на вузьких формах), attention більше не домінує.
+
 ## Що було зроблено (B0, campaign 2026-10-14)
 
 Створено новий **portable-plugin** репо `S:/rust/rusty-engine` — унікальний **pure-Rust

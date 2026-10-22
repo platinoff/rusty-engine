@@ -1,6 +1,6 @@
 # rusty-engine — PROJECT STATUS
 
-**Snapshot:** 2026-10-18 (agi-ланцюг: B0→B1 GGUF→B2 quant→B3 dense/KV/sampler/BPE→B4 MoE→B5
+**Snapshot:** 2026-10-22 (agi-ланцюг: B0→B1 GGUF→B2 quant→B3 dense/KV/sampler/BPE→B4 MoE→B5
 serve/heartbeat → **PH-405b forward-parity з llama-rs ✅** → **PH-507 hub provider-row E2E ✅
 (JSON + SSE) через живий хаб `:9999`** → **B2 SIMD bench ✅ (`PH-203` x86 / `PH-205`, 1.8–5.3×)**
 → **`PH-505` residual ✅ (per-process RAM у `/metrics`)** → **`PH-203d` AVX2+FMA fused dots ✅
@@ -27,22 +27,23 @@ down 10.0 → 36.4 GMAC/s; golden fingerprint не зрушив)** → **`PH-203
 live prefill **9.12–9.90 s**; fingerprint збігся)** ·
 **запушено 2026-10-22** (після `PH-203o`).
 
-## Верифікований стан (zmіряно цього сеансу, не «на памʼять»)
+## Верифікований стан (зміряно цього сеансу, не «на памʼять»)
 
 | Метрика | Значення |
 |---------|----------|
 | `git status` | **clean** (0 drift) |
-| Локальні коміти | **42** (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy; **pushed 2026-10-22**) |
+| Коміти | **99** усього (`git rev-list --count HEAD`); **42** у drain-серії B0→PH-203o (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy; **pushed 2026-10-22**, `origin/main` = `e44695d`) |
 | Тести | **220** (201 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
 | Rust LOC | **13738** (`src` 11612 + `tests` 1317 + `xtask` 319 + `benches` 490; `wc -l`) |
 | UI LOC (glue) | **157** (html+css+js) |
-| **Rust ratio** | **98.7%** (ціль 95–100 ✓) |
-| Docs LOC | 1885 (concept/arch/roadmap/UI/research/handoff/NEXT) |
-| Tracked files | 64 |
+| **Rust ratio** | **98.9%** (ціль 95–100 ✓) |
+| Docs LOC | 2339 (`git ls-files docs \| xargs wc -l`) |
+| Tracked files | 66 |
 | Реальна модель | `data/models/qwen2.5-0.5b-q4_k_m.gguf` (491 400 032 B, **gitignored**, sha256 `74a4da8c…`) |
 | Трекінг `data/` | лише `.gitkeep` (модель не в репо ✓) |
+| Live `:8090` (12 потоків, 961-tok prefill) | **9.12–9.90 s** · attention **812–880 ms** · matmul **7.07–7.95 s** (~77 %) · other ~11 % · decode **10.4–27.6 tok/s** (сильно залежить від фонового навантаження боксу; свіжий процес — 27.6) |
 
 ## Що зроблено (канон смуг → `docs/roadmap.md`)
 

@@ -35,15 +35,27 @@ cargo run --bin rusty -- --version
 cargo run --bin rusty -- --help
 ```
 
-## Status (verified 2026-10-14)
+## Status (verified 2026-10-22, `e44695d`)
 
-**19 commits · 79 tests · clippy `-D` clean · Rust ratio 96%.** End-to-end plumbing works:
-`ModelConfig → validate → GGUF dequant (Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K) → embed →
-`moe_layer_forward`/`block_forward` → sampler → byte-level BPE`. A **real** Qwen2.5-0.5B GGUF
-is parsed and geometry-validated (`rusty validate` = OK, 24 layers), first real weight
-materialized (`rusty tensor`). See [`docs/STATUS.md`](docs/STATUS.md) and
-[`docs/research/engine-landscape-2026.md`](docs/research/engine-landscape-2026.md).
+**99 commits · 220 tests (+5 ignored parity) · clippy `-D` clean · Rust ratio 98.9 % (13738 LOC).**
+End-to-end plumbing works: `ModelConfig → validate → GGUF dequant (Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K)
+→ embed → `moe_layer_forward`/`block_forward` → sampler → byte-level BPE`. A **real**
+Qwen2.5-0.5B GGUF is parsed and run (24 layers, greedy output byte-identical to the llama-rs
+oracle).
 
-Remaining: `PH-305` real multi-layer forward (numeric parity needs a llama-rs/llama.cpp
-reference → `PH-405`), HF-exact Qwen tokenization (`PH-305b`), then serving/build-matrix/fleet.
-See [`docs/roadmap.md`](docs/roadmap.md) and `S:/rust/GSV/docs/gsv/PRODUCTS.md` (row `rusty-engine`).
+Live `:8090`, Qwen2.5-0.5B Q4_K_M, 12 threads:
+
+| Path | Now | Session start |
+|------|-----|---------------|
+| prefill 961 tok | **9.12–9.90 s** | 190.9 s (20×) |
+| prefill 321 tok | 5.6 s | 45.6 s |
+| decode | **10.4–27.6 tok/s** (load-dependent) | 2.27 tok/s |
+| Q5_0 matmul 4864×896×961 | 199 ms single thread / 56 ms pool | 1009 ms |
+
+Profiled split of prefill: matmul ~77 %, attention 0.81–0.88 s, rmsnorm/RoPE/KV-copy/SwiGLU ~11 %.
+Golden fingerprint `tests/data/qwen25_golden.txt` has not moved through the whole PH-203j…o series.
+
+Remaining: `PH-203p` (the ~11 % "other" stage), K-quant dequant-once (tile multiple of 256),
+NEON, then `B6` build-matrix, `B7` docker, `B8` supervisor, `B9` dist-MoE, `B10` UI, `B11`
+distributions. See [`docs/STATUS.md`](docs/STATUS.md), [`docs/NEXT_SESSION_PROMPT.md`](docs/NEXT_SESSION_PROMPT.md)
+and `S:/rust/GSV/docs/gsv/PRODUCTS.md` (row `rusty-engine`).

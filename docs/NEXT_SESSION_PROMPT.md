@@ -1,5 +1,13 @@
 # NEXT_SESSION_PROMPT — rusty-engine
 
+## Сталий стан (2026-10-22) — почати звідси
+
+- **Owner product pick: `rusty-engine`** (не автоматично: Step 0 питає продукт; тут — вже обраний).
+- HEAD `e44695d` = `origin/main`, clean; гейт fmt/clippy-0/**220** тестів (+5 ignored) зелений.
+- Перф-серія prefill завершена: 961 tok **190.9 s → 9.12–9.90 s**; matmul ~77 %, attention 0.81–0.88 s, other ~11 % (див. `docs/STATUS.md`).
+- **Наступний зріз `PH-203p`:** інструментувати «other» — додати `Stage::Other` (або окремі rmsnorm/RoPE/kv/swiglu) у `src/profile.rs`, виміряти на `bash target/live/prefill_probe_lan.sh`, різати найбільший шматок. Далі: dequant-once для K-квантів (тайл кратний 256), NEON, B6–B11 (build-matrix/docker/fleet/dist-MoE/UI). Python-плейбук агента: `docs/HANDOFF_NEW_SESSION.md` §Продовження 17–18.
+- Заміри: лише на свіжому процесі, LAN-проба (`192.168.56.1:8090`), 3–4 прогони; `taskkill //IM rusty.exe //F` перед `cargo build --release`.
+
 ## Owner product pick: `rusty-engine`
 
 > Unknown pick = AskQuestion; iнакше продовжувати з `docs/HANDOFF_NEW_SESSION.md`.
