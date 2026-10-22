@@ -117,6 +117,14 @@ const PAR_SEQ_MIN: usize = 32;
 ///
 /// `k_rows`/`v_rows` are `pos_end × kv_dim` row-major, where `pos_end = pos_start + seq`
 /// (the KV cache or a prompt-local buffer — same layout).
+///
+/// `out` holds the rows `round, round + rounds, round + 2·rounds, …` of the head, in that
+/// order, so callers may hand interleaved row bundles of the same head to different workers.
+///
+/// Scores go through [`crate::kernel::dot_f32_x4_dispatch`] (one query load per four keys) and
+/// the value accumulation through [`crate::kernel::axpy_f32_dispatch`], which is bit-identical
+/// to the scalar `o += p * v` loop it replaces (`PH-203o`). The score change swaps the plain
+/// sequential f32 sum for the 8-lane ascending accumulator, i.e. a numeric slice.
 #[allow(clippy::too_many_arguments)]
 fn attention_head_ctx(
     q_all: &[f32],
@@ -126,29 +134,44 @@ fn attention_head_ctx(
     seq: usize,
     pos_start: usize,
     h: usize,
+    round: usize,
+    rounds: usize,
 ) -> Vec<f32> {
     let hd = g.head_dim;
     let kv_dim = g.n_kv_heads * hd;
     let q_dim = g.n_heads * hd;
     let kv_h = (h * g.n_kv_heads / g.n_heads) * hd;
     let scale = 1.0 / (hd as f32).sqrt();
-    let mut out = vec![0.0f32; seq * hd];
+    let rows = seq.saturating_sub(round).div_ceil(rounds.max(1));
+    let mut out = vec![0.0f32; rows * hd];
     let mut probs = vec![0.0f32; pos_start + seq];
-    for i in 0..seq {
+    for (k, o) in out.chunks_exact_mut(hd).enumerate() {
+        let i = round + k * rounds;
         let pos = pos_start + i;
         let qh = &q_all[i * q_dim + h * hd..i * q_dim + h * hd + hd];
-        // Causal scores over 0..=pos against the already-rotated keys.
-        for (j, p) in probs[..=pos].iter_mut().enumerate() {
+        // Causal scores over 0..=pos against the already-rotated keys, four keys per query load.
+        let mut j = 0;
+        while j + 4 <= pos + 1 {
+            let k0 = &k_rows[j * kv_dim + kv_h..j * kv_dim + kv_h + hd];
+            let k1 = &k_rows[(j + 1) * kv_dim + kv_h..(j + 1) * kv_dim + kv_h + hd];
+            let k2 = &k_rows[(j + 2) * kv_dim + kv_h..(j + 2) * kv_dim + kv_h + hd];
+            let k3 = &k_rows[(j + 3) * kv_dim + kv_h..(j + 3) * kv_dim + kv_h + hd];
+            let got = crate::kernel::dot_f32_x4_dispatch(qh, [k0, k1, k2, k3]);
+            probs[j] = got[0] * scale;
+            probs[j + 1] = got[1] * scale;
+            probs[j + 2] = got[2] * scale;
+            probs[j + 3] = got[3] * scale;
+            j += 4;
+        }
+        while j <= pos {
             let kh = &k_rows[j * kv_dim + kv_h..j * kv_dim + kv_h + hd];
-            *p = qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() * scale;
+            probs[j] = crate::kernel::dot_f32_dispatch(qh, kh) * scale;
+            j += 1;
         }
         softmax_in_place(&mut probs[..=pos]);
-        let o = &mut out[i * hd..(i + 1) * hd];
         for (j, p) in probs[..=pos].iter().enumerate() {
             let vh = &v_rows[j * kv_dim + kv_h..j * kv_dim + kv_h + hd];
-            for (x, vd) in o.iter_mut().zip(vh) {
-                *x += *p * *vd;
-            }
+            crate::kernel::axpy_f32_dispatch(o, vh, *p);
         }
     }
     out
@@ -182,25 +205,35 @@ fn attention_prefill_inner(
     let hd = g.head_dim;
     let q_dim = g.n_heads * hd;
     let mut ctx = vec![0.0f32; seq * q_dim];
-    let scatter = |ctx: &mut [f32], h: usize, c: &[f32]| {
-        for i in 0..seq {
-            let (a, b) = (i * q_dim + h * hd, (i * q_dim + h * hd) + hd);
-            ctx[a..b].copy_from_slice(&c[i * hd..(i + 1) * hd]);
-        }
+    // Jobs are `(head, interleaved row bundle)` pairs: causal rows are independent, and the
+    // cost of a row grows with its position, so rows are dealt round-robin instead of in
+    // contiguous blocks (`PH-203o`). Four rounds keeps all twelve workers busy when there are
+    // only `n_heads = 14` heads.
+    let rounds = if seq >= PAR_SEQ_MIN && g.n_heads > 1 {
+        let want = crate::pool::requested_threads() * 4;
+        (want / g.n_heads).clamp(1, seq)
+    } else {
+        1
     };
-    if seq >= PAR_SEQ_MIN && g.n_heads > 1 {
-        let parts = std::sync::Mutex::new(Vec::<(usize, Vec<f32>)>::with_capacity(g.n_heads));
-        crate::pool::parallel_for(g.n_heads, |h| {
-            let c = attention_head_ctx(q_all, k_rows, v_rows, g, seq, pos_start, h);
-            parts.lock().unwrap().push((h, c));
+    let jobs = g.n_heads * rounds;
+    let collected = std::sync::Mutex::new(Vec::with_capacity(jobs));
+    if jobs > 1 {
+        crate::pool::parallel_for(jobs, |ji| {
+            let (h, round) = (ji % g.n_heads, ji / g.n_heads);
+            let c = attention_head_ctx(q_all, k_rows, v_rows, g, seq, pos_start, h, round, rounds);
+            collected.lock().unwrap().push((h, round, c));
         });
-        for (h, c) in parts.into_inner().unwrap() {
-            scatter(&mut ctx, h, &c);
-        }
     } else {
         for h in 0..g.n_heads {
-            let c = attention_head_ctx(q_all, k_rows, v_rows, g, seq, pos_start, h);
-            scatter(&mut ctx, h, &c);
+            let c = attention_head_ctx(q_all, k_rows, v_rows, g, seq, pos_start, h, 0, 1);
+            collected.lock().unwrap().push((h, 0, c));
+        }
+    }
+    for (h, round, c) in collected.into_inner().unwrap() {
+        for (k, row) in c.chunks_exact(hd).enumerate() {
+            let i = round + k * rounds;
+            let a = i * q_dim + h * hd;
+            ctx[a..a + hd].copy_from_slice(row);
         }
     }
     ctx
@@ -656,5 +689,40 @@ mod tests {
             }
         }
         assert_eq!(cache.k.len(), seq * (g.n_kv_heads * g.head_dim));
+    }
+
+    #[test]
+    fn prefill_attention_row_rounds_are_bit_identical() {
+        // PH-203o: splitting a head's rows round-robin across jobs only regroups independent
+        // rows, so the assembled context must not move a single bit.
+        let g = Geometry::new(8, 4, 2, 4, 10_000.0, 1e-5);
+        let seq = 23usize;
+        let pos_start = 5usize;
+        let (q_dim, kv_dim) = (g.n_heads * g.head_dim, g.n_kv_heads * g.head_dim);
+        let q: Vec<f32> = (0..seq * q_dim)
+            .map(|i| ((i as i32 * 7 % 19) as f32) * 0.03 - 0.25)
+            .collect();
+        let k: Vec<f32> = (0..(pos_start + seq) * kv_dim)
+            .map(|i| ((i as i32 * 11 % 23) as f32) * 0.02 - 0.2)
+            .collect();
+        let v: Vec<f32> = (0..(pos_start + seq) * kv_dim)
+            .map(|i| ((i as i32 * 5 % 17) as f32) * 0.04 - 0.3)
+            .collect();
+        let whole = attention_head_ctx(&q, &k, &v, &g, seq, pos_start, 1, 0, 1);
+        let mut stitched = vec![f32::NAN; seq * g.head_dim];
+        for (k, row) in whole.chunks_exact(g.head_dim).enumerate() {
+            stitched[k * g.head_dim..(k + 1) * g.head_dim].copy_from_slice(row);
+        }
+        for rounds in [3usize, 7] {
+            let mut got = vec![f32::NAN; seq * g.head_dim];
+            for round in 0..rounds {
+                let part = attention_head_ctx(&q, &k, &v, &g, seq, pos_start, 1, round, rounds);
+                for (n, row) in part.chunks_exact(g.head_dim).enumerate() {
+                    let i = round + n * rounds;
+                    got[i * g.head_dim..(i + 1) * g.head_dim].copy_from_slice(row);
+                }
+            }
+            assert_eq!(got, stitched, "rounds {rounds} changed the context");
+        }
     }
 }

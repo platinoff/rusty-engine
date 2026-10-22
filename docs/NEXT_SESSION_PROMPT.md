@@ -503,4 +503,18 @@ push тільки B11.
 - **Далі:** attention (2.0 s, 19.3 %) — вже head-parallel, дивитись `attention_prefill_inner`;
   `other` ~11 %; NEON; `rb` для `m > 1024`.
 
+### Продовження 18 (2026-10-22, PH-203o — prefill attention 2.0 → 0.84 s)
+
+- Attention був **скалярним**: оцінки `zip().map().sum()` (1 MAC/цикл) і зважена сума значень
+  елемент-за-елементом. Тепер оцінки — `dot_f32_x4_dispatch` (одне завантаження `q` на 4 ключі;
+  числовий зріз, fingerprint збігся), значення — `axpy_f32_dispatch` (AVX2 `mul`+`add`,
+  **біт-у-біт**, тест на довжинах 1/7/8/9/64/67).
+- Розподіл: 14 голів × 4 round-robin «раунди» = 56 завдань замість 14 (було дві хвилі на 12
+  потоках); рядки чергуються, бо рядок `i` коштує O(i). Тест
+  `prefill_attention_row_rounds_are_bit_identical`.
+- Лайв: attention **812–880 ms** (було 2018), prefill **9.12–9.90 s** (було 10.44); matmul 77 %,
+  `other` ≈ 11 %.
+- Гейт: 201 lib + integration, clippy 0, `--ignored` зелений, golden не перезахоплювався.
+- **Далі:** `other` ≈ 1 s (rmsnorm/RoPE/KV-copy/swiglu) — додати стадію в профайлер; потім NEON.
+
 

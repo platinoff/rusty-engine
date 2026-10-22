@@ -729,3 +729,35 @@ attention 2.02 s (19.3 %), matvec 0.02 s. Форми: `4864×896` 53.9 GMAC/s, `
   потім K-chunking/`rb` для `m > 1024` (зараз `12640→7220 ms` — це вже майже стеля 74 GMAC/s
   на вузьких формах), NEON.
 
+### Продовження 22 — 2026-10-22: PH-203o — prefill attention 2.0 → 0.84 s (x4 scores + vector axpy + row rounds)
+
+Профіль після PH-203n показав attention **2.02 s (19.3 %, 24 × 84 ms)**. Порахували роботу:
+≈9.9 G MAC на оцінки + стільки ж на зважену суму значень, тобто attention був **compute-bound на
+скалярному** `qh.iter().zip(kh).map(..).sum()` (1 MAC/цикл), а не memory-bound.
+
+- **Оцінки** — `kernel::dot_f32_x4_dispatch(qh, [k_j..k_j+3])`: одне завантаження `q` на 4 ключі
+  (той самий 8-смуговий акумулятор, що й `dot_f32_dispatch`; хвіст — `dot_f32_dispatch`).
+  Це **числовий зріз** (послідовна f32-сума → 8-смуговий акумулятор).
+- **Зважена сума значень** — новий `kernel::axpy_f32_dispatch` (`y += a·x`, AVX2 8-wide,
+  `mul`+`add` без FMA-контракції) — **біт-у-біт** дорівнює скалярному `*o += p * *v`;
+  тест `axpy_dispatch_is_bit_exact_with_scalar` (довжини 1/7/8/9/64/67).
+- **Розподіл роботи**: 14 голів на 12 потоків давали дві хвилі (12 + 2). Тепер робота =
+  `(head, round)` з `rounds = clamp(4·threads / heads, 1, seq) = 4` → 56 завдань, рядки
+  роздаються **round-robin** (рядок `i` коштує O(i), тому суцільні блоки нерівні). Кожне
+  завдання пише свій набір рядків у спільний `ctx`; тест
+  `prefill_attention_row_rounds_are_bit_identical` (rounds 3 і 7 проти одного потоку).
+
+Лайв (release, 12 потоків, 4 прогони 961 tok): attention **812–880 ms** (було 2018), prefill
+**9.12–9.90 s** (було 10.44). `matmul` 7.07–7.95 s (77 %), форми стабільні: `4864×896`
+51–55 GMAC/s, `896×4864` 31–38, `896×896` 55–58, `128×896` 46–52. `other` ≈ 11 % (норми, RoPE,
+KV-копії, семплінг) — наступний за величиною після matmul.
+
+Гейт: 201 lib + integration green, clippy 0, fmt ok; `cargo test --release -- --ignored` —
+fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-токени не
+змінились, golden не перезахоплювався, попри числовий зріз в оцінках).
+
+- **Далі:** `other` ≈ 1 s — розкласти профайлером (rmsnorm/RoPE/KV-copy/swiglu —
+  `note_matmul` вже є, треба `Stage::Other` або лічильник на норми); далі K-квантовий
+  dequant-once 256 (`MATMUL_ROW_TILE` зараз 96 → для 256-блочних форматів тайл кратний 256?),
+  NEON.
+

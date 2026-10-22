@@ -1025,7 +1025,7 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Runtime-dispatched f32 dot: AVX2+FMA when the CPU reports support, else a scalar fold.
-fn dot_f32_dispatch(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot_f32_dispatch(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -1083,7 +1083,7 @@ unsafe fn dot_f32_avx2_x4(a: &[f32], b: [&[f32]; 4]) -> [f32; 4] {
 }
 
 /// Runtime-dispatched [`dot_f32_avx2_x4`]: AVX2+FMA when reported, else four scalar folds.
-fn dot_f32_x4_dispatch(a: &[f32], b: [&[f32]; 4]) -> [f32; 4] {
+pub(crate) fn dot_f32_x4_dispatch(a: &[f32], b: [&[f32]; 4]) -> [f32; 4] {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -1096,6 +1096,46 @@ fn dot_f32_x4_dispatch(a: &[f32], b: [&[f32]; 4]) -> [f32; 4] {
         out[k] = a.iter().zip(*bs).map(|(x, y)| x * y).sum();
     }
     out
+}
+
+/// AVX2 `y += a · x` — eight lanes, no FMA contraction (`mul` then `add`), so every element
+/// keeps the rounding of the scalar statement `y[i] + a * x[i]` (`PH-203o`).
+///
+/// # Safety
+/// Requires AVX2; slices must be the same length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn axpy_f32_avx2(y: &mut [f32], x: &[f32], a: f32) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(y.len(), x.len(), "axpy_f32_avx2: length mismatch");
+    let n = y.len();
+    let va = _mm256_set1_ps(a);
+    let mut i = 0;
+    while i + 8 <= n {
+        let prod = _mm256_mul_ps(va, _mm256_loadu_ps(x.as_ptr().add(i)));
+        let acc = _mm256_loadu_ps(y.as_ptr().add(i));
+        _mm256_storeu_ps(y.as_mut_ptr().add(i), _mm256_add_ps(acc, prod));
+        i += 8;
+    }
+    while i < n {
+        y[i] += a * x[i];
+        i += 1;
+    }
+}
+
+/// Runtime-dispatched [`axpy_f32_avx2`], bit-identical to the scalar loop.
+pub(crate) fn axpy_f32_dispatch(y: &mut [f32], x: &[f32], a: f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: gated by the runtime AVX2 check above.
+            unsafe { axpy_f32_avx2(y, x, a) };
+            return;
+        }
+    }
+    for (d, s) in y.iter_mut().zip(x) {
+        *d += a * *s;
+    }
 }
 
 /// Activation rows per matmul cache tile (see [`matmul_reuse`]).
@@ -2097,6 +2137,27 @@ mod tests {
             &matmul_q6_k_dispatch(&q6, km, kn, &kx, rows),
             &krowwise(&q6, matvec_q6_k_dispatch)
         ));
+    }
+
+    #[test]
+    fn axpy_dispatch_is_bit_exact_with_scalar() {
+        // PH-203o: the padded 8-wide body must round exactly like `y[i] + a * x[i]`, which is
+        // what attention used before the vectorized value accumulation.
+        for len in [1usize, 7, 8, 9, 64, 67] {
+            let x: Vec<f32> = (0..len)
+                .map(|i| ((i as i32 * 13 % 29) as f32) * 0.07 - 0.9)
+                .collect();
+            let mut want: Vec<f32> = (0..len)
+                .map(|i| ((i as i32 * 5 % 31) as f32) * 0.05 - 0.6)
+                .collect();
+            let mut got = want.clone();
+            let a = 0.371_390_8_f32;
+            for (y, xx) in want.iter_mut().zip(&x) {
+                *y += a * *xx;
+            }
+            axpy_f32_dispatch(&mut got, &x, a);
+            assert_eq!(got, want, "len {len} drifted from the scalar axpy");
+        }
     }
 
     #[test]
