@@ -112,6 +112,7 @@ impl DenseRunner {
     /// whole prefix (causal), so this is the correct "next-token from a prompt" call.
     pub fn prefill_logits(&self, tokens: &[u32]) -> Vec<f32> {
         assert!(!tokens.is_empty(), "prefill_logits: empty prompt");
+        let t0 = std::time::Instant::now();
         let d = self.geom.d_model;
         let mut hidden = vec![0.0f32; tokens.len() * d];
         for (i, &t) in tokens.iter().enumerate() {
@@ -120,6 +121,10 @@ impl DenseRunner {
         for blk in &self.blocks {
             hidden = block_forward_seq(&hidden, blk, &self.geom, 0);
         }
+        crate::profile::print_report_once(
+            t0.elapsed().as_nanos() as u64,
+            &format!("re-prefill {} tok", tokens.len()),
+        );
         last_logits(
             &hidden,
             &self.geom,
@@ -224,6 +229,7 @@ impl<'a> DenseDecoder<'a> {
     /// layer instead of `prompt.len()`.
     pub fn prefill(&mut self, prompt: &[u32]) -> Vec<f32> {
         assert!(!prompt.is_empty(), "prefill: empty prompt");
+        let t0 = std::time::Instant::now();
         let g = &self.runner.geom;
         let d = g.d_model;
         let mut hidden = vec![0.0f32; prompt.len() * d];
@@ -237,7 +243,12 @@ impl<'a> DenseDecoder<'a> {
         self.seq_len += prompt.len();
         let last = &hidden[(prompt.len() - 1) * d..prompt.len() * d];
         let normed = rmsnorm(last, &self.runner.output_norm, g.rms_eps);
-        logits_from_hidden(&normed, &self.runner.output, g, self.runner.n_vocab)
+        let logits = logits_from_hidden(&normed, &self.runner.output, g, self.runner.n_vocab);
+        crate::profile::print_report(
+            t0.elapsed().as_nanos() as u64,
+            &format!("serve prefill {} tok", prompt.len()),
+        );
+        logits
     }
 
     /// Prefill the prompt, then greedily append up to `max_new` tokens (stop at EOS).

@@ -470,3 +470,20 @@ push тільки B11.
   частку attention у prefill, dequant-once 256 для K-квантів, repack layout (PH-202), 4-рядковий
   блок (`dot` по 4 рядках `X` за один прохід ваги — більше FMA без нових hsum).
 
+### Продовження 16 (2026-10-22, PH-203m — профайлер: matmul 84.4 %, attention 9.4 %)
+
+- `src/profile.rs` + `RUSTY_PROFILE=1`: стадії `matvec`/`matmul`/`attention` атомарними
+  лічильниками, звіт у `DenseDecoder::prefill` (serve) і один раз у `prefill_logits`; плюс
+  розбивка `matmul` за формою. Вимкнено — один relaxed load на проєкцію.
+- Live 961 tok: wall 20.2 s = matmul **84.4 %**, attention 9.4 % (1.9 s), other ~6 %. Attention
+  не ботлнек (у 9× дешевший за matmul).
+- **Down-проєкція `896×4864` = 10.0 GMAC/s** проти 34.8–36.0 у `4864×896`/`896×896`/`128×896`:
+  24 down-виклики = ~60 % усього matmul-часу. Причина — `n=4864` → rowbuf 19.5 KiB + тайл
+  `X` 312 KiB не влазять в L1, `dot` тягне з L2.
+- Стеля: 1 FMA на 2 завантаження = ліміт load-портів AVX2 (6.9 GMAC/s ≈ 82 % від 8 MAC/цикл).
+  Важіль — **register blocking на 4 рядки `X`** (4 FMA / 5 loads ≈ 1.9×, біт-у-біт); альтернатива
+  для широких форм — K-chunking 1024 (числовий зріз).
+- Логи профілю: `target/live/rusty_prof.{out,err}.log`; `target/live/profile.txt` вмикає профіль
+  у `launch_serve.vbs` (видалити файл = вимкнути).
+
+

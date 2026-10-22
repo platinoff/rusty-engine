@@ -29,6 +29,8 @@
 //! - [`hub`]   — GSV-native master supervisor (Rust k8s-lite, B8)
 //! - [`worker`] — hub-edge worker/APK role (register/heartbeat/poll/complete, 2026-10-16)
 //! - [`backend`] — compile-time SIMD backend selection (sse/avx/neon, B6 `PH-606`)
+//! - [`profile`] — opt-in per-stage wall-clock accounting of the hot forward path
+//!   (`RUSTY_PROFILE=1`)
 
 pub mod backend;
 pub mod cache;
@@ -45,6 +47,7 @@ pub mod model;
 pub mod moe;
 pub mod node;
 pub mod pool;
+pub mod profile;
 pub mod qmat;
 pub mod quant;
 pub mod repack;

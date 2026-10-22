@@ -165,6 +165,20 @@ fn attention_prefill(
     seq: usize,
     pos_start: usize,
 ) -> Vec<f32> {
+    crate::profile::timed(crate::profile::Stage::Attention, || {
+        attention_prefill_inner(q_all, k_rows, v_rows, g, seq, pos_start)
+    })
+}
+
+/// Untimed body of [`attention_prefill`].
+fn attention_prefill_inner(
+    q_all: &[f32],
+    k_rows: &[f32],
+    v_rows: &[f32],
+    g: &Geometry,
+    seq: usize,
+    pos_start: usize,
+) -> Vec<f32> {
     let hd = g.head_dim;
     let q_dim = g.n_heads * hd;
     let mut ctx = vec![0.0f32; seq * q_dim];

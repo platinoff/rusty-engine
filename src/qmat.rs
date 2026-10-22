@@ -73,6 +73,11 @@ impl QMat {
     /// threads (`RUSTY_THREADS` / available parallelism). Each row runs the identical
     /// scalar sequence, so results are bit-for-bit independent of the thread count.
     pub fn matvec(&self, x: &[f32]) -> Vec<f32> {
+        crate::profile::timed(crate::profile::Stage::Matvec, || self.matvec_inner(x))
+    }
+
+    /// Untimed body of [`QMat::matvec`].
+    fn matvec_inner(&self, x: &[f32]) -> Vec<f32> {
         match self {
             Self::F32 { .. } => self.matvec_serial(x),
             Self::Quant {
@@ -154,6 +159,22 @@ impl QMat {
     /// weight re-reads — which pins the projection to L3 bandwidth (`PH-203k`). Each
     /// worker's rows are contiguous in the row-major `Out`.
     pub fn matmul(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        if !crate::profile::enabled() {
+            return self.matmul_inner(x, rows);
+        }
+        let t = std::time::Instant::now();
+        let out = self.matmul_inner(x, rows);
+        crate::profile::note_matmul(
+            t.elapsed().as_nanos() as u64,
+            self.rows(),
+            self.cols(),
+            rows,
+        );
+        out
+    }
+
+    /// Untimed body of [`QMat::matmul`].
+    fn matmul_inner(&self, x: &[f32], rows: usize) -> Vec<f32> {
         let (m, n) = (self.rows(), self.cols());
         let threads = workers_for(rows.saturating_mul(m).saturating_mul(n), rows);
         let (ggml_type, bytes) = match self {
