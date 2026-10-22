@@ -446,3 +446,27 @@ push тільки B11.
   змінює порядок сум, тому це окремий числовий зріз з `RUSTY_CAPTURE_GOLDEN=1`; інакше
   dequant-once 256 / repack PH-202 / замір частки attention.
 
+### Продовження 15 (2026-10-22, PH-203l — full-row f32 акумулятор, числовий зріз)
+
+- `kernel::matmul_reuse` більше не кличе `dot` на кожен 32/256-блок: ваговий рядок
+  дейквантизується **цілком** (`dequant_row`) у буфер `n` f32 і дотримується проти рядка `X`
+  одним викликом `dot_f32_dispatch` → **один hsum на `(row, r)`** замість 28 (для K-квантів — 3–19).
+- Порядок сум інший (8-смуговий акumulator по всьому рядку vs hsum-на-блок + f32-додавання),
+  тому це числовий зріз. Старий шлях лишено як `matmul_reuse_blocks` +
+  `matmul_q5_0_blockwise` (`#[doc(hidden)]`): оракул і бенч-A/B. Новий тест
+  `matmul_row_wise_accumulator_matches_block_wise` тримає розбіжність ≤1e-4 відносної на
+  896-широкому рядку (факт: ~2e-5).
+- **Golden не перезахоплювався:** `cargo test --release -- --ignored` з новим акумулятором
+  пройшов без recapture — greedy-fingerprint (re-prefill + incremental/serve) **не зрушив**.
+  Це головний доказ, що зміна — лише f32-округлення, а не семантика.
+- Заміри (`cargo bench --bench quant`, один процес, min-of-7 interleaved):
+  single-thread Q5_0 4864×896×961 **block 805.9 → row 606.3 ms (1.33×)**; serial 1469 (PH-203j)
+  → 859 ms; QMat parallel 92.5 ms = **45 GMAC/s** (9.29× над serial). Tile sweep став плоским
+  (961→606.7, 16→610.8) — тайлінг більше нічого не дає, кандидат на спрощення.
+- Гейт: fmt ok, **195 lib** + integration green, clippy 0, 5 ignored parity green.
+- **Live:** release + `spawn_threads.ps1 -Threads 12`, проба на LAN — prefill 961 tok
+  **18.93 / 19.04 s** (було 26.9–27.3 s у §14) — перший end-to-end виграш після PH-203h.
+- **Далі:** tile-цикл тепер зайвий (спростити або прибрати `MATMUL_ROW_TILE`); далі — заміряти
+  частку attention у prefill, dequant-once 256 для K-квантів, repack layout (PH-202), 4-рядковий
+  блок (`dot` по 4 рядках `X` за один прохід ваги — більше FMA без нових hsum).
+

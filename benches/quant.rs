@@ -353,4 +353,22 @@ fn main() {
             (rows as f64 * gm as f64 * n as f64 / 1e9) / (ms / 1e3)
         );
     }
+
+    // PH-203l numeric slice: full-row f32 accumulator (one hsum per row) vs the per-block
+    // accumulator the recorded goldens came from. Same rounding class, different order.
+    let (mut row_best, mut block_best) = (f64::INFINITY, f64::INFINITY);
+    for _ in 0..7 {
+        let t = time(1, || {
+            black_box(k::matmul_q5_0_tiled(&wg, gm, n, &xb, rows, 16));
+        });
+        row_best = row_best.min(t.as_secs_f64() * 1e3);
+        let t = time(1, || {
+            black_box(k::matmul_q5_0_blockwise(&wg, gm, n, &xb, rows, 16));
+        });
+        block_best = block_best.min(t.as_secs_f64() * 1e3);
+    }
+    println!(
+        "prefill accumulator A/B (min of 7, single thread):  row {row_best:>7.1} ms | block {block_best:>7.1} ms | row/block {:>5.2}x",
+        block_best / row_best
+    );
 }

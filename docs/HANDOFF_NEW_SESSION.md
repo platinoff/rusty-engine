@@ -604,3 +604,38 @@ Gate: fmt 0, clippy `--all-targets -D warnings` 0, **203 тести** green + у
   recapture); альтернативи: dequant-once 256 для K-квантів, repack layout (PH-202), виміряти
   частку attention у 23.5 s.
 
+
+### Продовження 19 — 2026-10-22: PH-203l — full-row f32 акумулятор (числовий зріз, golden не зрушив)
+
+- Після §18 вузьким місцем лишалась **латентність на кожен `(row, r)`**: `matmul_reuse` кликав
+  `dot` на кожен 32- (Q4_0/Q5_0/Q8_0) або 256-елементний (K-кванти) блок, тобто на 896-широкому
+  рядку — 28 викликів з dispatch і 28 hsum, а кожен hsum це серійний 5-оп ланцюг на 4-FMA залежності.
+- **`src/kernel.rs`:** ваговий рядок тепер дейквантизується **цілком** (`dequant_row` у буфер `n`
+  f32, ті самі блокові `dq`), після чого один `dot_f32_dispatch(&rowbuf, x_row)` на рядок.
+  Обхід `X` тайлами лишився, але результат від тайла більше не залежить узагалі.
+- Старий шлях збережено як `matmul_reuse_blocks` + бенч-хвіст `matmul_q5_0_blockwise`
+  (`#[doc(hidden)]`): це оракул для нового тесту і пара для A/B (новий хвіст — `matmul_q5_0_tiled`).
+- **Числовий зріз:** порядок сум інший (один 8-смуговий акumulator по всьому рядку проти
+  hsum-на-блок + f32-додавання). Тест `matmul_row_wise_accumulator_matches_block_wise`
+  (9×896, 37 рядків) тримає ≤1e-4 відносної; фактична розбіжність на першому елементі
+  −1.0500221 vs −1.0499992 (~2.2e-5).
+- **Golden не перезахоплювався — і не потребував:** `cargo test --release -- --ignored`
+  (qwen25 fingerprint re-prefill **і** incremental/serve, `greedy_text_against_recorded_oracle`,
+  `tokenizer_json_byte_exact_gate`, `dense_runner_loads_real_qwen`) — усе green на новому
+  акумуляторі. Це прямий доказ, що зріз семантично нейтральний. (`rusty.exe` перед release-тестом
+  треба вбити: `taskkill //F //PID <n>`, інакше лінк у `target/release/rusty.exe` падає з os error 5.)
+- Заміри `cargo bench --bench quant` (min-of-7, interleaved, один процес, `target/live/bench_ph203l.txt`):
+  single-thread Q5_0 4864×896×961 **block 805.9 → row 606.3 ms (1.33×)**; serial-рядок бенча
+  **859.1 ms** (було 1469 у PH-203j, 897–1103 у PH-203k); QMat parallel **92.5 ms**
+  (= 45 GMAC/s, 9.29× над serial). **Tile sweep плоский:** 961→606.7, 128→616.4, 64→612.1,
+  32→617.4, 16→610.8 ms — тайлінг став зайвим (рядковий `dot` читає `X` суміжно), це
+  кандидат на спрощення наступним зрізом.
+- Гейт: `cargo fmt --all -- --check` ok, **195 lib** + integration green,
+  `clippy --all-targets -D warnings` 0.
+- **End-to-end тепер заявляємо:** release перезібрано, `:8090` піднято
+  `spawn_threads.ps1 -Threads 12`, проби на LAN (`bash target/live/prefill_probe_lan.sh`):
+  961 tok = **18.93 / 19.04 s** проти **26.9–27.3 s** у §18 на тому ж завантаженому боксі
+  (1.4×) і 23.46 s у §16 — це перший end-to-end виграш після PH-203h.
+- **Далі:** (1) прибрати/спростити `MATMUL_ROW_TILE`, якщо flat-свіп підтвердиться; (2) 4-рядковий
+  блок — один прохід ваги проти 4 рядків `X` (більше FMA на hsum, новий числовий зріз);
+  (3) заміряти частку attention у prefill; (4) dequant-once 256 для K-квантів; (5) repack PH-202.

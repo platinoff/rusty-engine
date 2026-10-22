@@ -1042,12 +1042,76 @@ fn dot_f32_dispatch(a: &[f32], b: &[f32]) -> f32 {
 /// the untiled walk re-reads a 3.3 MiB activation matrix per weight row (`PH-203k`).
 const MATMUL_ROW_TILE: usize = 16;
 
-/// Batched `W[m×n] · X[rows×n] → Out[rows×m]`, dequantizing each `block_bytes` block once
-/// (via `dq`) and reusing it across every row. `X` is walked in `tile`-row cache blocks;
-/// each `(row, r)` still accumulates its blocks in ascending order, so the result is
-/// bit-identical to the untiled walk for any `tile`.
+/// Batched `W[m×n] · X[rows×n] → Out[rows×m]`. Each weight row is dequantized **once per
+/// output row** (`dq` over the whole `n`) and then dotted against every activation row with a
+/// single f32 reduction, so a `(row, r)` pair pays one horizontal sum instead of one per
+/// quant block. `X` is walked in `tile`-row cache blocks to keep the activation slice in L2.
+///
+/// Summation order per `(row, r)` is the row-wide 8-lane partial accumulation inside
+/// [`dot_f32_dispatch`] — that is *not* the block-wise order the pre-`PH-203l` kernel used, so
+/// results differ from it by f32 rounding (see [`matmul_reuse_blocks`] for the old path).
 #[allow(clippy::too_many_arguments)]
 fn matmul_reuse(
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    tile: usize,
+    block_bytes: usize,
+    block_vals: usize,
+    dq: impl Fn(&[u8], &mut [f32]),
+) -> Vec<f32> {
+    debug_assert_eq!(x.len(), rows * n, "matmul: X rows × n");
+    let tile = tile.max(1);
+    let blocks = n / block_vals;
+    let row_bytes = blocks * block_bytes;
+    debug_assert_eq!(w.len(), m * row_bytes, "matmul: weight size");
+    let mut out = vec![0.0f32; rows * m];
+    let mut rowbuf = vec![0.0f32; n];
+    for r in 0..m {
+        dequant_row(
+            &w[r * row_bytes..(r + 1) * row_bytes],
+            &mut rowbuf,
+            block_bytes,
+            block_vals,
+            &dq,
+        );
+        let mut r0 = 0;
+        while r0 < rows {
+            let r1 = (r0 + tile).min(rows);
+            for row in r0..r1 {
+                let xs = row * n;
+                out[row * m + r] = dot_f32_dispatch(&rowbuf, &x[xs..xs + n]);
+            }
+            r0 = r1;
+        }
+    }
+    out
+}
+
+/// Dequantize one stored weight row (`blocks * block_vals` values) into `out` with the same
+/// block layout the fused kernels use.
+fn dequant_row(
+    raw: &[u8],
+    out: &mut [f32],
+    block_bytes: usize,
+    block_vals: usize,
+    dq: &impl Fn(&[u8], &mut [f32]),
+) {
+    for (src, dst) in raw
+        .chunks_exact(block_bytes)
+        .zip(out.chunks_exact_mut(block_vals))
+    {
+        dq(src, dst);
+    }
+}
+
+/// The pre-`PH-203l` accumulator: one `dot` per quant block, each f32-added into the row total.
+/// Kept as the numeric oracle and bench A/B for [`matmul_reuse`] (`#[doc(hidden)]` bench hooks
+/// `matmul_q5_0_blockwise`), because it is the path the recorded golden fingerprints came from.
+#[allow(clippy::too_many_arguments)]
+fn matmul_reuse_blocks(
     w: &[u8],
     m: usize,
     n: usize,
@@ -1116,6 +1180,21 @@ pub fn matmul_q5_0_tiled(
 ) -> Vec<f32> {
     debug_assert_eq!(n % 32, 0, "matmul_q5_0_tiled: n%32");
     matmul_reuse(w, m, n, x, rows, tile, 22, 32, dq_q5_0_block)
+}
+
+/// Batched Q5_0 through the per-block accumulator ([`matmul_reuse_blocks`]): the numeric
+/// oracle and bench A/B for [`matmul_reuse`] (`PH-203l`).
+#[doc(hidden)]
+pub fn matmul_q5_0_blockwise(
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    tile: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matmul_q5_0_blockwise: n%32");
+    matmul_reuse_blocks(w, m, n, x, rows, tile, 22, 32, dq_q5_0_block)
 }
 
 /// Batched Q8_0 `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
@@ -1765,6 +1844,26 @@ mod tests {
         for tile in [1usize, 3, 31, 32, 64, 128] {
             let got = matmul_q5_0_tiled(&w, m, n, &x, rows, tile);
             assert_eq!(got, untiled, "tile {tile} changed the result");
+        }
+    }
+
+    #[test]
+    fn matmul_row_wise_accumulator_matches_block_wise() {
+        // PH-203l: the row-wide f32 reduction is a different summation order, not a different
+        // value — it must track the per-block accumulator to f32 rounding on a real-width row.
+        let (m, n, rows) = (9usize, 896usize, 37usize);
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i as i32 * 13 % 29) as f32) * 0.03 - 0.45)
+            .collect();
+        let w = q5_blocks(m * n / 32);
+        let row = matmul_q5_0_tiled(&w, m, n, &x, rows, MATMUL_ROW_TILE);
+        let block = matmul_q5_0_blockwise(&w, m, n, &x, rows, MATMUL_ROW_TILE);
+        assert_eq!(row.len(), m * rows);
+        for (i, (a, b)) in row.iter().zip(&block).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-4 * (1.0 + b.abs()),
+                "row-wise vs block-wise drift at {i}: {a} vs {b}"
+            );
         }
     }
 }
