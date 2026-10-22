@@ -10,16 +10,19 @@ serve/heartbeat → **PH-405b forward-parity з llama-rs ✅** → **PH-507 hub 
 position + rotated KV cache ✅ (decode 7.4→10.4 tok/s, prefill 321 tok 25.5→5.9 s, 961 tok
 190.9→29.1 s)** → **`PH-203h` head-parallel prefill attention ✅ (961 tok 29.1→23.5 s)** →
 **`PH-203i` f16-widening + q8_0 integer-dot probe ✅ (dot q8_0 9.55×, matvec 896² 11.8 GMAC/s,
-live decode 10.9→27.6 tok/s; int8 slower than the fixed float path, not wired))** ·
-**запушено 2026-10-21** (owner зняв B11 remote-only: `origin/main` = `ef0378a`).
+live decode 10.9→27.6 tok/s; int8 slower than the fixed float path, not wired))** →
+**`PH-203j` row-batched matmul ❌ (bit-exact але 3–4× повільніше, відкочено)** →
+**`PH-203k` activation tiling + row-split projections ✅ (serial 1469→897 ms, prefill matmul
+cols→rows 248→190 ms 1.30× in-process)** ·
+**запушено 2026-10-22** (після `PH-203k`).
 
 ## Верифікований стан (zmіряно цього сеансу, не «на памʼять»)
 
 | Метрика | Значення |
 |---------|----------|
 | `git status` | **clean** (0 drift) |
-| Локальні коміти | **36** (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int; **pushed 2026-10-21** → `origin/main` `ef0378a`) |
-| Тести | **212** (193 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
+| Локальні коміти | **38** (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul; **pushed 2026-10-22**) |
+| Тести | **213** (194 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
 | Rust LOC | **12664** (`src` 10711 + `tests` 1317 + `xtask` 319 + `benches` 317) |
@@ -37,7 +40,7 @@ live decode 10.9→27.6 tok/s; int8 slower than the fixed float path, not wired)
 | **B0** scaffold | ✅ | workspace + bin `rusty` + `xtask`; MoE `top_k`; 7 модулів |
 | **B1** GGUF-чанкер | ✅ **complete** | header+KV+tensor-info, mmap/staged, sizes+Q4_0/Q8_0/Q4_K/Q5_K/Q6_K dequant, tokenizer-meta, `rusty inspect` |
 | B1-real parity | ✅ | реальний Qwen2.5: парсер+`ggml_dtype` (баг off-by-K знайдено/виправлено) |
-| **B2** kernels | 🟡 | `PH-201/201+/201c/201d` fused dot/gemv Q4_0/Q5_0/Q8_0 + oracle K-кванти; `PH-204` fused K-quant dot/gemv; `PH-202` repack; **`PH-203` x86 SIMD (SSE2 Q4_0/Q8_0, AVX2 Q4_0/Q5_0/Q8_0/Q4_K/Q6_K) + `PH-205` bench ✅ (1.8–5.3×)**; **`PH-203d` AVX2+FMA fused dots ✅ (Q8_0 dot 1.72→2.09×)**; **`PH-203e` row-parallel matvec/matmul ✅ (decode 2.68→4.2–5.1 tok/s, prefill 45.6→24.7 s, `RUSTY_THREADS`)**; **`PH-203f` persistent pool ✅ (decode 4.4→7.2–7.9 tok/s, gate/up matvec 1.270→0.684 ms, prefill matmul 4.08×)**; **`PH-203g` RoPE once/position + rotated KV ✅ (decode→10.4 tok/s, prefill 321 tok 25.5→5.9 s, 961 tok 190.9→29.1 s)**; **`PH-203h` head-parallel prefill attention ✅ (961 tok →23.5 s, 8.1× від початку сесії)**; **`PH-203i` f16-widening + q8_0 integer-dot probe ✅ (dot q8_0 9.55×, matvec 896² 11.8 GMAC/s, decode 27.6 tok/s; int8 не wired — повільніший за виправлений float)**; лишився NEON |
+| **B2** kernels | 🟡 | `PH-201/201+/201c/201d` fused dot/gemv Q4_0/Q5_0/Q8_0 + oracle K-кванти; `PH-204` fused K-quant dot/gemv; `PH-202` repack; **`PH-203` x86 SIMD (SSE2 Q4_0/Q8_0, AVX2 Q4_0/Q5_0/Q8_0/Q4_K/Q6_K) + `PH-205` bench ✅ (1.8–5.3×)**; **`PH-203d` AVX2+FMA fused dots ✅ (Q8_0 dot 1.72→2.09×)**; **`PH-203e` row-parallel matvec/matmul ✅ (decode 2.68→4.2–5.1 tok/s, prefill 45.6→24.7 s, `RUSTY_THREADS`)**; **`PH-203f` persistent pool ✅ (decode 4.4→7.2–7.9 tok/s, gate/up matvec 1.270→0.684 ms, prefill matmul 4.08×)**; **`PH-203g` RoPE once/position + rotated KV ✅ (decode→10.4 tok/s, prefill 321 tok 25.5→5.9 s, 961 tok 190.9→29.1 s)**; **`PH-203h` head-parallel prefill attention ✅ (961 tok →23.5 s, 8.1× від початку сесії)**; **`PH-203i` f16-widening + q8_0 integer-dot probe ✅ (dot q8_0 9.55×, matvec 896² 11.8 GMAC/s, decode 27.6 tok/s; int8 не wired — повільніший за виправлений float)**; **`PH-203k` activation tiling (16 рядків, 57 KiB) + row-split проєкцій ✅ (prefill matmul serial 1469→897 ms, cols→rows 1.30× in-process)**; лишився NEON |
 | **B3** forward | ✅ **complete** | `PH-301..306` + `PH-305a/c/d/e` + **`PH-305`/`PH-306`** (multi-layer dense runner + CLI `rusty run`, real Qwen2.5 24-layer prefill) + **`PH-305b`** (BPE byte-fallback + atomic specials) + **`PH-306b`** (text pipeline: `src/textgen.rs` `TextRunner` + `rusty run -p "text"` + `tests/text_gen.rs` synth round-trip); **`PH-405`** numeric regression-gate + **`PH-405b`** semantic greedy-parity з llama-rs ✅ |
 | **B4** MoE-core | 🟡 | `PH-401..403` (router softmax/sigmoid/group, SwiGLU, shared) + `PH-406a` `moe_layer_forward` + **`PH-404` expert-cache LRU** (`src/cache.rs`, budgeted + pin + prefetch); parity/run/bench (405/406/407) open |
 | **B5** serve | 🟡 | PH-501a/b (std HTTP + real TextRunner), PH-502 (SSE), PH-503 (slot-cache), PH-504 (heartbeat), PH-505 (**metrics + per-process RAM**), PH-506 (serve integration tests ✅); **PH-507 hub provider-row E2E ✅ (`rusty-serve` через хаб, JSON+SSE)** |

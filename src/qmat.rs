@@ -145,11 +145,59 @@ impl QMat {
 
     /// Batched `W[m×n] · X[rows×n] → Out[rows×m]` for prefill. Quant formats swap each
     /// block's dequant out of the row loop (see `kernel::matmul_*`), so the int→float
-    /// conversions that dominate `matvec` are paid once instead of once per row. Split by
-    /// **weight rows** (output columns) so each block is still dequantized exactly once —
-    /// splitting by input rows would re-dequantize the whole matrix per worker. Each worker's
-    /// block is scattered back into the row-major `Out`.
+    /// conversions that dominate `matvec` are paid once instead of once per row.
+    ///
+    /// Split by **input rows**: every worker streams the same weights (a few MiB, re-read
+    /// `threads` times) while each owns a `rows/threads` slice of `X` (~290 KiB, L2-sized).
+    /// Splitting by output columns instead makes all workers walk the whole activation
+    /// matrix per weight row — a shared 16 GiB `X` stream per projection against ~36 MiB of
+    /// weight re-reads — which pins the projection to L3 bandwidth (`PH-203k`). Each
+    /// worker's rows are contiguous in the row-major `Out`.
     pub fn matmul(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        let (m, n) = (self.rows(), self.cols());
+        let threads = workers_for(rows.saturating_mul(m).saturating_mul(n), rows);
+        let (ggml_type, bytes) = match self {
+            Self::Quant {
+                ggml_type, bytes, ..
+            } => (*ggml_type, bytes.as_slice()),
+            Self::F32 { .. } => return self.matmul_serial(x, rows),
+        };
+        let Some(_rb) = crate::kernel::quant_row_bytes(ggml_type, n) else {
+            return self.matmul_serial(x, rows);
+        };
+        if threads <= 1 {
+            return self.matmul_serial(x, rows);
+        }
+        let chunk = rows.div_ceil(threads);
+        let jobs = rows.div_ceil(chunk);
+        let parts = std::sync::Mutex::new(Vec::<(usize, Vec<f32>)>::with_capacity(jobs));
+        crate::pool::parallel_for(jobs, |ji| {
+            let row0 = ji * chunk;
+            let rc = chunk.min(rows - row0);
+            let got = crate::kernel::matmul_dispatch(
+                ggml_type,
+                bytes,
+                m,
+                n,
+                &x[row0 * n..(row0 + rc) * n],
+                rc,
+            );
+            parts.lock().unwrap().push((ji, got));
+        });
+        let mut out = vec![0f32; rows * m];
+        for (ji, got) in parts.into_inner().unwrap() {
+            let row0 = ji * chunk;
+            let rc = chunk.min(rows - row0);
+            out[row0 * m..(row0 + rc) * m].copy_from_slice(&got);
+        }
+        out
+    }
+
+    /// Bench A/B (`PH-203k`): the previous prefill decomposition, split by **output
+    /// columns**. Kept behind `#[doc(hidden)]` so one process can compare it against the
+    /// row split under identical machine noise; production always uses [`QMat::matmul`].
+    #[doc(hidden)]
+    pub fn matmul_split_cols(&self, x: &[f32], rows: usize) -> Vec<f32> {
         let (m, n) = (self.rows(), self.cols());
         let threads = workers_for(rows.saturating_mul(m).saturating_mul(n), m);
         let (ggml_type, bytes) = match self {

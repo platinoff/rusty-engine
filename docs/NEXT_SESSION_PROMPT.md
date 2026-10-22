@@ -429,3 +429,20 @@ push тільки B11.
 - **Далі:** перед новими правками prefill виміряти частку attention у 23.5 s; для matmul —
   repack layout (PH-202) або K-quant dequant-once на 256, не перестановка циклів.
 
+### Продовження 14 (2026-10-22, PH-203k — activation tiling + row-split проєкцій)
+
+- Знайдено справжній ботлнек prefill-matmul: це **трафік `X`**, не форма циклу. Старий
+  `matmul_reuse` сканував усі 3.3 MiB активацій на кожен ваговий рядок (≈16 GiB з L3 на проєкцію),
+  а `QMat::matmul` ділив роботу по стовпцях, тобто 12 воркерів годували той самий потік.
+- Зроблено: `MATMUL_ROW_TILE = 16` (57 KiB, L2) в `kernel::matmul_reuse` — біт-у-біт, тест
+  `matmul_activation_tiling_is_bit_identical`; `QMat::matmul` ділиться по **вхідних рядках**
+  (кожен воркер ~290 KiB `X`, ваги ≈36 MiB на всіх), старий варіант — `matmul_split_cols` для A/B.
+- Заміри (один процес): serial 4864×896×961 1469→**897–1103 ms**; decomposition A/B
+  cols→rows **248→190 ms (1.30×)**, повтор 344→291 (1.18×). Live prefill 961 tok 26.9–27.3 s на
+  завантаженому боксі — end-to-end не заявляємо (rebook + llamas + gsv у фоні).
+- **Порт:** rebook зайняв `127.0.0.1:8090` (rusty слухає `0.0.0.0:8090`) — проби гнати на LAN:
+  `bash target/live/prefill_probe_lan.sh`, не через `127.0.0.1`.
+- **Далі:** латентність `dot(32)`+hsum на блок — повний f32-акумулятор по рядку (один hsum)
+  змінює порядок сум, тому це окремий числовий зріз з `RUSTY_CAPTURE_GOLDEN=1`; інакше
+  dequant-once 256 / repack PH-202 / замір частки attention.
+

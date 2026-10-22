@@ -314,4 +314,43 @@ fn main() {
     });
     let par_mm = t.as_secs_f64() * 1e3 / 3.0;
     println!("prefill matmul 4864x896 x{rows}  serial {serial_mm:>8.1} ms | QMat {par_mm:>8.1} ms | speedup {:>5.2}x", serial_mm / par_mm);
+
+    // Interleaved A/B, min of 3 rounds: this box drifts ~2x between runs and the first
+    // measurement after a cache-cold start is biased, so only repeats inside one process
+    // are comparable. Rows = the decomposition `QMat::matmul` now uses, cols = the old one.
+    let (mut row_best, mut col_best) = (f64::INFINITY, f64::INFINITY);
+    for _ in 0..7 {
+        let t = time(1, || {
+            black_box(qm.matmul(&xb, rows));
+        });
+        row_best = row_best.min(t.as_secs_f64() * 1e3);
+        let t = time(1, || {
+            black_box(qm.matmul_split_cols(&xb, rows));
+        });
+        col_best = col_best.min(t.as_secs_f64() * 1e3);
+    }
+    println!(
+        "prefill split A/B (min of 3):  rows {row_best:>7.1} ms | cols {col_best:>7.1} ms | rows/cols {:>5.2}x",
+        col_best / row_best
+    );
+
+    // Activation-tile sweep, same interleaved min-of-3 discipline.
+    let tiles = [961usize, 128, 64, 32, 16];
+    let mut best = vec![f64::INFINITY; tiles.len()];
+    for _ in 0..7 {
+        for (i, &tile) in tiles.iter().enumerate() {
+            let t = time(1, || {
+                black_box(k::matmul_q5_0_tiled(&wg, gm, n, &xb, rows, tile));
+            });
+            best[i] = best[i].min(t.as_secs_f64() * 1e3);
+        }
+    }
+    println!("prefill matmul tile sweep (min of 3, single thread, Q5_0 4864x896 x961):");
+    for (i, &tile) in tiles.iter().enumerate() {
+        let ms = best[i];
+        println!(
+            "  tile {tile:>4}  {ms:>8.1} ms  {:>6.2} GMAC/s",
+            (rows as f64 * gm as f64 * n as f64 / 1e9) / (ms / 1e3)
+        );
+    }
 }

@@ -1036,8 +1036,16 @@ fn dot_f32_dispatch(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// Activation rows per cache tile. One weight row scans `tile * n * 4` bytes of `X` before
+/// moving to the next weight row, so the tile must stay well inside L2 (16 rows × 896 × 4 B
+/// = 57 KiB; 32 rows = 114 KiB is ~8% slower, and no tiling costs ~33%) — at `rows = 961`
+/// the untiled walk re-reads a 3.3 MiB activation matrix per weight row (`PH-203k`).
+const MATMUL_ROW_TILE: usize = 16;
+
 /// Batched `W[m×n] · X[rows×n] → Out[rows×m]`, dequantizing each `block_bytes` block once
-/// (via `dq`) and reusing it across every row.
+/// (via `dq`) and reusing it across every row. `X` is walked in `tile`-row cache blocks;
+/// each `(row, r)` still accumulates its blocks in ascending order, so the result is
+/// bit-identical to the untiled walk for any `tile`.
 #[allow(clippy::too_many_arguments)]
 fn matmul_reuse(
     w: &[u8],
@@ -1045,30 +1053,38 @@ fn matmul_reuse(
     n: usize,
     x: &[f32],
     rows: usize,
+    tile: usize,
     block_bytes: usize,
     block_vals: usize,
     dq: impl Fn(&[u8], &mut [f32]),
 ) -> Vec<f32> {
     debug_assert_eq!(x.len(), rows * n, "matmul: X rows × n");
+    let tile = tile.max(1);
     let blocks = n / block_vals;
     let row_bytes = blocks * block_bytes;
     debug_assert_eq!(w.len(), m * row_bytes, "matmul: weight size");
     let mut out = vec![0.0f32; rows * m];
     let mut buf = vec![0.0f32; block_vals];
-    let mut acc = vec![0.0f32; rows];
+    let mut acc = vec![0.0f32; tile.min(rows)];
     for r in 0..m {
-        acc.iter_mut().for_each(|a| *a = 0.0);
         let wr = &w[r * row_bytes..(r + 1) * row_bytes];
-        for b in 0..blocks {
-            dq(&wr[b * block_bytes..(b + 1) * block_bytes], &mut buf);
-            let xoff = b * block_vals;
-            for (row, a) in acc.iter_mut().enumerate() {
-                let xb = &x[row * n + xoff..row * n + xoff + block_vals];
-                *a += dot_f32_dispatch(&buf, xb);
+        let mut r0 = 0;
+        while r0 < rows {
+            let r1 = (r0 + tile).min(rows);
+            let acc = &mut acc[..r1 - r0];
+            acc.iter_mut().for_each(|a| *a = 0.0);
+            for b in 0..blocks {
+                dq(&wr[b * block_bytes..(b + 1) * block_bytes], &mut buf);
+                let xoff = b * block_vals;
+                for (i, a) in acc.iter_mut().enumerate() {
+                    let xs = (r0 + i) * n + xoff;
+                    *a += dot_f32_dispatch(&buf, &x[xs..xs + block_vals]);
+                }
             }
-        }
-        for (row, a) in acc.iter().enumerate() {
-            out[row * m + r] = *a;
+            for (i, a) in acc.iter().enumerate() {
+                out[(r0 + i) * m + r] = *a;
+            }
+            r0 = r1;
         }
     }
     out
@@ -1077,25 +1093,41 @@ fn matmul_reuse(
 /// Batched Q4_0 `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q4_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 32, 0, "matmul_q4_0_dispatch: n%32");
-    matmul_reuse(w, m, n, x, rows, 18, 32, dq_q4_0_block)
+    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 18, 32, dq_q4_0_block)
 }
 
 /// Batched Q5_0 `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q5_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 32, 0, "matmul_q5_0_dispatch: n%32");
-    matmul_reuse(w, m, n, x, rows, 22, 32, dq_q5_0_block)
+    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 22, 32, dq_q5_0_block)
+}
+
+/// Batched Q5_0 `W[m×n] · X[rows×n]` with an explicit activation tile: bench hook for the
+/// cache-blocking A/B (`PH-203k`). Production goes through [`matmul_q5_0_dispatch`], which
+/// pins [`MATMUL_ROW_TILE`].
+#[doc(hidden)]
+pub fn matmul_q5_0_tiled(
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    tile: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matmul_q5_0_tiled: n%32");
+    matmul_reuse(w, m, n, x, rows, tile, 22, 32, dq_q5_0_block)
 }
 
 /// Batched Q8_0 `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q8_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 32, 0, "matmul_q8_0_dispatch: n%32");
-    matmul_reuse(w, m, n, x, rows, 34, 32, dq_q8_0_block)
+    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 34, 32, dq_q8_0_block)
 }
 
 /// Batched Q4_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q4_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 256, 0, "matmul_q4_k_dispatch: n%256");
-    matmul_reuse(w, m, n, x, rows, 144, 256, |b, o| {
+    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 144, 256, |b, o| {
         dq_q4_k_block(b, o.try_into().expect("q4_k block buffer is 256"))
     })
 }
@@ -1103,7 +1135,7 @@ pub fn matmul_q4_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize
 /// Batched Q5_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q5_k(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 256, 0, "matmul_q5_k: n%256");
-    matmul_reuse(w, m, n, x, rows, 176, 256, |b, o| {
+    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 176, 256, |b, o| {
         dq_q5_k_block(b, o.try_into().expect("q5_k block buffer is 256"))
     })
 }
@@ -1111,7 +1143,7 @@ pub fn matmul_q5_k(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<
 /// Batched Q6_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q6_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
     debug_assert_eq!(n % 256, 0, "matmul_q6_k_dispatch: n%256");
-    matmul_reuse(w, m, n, x, rows, 210, 256, |b, o| {
+    matmul_reuse(w, m, n, x, rows, MATMUL_ROW_TILE, 210, 256, |b, o| {
         dq_q6_k_block(b, o.try_into().expect("q6_k block buffer is 256"))
     })
 }
@@ -1719,5 +1751,20 @@ mod tests {
             &matmul_q6_k_dispatch(&q6, km, kn, &kx, rows),
             &krowwise(&q6, matvec_q6_k_dispatch)
         ));
+    }
+
+    #[test]
+    fn matmul_activation_tiling_is_bit_identical() {
+        // 70 rows => three 32-row tiles plus a ragged tail.
+        let (m, n, rows) = (7usize, 64usize, 70usize);
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i as i32 * 11 % 17) as f32) * 0.05 - 0.4)
+            .collect();
+        let w = q5_blocks(m * n / 32);
+        let untiled = matmul_q5_0_tiled(&w, m, n, &x, rows, rows);
+        for tile in [1usize, 3, 31, 32, 64, 128] {
+            let got = matmul_q5_0_tiled(&w, m, n, &x, rows, tile);
+            assert_eq!(got, untiled, "tile {tile} changed the result");
+        }
     }
 }
