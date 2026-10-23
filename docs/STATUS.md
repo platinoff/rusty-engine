@@ -39,7 +39,7 @@ live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; �
 | Метрика | Значення |
 |---------|----------|
 | `git status` | **clean** (0 drift) |
-| Коміти | **102** усього (`git rev-list --count HEAD`); **45** у drain-серії B0→PH-203r (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3 + PH-203r two weight rows; **pushed 2026-10-22**) |
+| Коміти | **103** усього (`git rev-list --count HEAD`); **45** у drain-серії B0→PH-203r (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3 + PH-203r two weight rows; **pushed 2026-10-22**) |
 | Тести | **224** (205 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |

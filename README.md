@@ -37,7 +37,7 @@ cargo run --bin rusty -- --help
 
 ## Status (verified 2026-10-22, PH-203r)
 
-**102 commits · 224 tests (+5 ignored parity) · clippy `-D` clean · Rust ratio 98.9 % (14605 LOC).**
+**103 commits · 224 tests (+5 ignored parity) · clippy `-D` clean · Rust ratio 98.9 % (14605 LOC).**
 End-to-end plumbing works: `ModelConfig → validate → GGUF dequant (Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K)
 → embed → `moe_layer_forward`/`block_forward` → sampler → byte-level BPE`. A **real**
 Qwen2.5-0.5B GGUF is parsed and run (24 layers, greedy output byte-identical to the llama-rs
