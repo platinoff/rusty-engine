@@ -106,6 +106,38 @@ pub fn rope_in_place(head: &mut [f32], pos: usize, freqs: &[f32]) {
     }
 }
 
+/// Rotate-half `(cos, sin)` table for `seq` consecutive positions starting at `pos_start`,
+/// row-major by position with `d/2` pairs per row (`PH-203p`).
+///
+/// Prefill rotates every head of every prompt row, i.e. `seq × heads × d/2` pairs, so calling
+/// [`rope_in_place`] there recomputes the same `cos`/`sin` per head. This table computes each
+/// angle exactly once per `(position, pair)` — the angle expression and the trig calls are the
+/// ones [`rope_in_place`] uses, so the rotation is bit-identical.
+pub fn rope_table(seq: usize, pos_start: usize, d: usize, base: f32) -> Vec<(f32, f32)> {
+    let half = (d / 2).max(1);
+    let freqs = rope_freqs(d, base);
+    let mut table = Vec::with_capacity(seq * half);
+    for i in 0..seq {
+        let pos = pos_start + i;
+        for &f in freqs.iter().take(half) {
+            let angle = pos as f32 * f;
+            table.push((angle.cos(), angle.sin()));
+        }
+    }
+    table
+}
+
+/// In-place NeoX rotate-half from one [`rope_table`] row (bit-identical to [`rope_in_place`]).
+pub fn rope_in_place_tabled(head: &mut [f32], table: &[(f32, f32)]) {
+    let half = head.len() / 2;
+    for i in 0..half.min(table.len()) {
+        let (c, s) = table[i];
+        let (x0, x1) = (head[i], head[i + half]);
+        head[i] = x0 * c - x1 * s;
+        head[i + half] = x1 * c + x0 * s;
+    }
+}
+
 /// **NeoX rotate-half** (llama.cpp `LLAMA_ROPE_TYPE_NEOX`, HF/Llama/Qwen `rotate_half`):
 /// pair `i` = elements `(i, i + d/2)` rotates by `pos * theta_i`,
 /// `theta_i = base^(-2i/d)`. Qwen2 uses NeoX, not the GPT-J interleaved
@@ -350,6 +382,24 @@ mod tests {
         assert_eq!(o.max_tokens, 256);
         assert!((o.temperature - 1.0).abs() < f32::EPSILON);
         assert!((o.repetition_penalty - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn rope_table_is_bit_identical_to_per_position_rope() {
+        // PH-203p: the shared table must produce exactly the values `rope_in_place` computes
+        // per head, otherwise the prefill numbers would silently move.
+        let (d, base, pos_start, seq) = (8usize, 10_000.0f32, 3usize, 5usize);
+        let freqs = rope_freqs(d, base);
+        let table = rope_table(seq, pos_start, d, base);
+        assert_eq!(table.len(), seq * (d / 2));
+        let head: Vec<f32> = (0..d).map(|i| 0.17 * i as f32 - 0.4).collect();
+        for i in 0..seq {
+            let mut want = head.clone();
+            rope_in_place(&mut want, pos_start + i, &freqs);
+            let mut got = head.clone();
+            rope_in_place_tabled(&mut got, &table[i * (d / 2)..(i + 1) * (d / 2)]);
+            assert_eq!(got, want, "position {}", pos_start + i);
+        }
     }
 
     #[test]

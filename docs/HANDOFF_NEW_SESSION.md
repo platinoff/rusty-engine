@@ -7,18 +7,17 @@
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | `e44695d` (PH-203o), `origin/main` синхронний, `git status` clean |
-| Гейт | fmt ok · clippy `-D` **0** · **220** тестів (201 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
-| Код | Rust **13738** LOC (src 11612 / tests 1317 / xtask 319 / benches 490), UI 157 → ratio **98.9 %** · 66 tracked files · docs 2339 LOC |
-| Prefill (live `:8090`, 12 потоків, 961 tok) | **9.12–9.90 s** (було 190.9 s на старті перф-серії) · matmul 7.1–8.0 s (~77 %) · attention 0.81–0.88 s · other ~11 % |
+| HEAD / origin | PH-203p (див. `git log -1`), `origin/main` синхронний, `git status` clean |
+| Гейт | fmt ok · clippy `-D` **0** · **222** тести (203 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
+| Код | Rust **13890** LOC (src 11764 / tests 1317 / xtask 319 / benches 490), UI 157 → ratio **98.9 %** · 66 tracked files · docs 2400 LOC |
+| Prefill (live `:8090`, 12 потоків, 961 tok) | **6.90–7.84 s** (було 190.9 s на старті перф-серії) · matmul 5.80–6.60 s (~84 %) · attention 0.66–0.77 s (~9.8 %) · swiglu 116–123 ms · rope 33–41 ms · other **3.4–3.8 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
-| Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…o (recapture не робився) |
+| Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…p (recapture не робився) |
 | Живий білд | `target/release/rusty.exe` + `target/live/launch_serve.vbs` (CRLF!), `threads.txt`=12, `profile.txt`=1, звіт `target/live/rusty_prof.err.log` |
 
-**Далі:** `PH-203p` — ~11 % «other» у prefill (rmsnorm, RoPE, KV-copy, swiglu): спершу додати
-`Stage::Other`/лічильник у `src/profile.rs`, потім різати найбільший шматок. Після того —
-K-квантовий dequant-once на кратному 256 тайлі й NEON (B2). Матмул уже близько стелі
-(~74 GMAC/s на вузьких формах), attention більше не домінує.
+**Далі:** `PH-203q` — K-квантовий dequant-once (тайл, кратний 256; `MATMUL_ROW_TILE` зараз 96).
+Після PH-203p prefill на **84 %** — matmul (down `896×4864` = 36–42 GMAC/s проти 63–72 у
+`4864×896`) і 9.8 % attention; «other» більше не резерв. Далі NEON (B2), потім B6/B7.
 
 ## Що було зроблено (B0, campaign 2026-10-14)
 
@@ -777,4 +776,35 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
   `note_matmul` вже є, треба `Stage::Other` або лічильник на норми); далі K-квантовий
   dequant-once 256 (`MATMUL_ROW_TILE` зараз 96 → для 256-блочних форматів тайл кратний 256?),
   NEON.
+
+### Продовження 23 — 2026-10-22: PH-203p — «other» розкладено профайлером і зрізано (serial 1010 → 260–297 ms)
+
+Після PH-203o профіль показував matmul ~77 %, attention 0.81–0.88 s і ~1 s «other» без
+розкладу. Спершу інструментарій, потім різанина; обидва зрізи **біт-у-біт**.
+
+- **`src/profile.rs`:** `Stage` розширено до `{Matvec,Matmul,Attention,Norm,Rope,KvCopy,Swiglu,
+  Residual,Embed}` (масиви `[AtomicU64; N_STAGES]`), у звіті з'явились `[pool]`-маркер,
+  підсумок **serial** (стадії від `Norm` міряються на викликаючому потоці) та
+  **`unaccounted = wall − serial`**. Тест `report_splits_pool_and_serial_stages`.
+- **Хуки:** `forward.rs` — `norm_row`/`norm_rows`, `residual_add`, `swiglu_batch`, `rope_rows`,
+  `kv_append` (усі три шляхи — `block_forward_seq`, cached-prefill, decode — тепер кличуть
+  спільні хелпери, тож дубльовані цикли зникли); `runner.rs` — `embed_batch` + фінальна норма.
+- **Замір до зрізу (live 961 tok, 12 потоків):** wall **8493 ms** → serial **1010 ms (11.9 %)** =
+  **swiglu 676 ms (8.0 %)** + rope 205 ms (2.4 %) + residual 69 + norm 53 + kv-copy 6 + embed 1.
+  Тобто «other» — це на 67 % `silu` (112 M `exp` на 24 шари) і на 20 % RoPE-тригонометрія.
+- **SwiGLU на пулі:** 4·threads діапазонів по `seq×d_ff`, кожен пише свій `lo..hi` у спільний
+  вихід (покажчик через `as_mut_ptr`; `parallel_for` дочікується всіх job-ів; `SWIGLU_PAR_MIN`
+  16 K елементів). Порядок арифметики на елемент той самий → біт-у-біт. **676 → 116–123 ms (5.7×)**.
+- **RoPE-таблиця:** `infer::rope_table(seq, pos_start, d, base)` + `rope_in_place_tabled`
+  рахують `(cos,sin)` раз на `(позиція, пара)` (той самий `angle = pos·freq` і ті самі виклики
+  `cos`/`sin`, що в `rope_in_place`), а не `heads×`. Тест
+  `rope_table_is_bit_identical_to_per_position_rope`. **205 → 33–41 ms (6×)**.
+- **Після (3 прогони, LAN-проба):** wall **6.90 / 7.35 / 7.84 s** (було 8.49 на тому ж боксі),
+  matmul 5.80–6.60 s (**84 %**), attention 657–766 ms (9.8 %), swiglu 116–123 ms, rope 33–41 ms,
+  norm 50–54, residual 53–65, kv-copy 6, **serial 260–297 ms = 3.4–3.8 %**.
+- **Гейт:** 203 lib + integration green, clippy 0, fmt ok; `cargo test --release -- --ignored` —
+  `qwen25_greedy_fingerprint_is_stable` + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok**
+  без перезахоплення golden.
+- **Далі:** matmul 84 % → `PH-203q` (K-квантовий dequant-once на тайлі 256; down-форми
+  36–42 GMAC/s проти 63–72 у `4864×896`), потім attention 9.8 %, NEON.
 

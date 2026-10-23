@@ -2,9 +2,10 @@
 //!
 //! std-only and allocation-free in the hot path: one relaxed atomic load decides whether a
 //! projection is timed at all, so a normal release build pays a single predictable branch.
-//! The counters are per-stage atomics summed across the worker pool, i.e. **thread time**,
-//! which is why [`report`] prints them against the measured wall clock of the caller and
-//! leaves the remainder as `other` (serial parts: norms, rope, KV copies, sampling).
+//! The pool stages (`matvec`/`matmul`/`attention`) are per-stage atomics summed across the
+//! workers, i.e. **thread time**; the serial stages (`norm`, `rope`, `kv-copy`, `swiglu`,
+//! `residual`, `embed`) run on the calling thread, so their sum is directly comparable to
+//! the wall clock and what is left over is printed as `unaccounted` (`PH-203p`).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -18,15 +19,43 @@ pub enum Stage {
     Matmul = 1,
     /// One [`crate::forward`] prefill attention pass.
     Attention = 2,
+    /// Per-row RMS-norm passes (attn/ffn/output) including the row copy into the batch.
+    Norm = 3,
+    /// RoPE rotation of the batched Q/K rows.
+    Rope = 4,
+    /// Appending the prefill K/V rows to the layer cache.
+    KvCopy = 5,
+    /// SwiGLU activation over the batched gate/up buffers.
+    Swiglu = 6,
+    /// Residual adds between the attention/FFN branches and the block input.
+    Residual = 7,
+    /// Token embedding rows gathered into the prompt batch.
+    Embed = 8,
 }
 
-const STAGES: [&str; 3] = ["matvec", "matmul", "attention"];
+const STAGES: [&str; 9] = [
+    "matvec",
+    "matmul",
+    "attention",
+    "norm",
+    "rope",
+    "kv-copy",
+    "swiglu",
+    "residual",
+    "embed",
+];
+
+const N_STAGES: usize = STAGES.len();
+
+/// First stage whose time is measured on the calling thread (everything below is serial),
+/// so its subtotal can be subtracted from the wall clock.
+const FIRST_SERIAL: usize = Stage::Norm as usize;
 
 static INIT: AtomicBool = AtomicBool::new(false);
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static REPORTED: AtomicBool = AtomicBool::new(false);
-static NS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static CALLS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static NS: [AtomicU64; N_STAGES] = [const { AtomicU64::new(0) }; N_STAGES];
+static CALLS: [AtomicU64; N_STAGES] = [const { AtomicU64::new(0) }; N_STAGES];
 
 fn init_once() {
     if INIT.swap(true, Ordering::Relaxed) {
@@ -64,10 +93,10 @@ pub fn add(stage: Stage, ns: u64) {
     CALLS[i].fetch_add(1, Ordering::Relaxed);
 }
 
-fn take() -> ([u64; 3], [u64; 3]) {
-    let mut ns = [0u64; 3];
-    let mut calls = [0u64; 3];
-    for i in 0..3 {
+fn take() -> ([u64; N_STAGES], [u64; N_STAGES]) {
+    let mut ns = [0u64; N_STAGES];
+    let mut calls = [0u64; N_STAGES];
+    for i in 0..N_STAGES {
         ns[i] = NS[i].swap(0, Ordering::Relaxed);
         calls[i] = CALLS[i].swap(0, Ordering::Relaxed);
     }
@@ -131,7 +160,8 @@ pub fn report(total_ns: u64, label: &str) -> String {
     let total = total_ns.max(1) as f64 / 1e6;
     let mut out = format!("[profile] {label}: wall {total:.1} ms\n");
     let mut sum = 0.0f64;
-    for i in 0..3 {
+    let mut serial = 0.0f64;
+    for i in 0..N_STAGES {
         let ms = ns[i] as f64 / 1e6;
         sum += ms;
         let per_call = if calls[i] == 0 {
@@ -140,19 +170,36 @@ pub fn report(total_ns: u64, label: &str) -> String {
             ns[i] as f64 / calls[i] as f64 / 1000.0
         };
         out.push_str(&format!(
-            "  {:<9} {:>9.1} ms  {:>5.1}%  {:>6} calls  {:>8.1} µs/call\n",
+            "  {:<9} {:>9.1} ms  {:>5.1}%  {:>6} calls  {:>8.1} µs/call{}\n",
             STAGES[i],
             ms,
             100.0 * ms / total,
             calls[i],
-            per_call
+            per_call,
+            if i < FIRST_SERIAL { "  [pool]" } else { "" }
         ));
+        if i >= FIRST_SERIAL {
+            serial += ms;
+        }
     }
     out.push_str(&format!(
-        "  {:<9} {:>9.1} ms  {:>5.1}%  (thread time of the pool, not wall)\n",
+        "  {:<9} {:>9.1} ms  {:>5.1}%  (thread time of the pool + serial, not wall)\n",
         "measured",
         sum,
         100.0 * sum / total
+    ));
+    out.push_str(&format!(
+        "  {:<9} {:>9.1} ms  {:>5.1}%  (serial only; wall − serial still holds matmul/attention wall)\n",
+        "serial",
+        serial,
+        100.0 * serial / total
+    ));
+    let rest = (total - serial).max(0.0);
+    out.push_str(&format!(
+        "  {:<9} {:>9.1} ms  {:>5.1}%  (wall − serial: pool stages + untimed)\n",
+        "unaccounted",
+        rest,
+        100.0 * rest / total
     ));
     let shapes = take_shapes();
     if !shapes.is_empty() {
@@ -201,6 +248,20 @@ mod tests {
         assert_eq!(got, 42);
         assert!(!enabled());
         assert_eq!(report(1_000_000, "test"), report(1_000_000, "test"));
+    }
+
+    #[test]
+    fn report_splits_pool_and_serial_stages() {
+        // PH-203p: the serial stages (norm..embed) get their own subtotal, so the share of
+        // the "other" bucket is a number instead of a guess.
+        add(Stage::Norm, 2_000_000);
+        add(Stage::Rope, 1_000_000);
+        let s = report(10_000_000, "unit");
+        assert!(s.contains("norm"), "{s}");
+        assert!(s.contains("rope"), "{s}");
+        assert!(s.contains("30.0%"), "{s}");
+        assert!(s.contains("serial"), "{s}");
+        assert!(s.contains("[pool]"), "{s}");
     }
 
     #[test]

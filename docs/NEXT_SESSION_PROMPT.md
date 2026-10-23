@@ -3,9 +3,9 @@
 ## Сталий стан (2026-10-22) — почати звідси
 
 - **Owner product pick: `rusty-engine`** (не автоматично: Step 0 питає продукт; тут — вже обраний).
-- HEAD `e44695d` = `origin/main`, clean; гейт fmt/clippy-0/**220** тестів (+5 ignored) зелений.
-- Перф-серія prefill завершена: 961 tok **190.9 s → 9.12–9.90 s**; matmul ~77 %, attention 0.81–0.88 s, other ~11 % (див. `docs/STATUS.md`).
-- **Наступний зріз `PH-203p`:** інструментувати «other» — додати `Stage::Other` (або окремі rmsnorm/RoPE/kv/swiglu) у `src/profile.rs`, виміряти на `bash target/live/prefill_probe_lan.sh`, різати найбільший шматок. Далі: dequant-once для K-квантів (тайл кратний 256), NEON, B6–B11 (build-matrix/docker/fleet/dist-MoE/UI). Python-плейбук агента: `docs/HANDOFF_NEW_SESSION.md` §Продовження 17–18.
+- HEAD = `origin/main` (PH-203p), clean; гейт fmt/clippy-0/**222** тести (+5 ignored) зелений.
+- Перф-серія prefill завершена: 961 tok **190.9 s → 6.90–7.84 s**; matmul ~84 %, attention 0.66–0.77 s, swiglu 116–123 ms, rope 33–41 ms, other **3.4–3.8 %** (див. `docs/STATUS.md`).
+- **Наступний зріз `PH-203q`:** K-квантовий dequant-once на тайлі, кратному 256 (`MATMUL_ROW_TILE` зараз 96), бо matmul — це 84 % prefill (down `896×4864` = 36–42 GMAC/s проти 63–72 у `4864×896`). Далі: attention 9.8 %, NEON, B6–B11 (build-matrix/docker/fleet/dist-MoE/UI). Плейбук агента: `docs/HANDOFF_NEW_SESSION.md` §Продовження 20–23.
 - Заміри: лише на свіжому процесі, LAN-проба (`192.168.56.1:8090`), 3–4 прогони; `taskkill //IM rusty.exe //F` перед `cargo build --release`.
 
 ## Owner product pick: `rusty-engine`

@@ -108,16 +108,25 @@ impl DenseRunner {
         &self.embed[t * self.geom.d_model..(t + 1) * self.geom.d_model]
     }
 
+    /// Gather the prompt's embedding rows into one `seq × d_model` batch (profiled as
+    /// `embed`, the only prompt-shaped work outside the blocks).
+    fn embed_batch(&self, tokens: &[u32]) -> Vec<f32> {
+        crate::profile::timed(crate::profile::Stage::Embed, || {
+            let d = self.geom.d_model;
+            let mut hidden = vec![0.0f32; tokens.len() * d];
+            for (i, &t) in tokens.iter().enumerate() {
+                hidden[i * d..(i + 1) * d].copy_from_slice(self.embed_row(t));
+            }
+            hidden
+        })
+    }
+
     /// Prefill a token sequence: returns the last-position logits. Attention sees the
     /// whole prefix (causal), so this is the correct "next-token from a prompt" call.
     pub fn prefill_logits(&self, tokens: &[u32]) -> Vec<f32> {
         assert!(!tokens.is_empty(), "prefill_logits: empty prompt");
         let t0 = std::time::Instant::now();
-        let d = self.geom.d_model;
-        let mut hidden = vec![0.0f32; tokens.len() * d];
-        for (i, &t) in tokens.iter().enumerate() {
-            hidden[i * d..(i + 1) * d].copy_from_slice(self.embed_row(t));
-        }
+        let mut hidden = self.embed_batch(tokens);
         for blk in &self.blocks {
             hidden = block_forward_seq(&hidden, blk, &self.geom, 0);
         }
@@ -232,17 +241,16 @@ impl<'a> DenseDecoder<'a> {
         let t0 = std::time::Instant::now();
         let g = &self.runner.geom;
         let d = g.d_model;
-        let mut hidden = vec![0.0f32; prompt.len() * d];
-        for (i, &t) in prompt.iter().enumerate() {
-            hidden[i * d..(i + 1) * d].copy_from_slice(self.runner.embed_row(t));
-        }
+        let mut hidden = self.runner.embed_batch(prompt);
         let pos_start = self.seq_len;
         for (l, blk) in self.runner.blocks.iter().enumerate() {
             hidden = block_forward_prefill_cached(&hidden, blk, g, pos_start, &mut self.caches[l]);
         }
         self.seq_len += prompt.len();
         let last = &hidden[(prompt.len() - 1) * d..prompt.len() * d];
-        let normed = rmsnorm(last, &self.runner.output_norm, g.rms_eps);
+        let normed = crate::profile::timed(crate::profile::Stage::Norm, || {
+            rmsnorm(last, &self.runner.output_norm, g.rms_eps)
+        });
         let logits = logits_from_hidden(&normed, &self.runner.output, g, self.runner.n_vocab);
         crate::profile::print_report(
             t0.elapsed().as_nanos() as u64,

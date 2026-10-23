@@ -7,7 +7,9 @@
 //! known greedy token). Real Qwen numeric parity vs llama.cpp is `PH-405` (needs a
 //! reference + tensor-layout confirmation); this slice proves the *plumbing* composes.
 
-use crate::infer::{gqa_repeat_kv, rmsnorm, rope_freqs, rope_in_place};
+use crate::infer::{
+    gqa_repeat_kv, rmsnorm, rope_freqs, rope_in_place, rope_in_place_tabled, rope_table,
+};
 use crate::moe::{softmax, softmax_in_place};
 use crate::qmat::QMat;
 
@@ -112,6 +114,105 @@ fn rotate_heads(row: &mut [f32], heads: usize, head_dim: usize, pos: usize, freq
 /// Sequence length from which prefill attention is split across heads (below it the pool's
 /// job hand-off costs more than the work).
 const PAR_SEQ_MIN: usize = 32;
+
+/// RMS-norm of one row, profiled as [`Stage::Norm`] (`PH-203p`).
+fn norm_row(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    crate::profile::timed(crate::profile::Stage::Norm, || rmsnorm(x, weight, eps))
+}
+
+/// Per-row RMS-norm of a `seq × d` batch into a fresh buffer (profiled per row).
+fn norm_rows(x_seq: &[f32], weight: &[f32], eps: f32, d: usize) -> Vec<f32> {
+    let seq = x_seq.len() / d;
+    let mut out = vec![0.0f32; x_seq.len()];
+    for (i, row) in x_seq.chunks_exact(d).enumerate() {
+        let n = norm_row(row, weight, eps);
+        out[i * d..(i + 1) * d].copy_from_slice(&n);
+    }
+    debug_assert_eq!(seq * d, x_seq.len());
+    out
+}
+
+/// `a + b` elementwise, profiled as [`Stage::Residual`].
+fn residual_add(a: &[f32], b: &[f32]) -> Vec<f32> {
+    crate::profile::timed(crate::profile::Stage::Residual, || {
+        a.iter().zip(b).map(|(x, y)| x + y).collect()
+    })
+}
+
+/// Below this many elements the pool hand-off costs more than the serial activation.
+const SWIGLU_PAR_MIN: usize = 2 << 14;
+
+/// Batched SwiGLU over the shared pool, profiled as [`Stage::Swiglu`].
+///
+/// The activation is pure elementwise work over `seq × d_ff` (4.7 M values per layer on
+/// Qwen2.5, ~112 M over 24 layers), and it used to run serially on the caller while the pool
+/// idled — `PH-203p` measured it at 8 % of the prefill wall, the largest slice of `other`.
+/// Splitting the range into disjoint chunks keeps the per-element arithmetic (and therefore
+/// the result) bit-identical.
+fn swiglu_batch(gate: &[f32], up: &[f32]) -> Vec<f32> {
+    assert_eq!(gate.len(), up.len(), "swiglu: shape mismatch");
+    crate::profile::timed(crate::profile::Stage::Swiglu, || {
+        let n = gate.len();
+        let mut out = vec![0.0f32; n];
+        let chunk = n
+            .div_ceil(crate::pool::requested_threads().saturating_mul(4))
+            .max(1);
+        let jobs = n.div_ceil(chunk);
+        if jobs <= 1 || n < SWIGLU_PAR_MIN {
+            for i in 0..n {
+                out[i] = crate::moe::silu(gate[i]) * up[i];
+            }
+            return out;
+        }
+        // SAFETY: job `j` writes only its own disjoint `lo..hi` range of `out`, and
+        // `parallel_for` does not return until every job it submitted has finished, so the
+        // raw pointer can neither alias another job's range nor outlive the buffer.
+        let base = out.as_mut_ptr() as usize;
+        crate::pool::parallel_for(jobs, |j| {
+            let lo = (j * chunk).min(n);
+            let hi = ((j + 1) * chunk).min(n);
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut((base as *mut f32).add(lo), hi - lo) };
+            for ((d, &g), &u) in dst.iter_mut().zip(&gate[lo..hi]).zip(&up[lo..hi]) {
+                *d = crate::moe::silu(g) * u;
+            }
+        });
+        out
+    })
+}
+
+/// RoPE-rotate the batched Q/K rows in place, profiled as [`Stage::Rope`].
+///
+/// Every head of a row shares one `(cos, sin)` table row, so the table is built once for the
+/// prompt instead of recomputing `cos`/`sin` per head (`PH-203p`: rope was 2.4 % of prefill).
+fn rope_rows(q_all: &mut [f32], k_all: &mut [f32], g: &Geometry, seq: usize, pos_start: usize) {
+    crate::profile::timed(crate::profile::Stage::Rope, || {
+        let hd = g.head_dim;
+        let q_dim = g.n_heads * hd;
+        let kv_dim = g.n_kv_heads * hd;
+        let table = rope_table(seq, pos_start, hd, g.rope_freq_base);
+        for i in 0..seq {
+            let t = &table[i * (hd / 2)..(i + 1) * (hd / 2)];
+            for h in 0..g.n_heads {
+                rope_in_place_tabled(&mut q_all[i * q_dim + h * hd..i * q_dim + (h + 1) * hd], t);
+            }
+            for h in 0..g.n_kv_heads {
+                rope_in_place_tabled(
+                    &mut k_all[i * kv_dim + h * hd..i * kv_dim + (h + 1) * hd],
+                    t,
+                );
+            }
+        }
+    });
+}
+
+/// Append this prompt's K/V rows to the layer cache, profiled as [`Stage::KvCopy`].
+fn kv_append(cache: &mut LayerKv, k_all: &[f32], v_all: &[f32]) {
+    crate::profile::timed(crate::profile::Stage::KvCopy, || {
+        cache.k.extend_from_slice(k_all);
+        cache.v.extend_from_slice(v_all);
+    });
+}
 
 /// Causal attention for **one** head over already-rotated K/V rows: `seq × head_dim` output.
 ///
@@ -396,13 +497,7 @@ pub fn block_forward_seq(
 
     // Attention: rmsnorm(x) per row → q/k/v projection per row → head-major causal
     // attention over [0..=i] at position `pos_start + i`, RoPE on q/k → per-row concat.
-    let kv_dim = g.n_kv_heads * g.head_dim;
-    let q_dim = g.n_heads * g.head_dim;
-    let mut x_norm = vec![0.0f32; seq * g.d_model];
-    for (i, row) in x_seq.chunks_exact(g.d_model).enumerate() {
-        let n = rmsnorm(row, &w.attn_norm, g.rms_eps);
-        x_norm[i * g.d_model..(i + 1) * g.d_model].copy_from_slice(&n);
-    }
+    let x_norm = norm_rows(x_seq, &w.attn_norm, g.rms_eps, g.d_model);
     // Batched projections: each weight block is dequantized once for the whole prompt
     // (row-wise `matvec` would repeat that `seq×` — the dequant-heavy part of prefill).
     let mut q_all = w.q.matmul(&x_norm, seq);
@@ -411,46 +506,18 @@ pub fn block_forward_seq(
     add_bias_rows(&mut q_all, &w.q_bias);
     add_bias_rows(&mut k_all, &w.k_bias);
     add_bias_rows(&mut v_all, &w.v_bias);
-    let freqs = rope_freqs(g.head_dim, g.rope_freq_base);
-    for i in 0..seq {
-        let pos = pos_start + i;
-        rotate_heads(
-            &mut q_all[i * q_dim..(i + 1) * q_dim],
-            g.n_heads,
-            g.head_dim,
-            pos,
-            &freqs,
-        );
-        rotate_heads(
-            &mut k_all[i * kv_dim..(i + 1) * kv_dim],
-            g.n_kv_heads,
-            g.head_dim,
-            pos,
-            &freqs,
-        );
-    }
+    rope_rows(&mut q_all, &mut k_all, g, seq, pos_start);
     let attn_ctx = attention_prefill(&q_all, &k_all, &v_all, g, seq, pos_start);
     // Output projection (batched) + residual.
     let o_all = w.o.matmul(&attn_ctx, seq);
-    let mut y = vec![0.0f32; seq * g.d_model];
-    for i in 0..seq * g.d_model {
-        y[i] = x_seq[i] + o_all[i];
-    }
+    let y = residual_add(x_seq, &o_all);
     // FFN (SwiGLU), batched: one rmsnorm pass, then gate/up/down over the whole prompt.
-    let mut y_norm = vec![0.0f32; seq * g.d_model];
-    for (i, row) in y.chunks_exact(g.d_model).enumerate() {
-        let n = rmsnorm(row, &w.ffn_norm, g.rms_eps);
-        y_norm[i * g.d_model..(i + 1) * g.d_model].copy_from_slice(&n);
-    }
+    let y_norm = norm_rows(&y, &w.ffn_norm, g.rms_eps, g.d_model);
     let gate = w.ffn_gate.matmul(&y_norm, seq);
     let up = w.ffn_up.matmul(&y_norm, seq);
-    let act = crate::moe::swiglu(&gate, &up);
+    let act = swiglu_batch(&gate, &up);
     let down = w.ffn_down.matmul(&act, seq);
-    let mut z = vec![0.0f32; seq * g.d_model];
-    for i in 0..seq * g.d_model {
-        z[i] = y[i] + down[i];
-    }
-    z
+    residual_add(&y, &down)
 }
 
 /// Batched prefill that also fills the KV cache: one pass over the `seq`-row prompt with
@@ -476,65 +543,31 @@ pub fn block_forward_prefill_cached(
         "block_forward_prefill_cached: seq × d_model"
     );
     let kv_dim = g.n_kv_heads * g.head_dim;
-    let q_dim = g.n_heads * g.head_dim;
     assert_eq!(
         cache.k.len() / kv_dim,
         pos_start,
         "block_forward_prefill_cached: cache/pos mismatch"
     );
 
-    let mut x_norm = vec![0.0f32; seq * g.d_model];
-    for (i, row) in x_seq.chunks_exact(g.d_model).enumerate() {
-        let n = rmsnorm(row, &w.attn_norm, g.rms_eps);
-        x_norm[i * g.d_model..(i + 1) * g.d_model].copy_from_slice(&n);
-    }
+    let x_norm = norm_rows(x_seq, &w.attn_norm, g.rms_eps, g.d_model);
     let mut q_all = w.q.matmul(&x_norm, seq);
     let mut k_all = w.k.matmul(&x_norm, seq);
     let mut v_all = w.v.matmul(&x_norm, seq);
     add_bias_rows(&mut q_all, &w.q_bias);
     add_bias_rows(&mut k_all, &w.k_bias);
     add_bias_rows(&mut v_all, &w.v_bias);
-    let freqs = rope_freqs(g.head_dim, g.rope_freq_base);
-    for i in 0..seq {
-        let pos = pos_start + i;
-        rotate_heads(
-            &mut q_all[i * q_dim..(i + 1) * q_dim],
-            g.n_heads,
-            g.head_dim,
-            pos,
-            &freqs,
-        );
-        rotate_heads(
-            &mut k_all[i * kv_dim..(i + 1) * kv_dim],
-            g.n_kv_heads,
-            g.head_dim,
-            pos,
-            &freqs,
-        );
-    }
-    cache.k.extend_from_slice(&k_all);
-    cache.v.extend_from_slice(&v_all);
+    rope_rows(&mut q_all, &mut k_all, g, seq, pos_start);
+    kv_append(cache, &k_all, &v_all);
 
     let attn_ctx = attention_prefill(&q_all, &cache.k, &cache.v, g, seq, pos_start);
     let o_all = w.o.matmul(&attn_ctx, seq);
-    let mut y = vec![0.0f32; seq * g.d_model];
-    for i in 0..seq * g.d_model {
-        y[i] = x_seq[i] + o_all[i];
-    }
-    let mut y_norm = vec![0.0f32; seq * g.d_model];
-    for (i, row) in y.chunks_exact(g.d_model).enumerate() {
-        let n = rmsnorm(row, &w.ffn_norm, g.rms_eps);
-        y_norm[i * g.d_model..(i + 1) * g.d_model].copy_from_slice(&n);
-    }
+    let y = residual_add(x_seq, &o_all);
+    let y_norm = norm_rows(&y, &w.ffn_norm, g.rms_eps, g.d_model);
     let gate = w.ffn_gate.matmul(&y_norm, seq);
     let up = w.ffn_up.matmul(&y_norm, seq);
-    let act = crate::moe::swiglu(&gate, &up);
+    let act = swiglu_batch(&gate, &up);
     let down = w.ffn_down.matmul(&act, seq);
-    let mut z = vec![0.0f32; seq * g.d_model];
-    for i in 0..seq * g.d_model {
-        z[i] = y[i] + down[i];
-    }
-    z
+    residual_add(&y, &down)
 }
 
 /// Final RMS-norm over the last row, then project to logits.
@@ -548,7 +581,7 @@ pub fn last_logits(
     let seq = hidden_seq.len() / g.d_model;
     assert!(seq >= 1, "last_logits: at least one row");
     let last = &hidden_seq[(seq - 1) * g.d_model..seq * g.d_model];
-    let normed = rmsnorm(last, out_norm, g.rms_eps);
+    let normed = norm_row(last, out_norm, g.rms_eps);
     logits_from_hidden(&normed, out_w, g, n_vocab)
 }
 
