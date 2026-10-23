@@ -418,6 +418,26 @@ fn main() {
             mac / (g4 / 1e3),
             g1 / g4
         );
+        // PH-203q: the accumulator is one dependent FMA chain per output, so sweep the block
+        // width until the 16 AVX2 registers stop holding the accumulators.
+        let groups = [1usize, 2, 4, 6, 8];
+        let mut bg = vec![f64::INFINITY; groups.len()];
+        for _ in 0..5 {
+            for (i, &group) in groups.iter().enumerate() {
+                let t = time(1, || {
+                    black_box(k::matmul_q5_0_grouped(&w_s, mm, nn, &x_s, rows, group));
+                });
+                bg[i] = bg[i].min(t.as_secs_f64() * 1e3);
+            }
+        }
+        println!("  register-block sweep on {label} (min of 5, single thread):");
+        for (i, &group) in groups.iter().enumerate() {
+            println!(
+                "    group {group:>2}  {:>8.1} ms  {:>6.2} GMAC/s",
+                bg[i],
+                mac / (bg[i] / 1e3)
+            );
+        }
         // Tile size now only buys down the dequant pass count (one dequant per weight row per
         // tile), so sweep upwards on both shapes.
         let tiles = [16usize, 24, 32, 48, 64, 96];

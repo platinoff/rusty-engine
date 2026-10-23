@@ -7,17 +7,18 @@
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | PH-203p (див. `git log -1`), `origin/main` синхронний, `git status` clean |
-| Гейт | fmt ok · clippy `-D` **0** · **222** тести (203 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
-| Код | Rust **13890** LOC (src 11764 / tests 1317 / xtask 319 / benches 490), UI 157 → ratio **98.9 %** · 66 tracked files · docs 2400 LOC |
-| Prefill (live `:8090`, 12 потоків, 961 tok) | **6.90–7.84 s** (було 190.9 s на старті перф-серії) · matmul 5.80–6.60 s (~84 %) · attention 0.66–0.77 s (~9.8 %) · swiglu 116–123 ms · rope 33–41 ms · other **3.4–3.8 %** |
+| HEAD / origin | PH-203q (див. `git log -1`), `origin/main` синхронний, `git status` clean |
+| Гейт | fmt ok · clippy `-D` **0** · **224** тести (205 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
+| Код | Rust **14302** LOC (src 11965 / tests 1317 / xtask 319 / benches 701), UI 157 → ratio **98.9 %** · 67 tracked files · docs 2440 LOC |
+| Prefill (live `:8090`, 12 потоків, 961 tok) | **7.1–8.9 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 5.8–6.6 s (~81–86 %) · attention 0.72–0.93 s (~10–12 %) · down `896×4864` **50–56 GMAC/s** (було 36–42) · swiglu 116–128 ms · rope 33–41 ms · other **3.4–3.9 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
-| Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…p (recapture не робився) |
+| Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…q (recapture не робився) |
 | Живий білд | `target/release/rusty.exe` + `target/live/launch_serve.vbs` (CRLF!), `threads.txt`=12, `profile.txt`=1, звіт `target/live/rusty_prof.err.log` |
 
-**Далі:** `PH-203q` — K-квантовий dequant-once (тайл, кратний 256; `MATMUL_ROW_TILE` зараз 96).
-Після PH-203p prefill на **84 %** — matmul (down `896×4864` = 36–42 GMAC/s проти 63–72 у
-`4864×896`) і 9.8 % attention; «other» більше не резерв. Далі NEON (B2), потім B6/B7.
+**Далі:** `PH-203r` — два рядки ваг на прохід (два `rowbuf` замість одного): ціль знизити
+load-port тиск `5 завантажень / 4 FMA` до `6/8`. Після PH-203q down-форма наздогнала решту
+(50–56 проти 58–65 GMAC/s), тож резерв — сама структура dot-циклу, а не тайл/дейквант.
+Attention 10–12 % (exp-bound, чіпати лише з новим golden), далі NEON (B2), потім B6/B7.
 
 ## Що було зроблено (B0, campaign 2026-10-14)
 
@@ -807,4 +808,39 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
   без перезахоплення golden.
 - **Далі:** matmul 84 % → `PH-203q` (K-квантовий dequant-once на тайлі 256; down-форми
   36–42 GMAC/s проти 63–72 у `4864×896`), потім attention 9.8 %, NEON.
+
+### Продовження 24 — 2026-10-22: PH-203q — гіпотезу «тайл 256» відкинуто виміром; тайл став похідною від L3 (down +25 %)
+
+Гіпотеза з роадмепу: K-кванти мають блок 256, тож тайл 96 «де-квантує блок 2.67×», і 256 дасть
+економію. Перевірка показала протилежне — і знайшла справжній механізм.
+
+- **`src/kernel.rs`:** три K-квантові диспетчери зведено в один `matmul_k(ggml_type, …)` +
+  `k_quant()` (144/176/210 B, `type KBlockDequant`), щоб тайл жив в одному місці.
+  `matmul_k_tiled` — вимірювальний хук (біт-у-біт, тест `matmul_k_quant_tiling_is_bit_identical`).
+- **`benches/kquant.rs` (новий, `harness = false`):** тайл-свіп на реальних формах
+  (`down 896×4864` Q6_K — єдиний K-квант 0.5B-моделі, `gate/up 4864×896`, `down` Q4_K), окремо
+  один потік і **пул 12 потоків** (`pool_matmul` повторює прод-поділ за вихідними рядками).
+- **Один потік:** down Q6_K — 32 → 310.9 ms, 48 → 278.0, 64 → 261.9, 96 → 245.0
+  (**17.1 GMAC/s**), 128 → 263.4, 256 → 439.9 (**−44 %**). Тобто дейквант K-квантів — це одиниці
+  відсотків, а 96 рядків × 4864 × 4 B = 1.87 MiB уже не влазить у L2, тому далі винна памʼять,
+  не дейквант.
+- **Пул 12 потоків (головне):** down Q6_K — тайл 96 = **109.4 ms (38.3 GMAC/s)**, 48 = 75.9,
+  32 = 71.9, **24 = 66.1 ms (63.4 GMAC/s)**, 16 = 77.1. Кожен воркер тримає **свій** тайл, тож
+  вузьке місце — L3 на всіх: 12 × 1.87 MiB = 22 MiB проти 8 MiB L3. Вузька форма навпаки
+  (`48 → 64 GMAC/s` при 96), тому тайл став функцією: `k_row_tile_with(n, threads)` =
+  `clamp(6 MiB / (threads·n·4), 8, 96)`, кратне 8. Тести: `k_row_tile_shrinks_with_row_width_and_threads`
+  (896/12 → 96, 4864/12 → 24, 4864/1 → 96, 16384/12 → 8).
+- **Register blocking x8 — виміряно, ВІДКИНУТО:** 8 незалежних акумуляторів прибирають
+  латентність `vfmadd` (один потік: down 18.81 → 20.68 GMAC/s, gate/up 19.18 → 21.67), але в
+  пулі кожен воркер отримує 8 потоків X замість 4 → down **падає 36.8–41.9 → 23.3–25.1 GMAC/s**,
+  wall 6.9 → 9.1–10.3 s. Відкочено, `MATMUL_ROW_GROUP` лишився 4; хук `matmul_q5_0_grouped` +
+  свіп у `benches/quant.rs` лишились як доказ. Заодно виправлено латентний баг `dot_f32_avx2_x4`:
+  хвіст `n % 8` додавався лише в `out[0]` (на `n = 32k` не проявлявся, golden не зрушив).
+- **Live (той самий бокс, але з дрейфом навантаження):** down **2.40–2.73 → 1.79–2.02 s**
+  (36.8–41.9 → **49.7–56.0 GMAC/s**), gate/up 58–65, attention 0.72–0.93 s; wall 7.1–8.9 s
+  (розкид > ефекту, бокс ділить CPU з Chrome/Avast — тому доказ = in-process A/B вище).
+- **Гейт:** 205 lib + integration = **224** тести, clippy 0, fmt ok; `--ignored` (golden +
+  moe-parity + dense real-model) зелені без перезахоплення.
+- **Далі:** `PH-203r` — два рядки ваг на прохід (2 `rowbuf`), щоб зняти load-port тиск
+  `5 loads / 4 FMA`; потім attention (exp-bound) і NEON.
 

@@ -1069,15 +1069,76 @@ unsafe fn dot_f32_avx2_x4(a: &[f32], b: [&[f32]; 4]) -> [f32; 4] {
         i += 8;
     }
     let mut out = [0.0f32; 4];
-    for k in 0..4 {
-        out[k] = hsum_ps_sse2(_mm_add_ps(
+    for (k, out_k) in out.iter_mut().enumerate() {
+        *out_k = hsum_ps_sse2(_mm_add_ps(
             _mm256_castps256_ps128(acc[k]),
             _mm256_extractf128_ps(acc[k], 1),
         ));
-        while i < n {
-            out[k] += a[i] * b[k][i];
-            i += 1;
+        // Per-output tail: `i` is shared across `k`, so it must not be advanced by the first
+        // output's tail loop (the pre-`PH-203q` version only added the ragged tail to `out[0]`).
+        for (av, bv) in a.iter().zip(b[k]).skip(i) {
+            *out_k += av * bv;
         }
+    }
+    out
+}
+
+/// Eight f32 dots that share the `a` load: `out[k] = a · b[k]`.
+///
+/// The four-way version leaves the single 8-lane accumulator as a serial FMA chain (~4-cycle
+/// latency), so it tops out near one FMA/cycle; four such chains cannot fill the two FMA ports.
+/// Eight independent chains do hide the latency, and the load ratio still favours the wide
+/// block (`PH-203q`, measured on the `896 × 4864` Q6_K down projection).
+///
+/// Each `out[k]` still keeps the exact accumulation order of [`dot_f32_avx2`] — one 8-lane
+/// accumulator ascending over the row — so the result is bit-identical to eight independent
+/// dots and to the four-way path.
+///
+/// # Safety
+/// Requires AVX2+FMA (gated by [`dot_f32_x8_dispatch`]); every slice must be `a.len()` long.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2_x8(a: &[f32], b: [&[f32]; 8]) -> [f32; 8] {
+    use std::arch::x86_64::*;
+    let n = a.len();
+    for s in b {
+        debug_assert_eq!(s.len(), n, "dot_f32_avx2_x8: length mismatch");
+    }
+    let mut acc = [_mm256_setzero_ps(); 8];
+    let mut i = 0;
+    while i + 8 <= n {
+        let av = _mm256_loadu_ps(a.as_ptr().add(i));
+        for (k, bs) in b.iter().enumerate() {
+            // SAFETY: `i + 8 <= n` and every `bs` is `n` long, so the load is in bounds.
+            acc[k] = _mm256_fmadd_ps(av, _mm256_loadu_ps(bs.as_ptr().add(i)), acc[k]);
+        }
+        i += 8;
+    }
+    let mut out = [0.0f32; 8];
+    for (k, out_k) in out.iter_mut().enumerate() {
+        *out_k = hsum_ps_sse2(_mm_add_ps(
+            _mm256_castps256_ps128(acc[k]),
+            _mm256_extractf128_ps(acc[k], 1),
+        ));
+        for (av, bv) in a.iter().zip(b[k]).skip(i) {
+            *out_k += av * bv;
+        }
+    }
+    out
+}
+
+/// Runtime-dispatched [`dot_f32_avx2_x8`]: AVX2+FMA when reported, else eight scalar folds.
+pub(crate) fn dot_f32_x8_dispatch(a: &[f32], b: [&[f32]; 8]) -> [f32; 8] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: gated by the runtime AVX2+FMA check above.
+            return unsafe { dot_f32_avx2_x8(a, b) };
+        }
+    }
+    let mut out = [0.0f32; 8];
+    for (k, bs) in b.iter().enumerate() {
+        out[k] = a.iter().zip(*bs).map(|(x, y)| x * y).sum();
     }
     out
 }
@@ -1147,7 +1208,41 @@ pub(crate) fn axpy_f32_dispatch(y: &mut [f32], x: &[f32], a: f32) {
 /// wide shape once a tile stops fitting the core's L2.
 const MATMUL_ROW_TILE: usize = 96;
 
+/// L3 bytes the pool may hold in activation tiles at once, shared with
+/// [`crate::qmat`]'s output-row split budget.
+const K_TILE_L3_BUDGET: usize = 6 * 1024 * 1024;
+
+/// Activation rows per tile for the 256-value K-quants ([`matmul_k`]).
+///
+/// Dequant amortization argues for the widest tile that still fits (`PH-203q`: 256 value-blocks
+/// mean a 96-row tile expands every super-block 2.67× over a 961-row prompt), but the pooled
+/// measurement says the opposite for the wide shape: each worker keeps its **own** activation
+/// tile resident, so the tile is bounded by L3 shared across workers rather than by dequant
+/// cost. A 96-row tile on `896 × 4864` costs 109 ms against 66 ms at 24 (`benches/kquant.rs`,
+/// min of 3, 12 threads) — the dequant share it saves is a few percent, the L3 it evicts is
+/// 1.7×. Narrow rows (`n = 896`, worst case `52 → 64 GMAC/s`) still take the full 96.
+fn k_row_tile_with(n: usize, threads: usize) -> usize {
+    let threads = threads.max(1);
+    let per_row = n.saturating_mul(4).saturating_mul(threads);
+    if per_row == 0 {
+        return MATMUL_ROW_TILE;
+    }
+    let rows = K_TILE_L3_BUDGET / per_row;
+    (rows.clamp(8, MATMUL_ROW_TILE) / 8) * 8
+}
+
+/// [`k_row_tile_with`] for the live pool.
+fn k_row_tile(n: usize) -> usize {
+    k_row_tile_with(n, crate::pool::requested_threads())
+}
+
 /// Activation rows sharing one weight-row load in [`matmul_reuse`] (register blocking).
+///
+/// Four (`PH-203n`). Eight independent accumulators do hide the 4-cycle `vfmadd` latency and win
+/// 1.10–1.13× single-thread (`matmul_q5_0_grouped`), but the pool calls this kernel once per
+/// worker and each extra activation row is one more stream per thread: on the wide `896 × 4864`
+/// down projection 8 rows/thread × 12 workers collapse the shared 8 MiB L3 and cost 1.6×
+/// (`PH-203q`). Four stays the measured pooled optimum.
 const MATMUL_ROW_GROUP: usize = 4;
 
 /// Weight rows per pass over the activation tile. Without this the walk is
@@ -1186,7 +1281,7 @@ fn matmul_reuse(
 ) -> Vec<f32> {
     debug_assert_eq!(x.len(), rows * n, "matmul: X rows × n");
     let tile = tile.max(1);
-    let group = group.clamp(1, 4);
+    let group = group.clamp(1, 8);
     let r_block = r_block.max(1);
     let blocks = n / block_vals;
     let row_bytes = blocks * block_bytes;
@@ -1208,7 +1303,27 @@ fn matmul_reuse(
                     &dq,
                 );
                 let mut row = r0;
-                if group == 4 {
+                if group == 8 {
+                    while row + 8 <= r1 {
+                        let s = row * n;
+                        let b = [
+                            &x[s..s + n],
+                            &x[s + n..s + 2 * n],
+                            &x[s + 2 * n..s + 3 * n],
+                            &x[s + 3 * n..s + 4 * n],
+                            &x[s + 4 * n..s + 5 * n],
+                            &x[s + 5 * n..s + 6 * n],
+                            &x[s + 6 * n..s + 7 * n],
+                            &x[s + 7 * n..s + 8 * n],
+                        ];
+                        let got = dot_f32_x8_dispatch(&rowbuf, b);
+                        for (k, v) in got.into_iter().enumerate() {
+                            out[(row + k) * m + r] = v;
+                        }
+                        row += 8;
+                    }
+                }
+                if group >= 4 {
                     while row + 4 <= r1 {
                         let s = row * n;
                         let b = [
@@ -1365,6 +1480,33 @@ pub fn matmul_q5_0_tiled(
     )
 }
 
+/// Batched Q5_0 with an explicit register-blocking width: the sweep hook for
+/// [`MATMUL_ROW_GROUP`] (`PH-203q`). Bit-identical for every width.
+#[doc(hidden)]
+pub fn matmul_q5_0_grouped(
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    group: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matmul_q5_0_grouped: n%32");
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        MATMUL_ROW_TILE,
+        group,
+        MATMUL_R_BLOCK,
+        22,
+        32,
+        dq_q5_0_block,
+    )
+}
+
 /// Batched Q5_0 with the register blocking turned off (one row per weight load): the A/B
 /// pair for [`MATMUL_ROW_GROUP`] (`PH-203n`). Bit-identical to the production path.
 #[doc(hidden)]
@@ -1480,58 +1622,82 @@ pub fn matmul_q8_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize
     )
 }
 
-/// Batched Q4_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
-pub fn matmul_q4_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
-    debug_assert_eq!(n % 256, 0, "matmul_q4_k_dispatch: n%256");
+/// One 256-value K-quant super-block expanded into 256 floats.
+type KBlockDequant = fn(&[u8], &mut [f32; 256]);
+
+/// 256-value K-quant super-block dequantizer, keyed by `ggml_type`.
+///
+/// The three K-quants share the block geometry and only differ in the byte layout, so they all
+/// run through one [`matmul_k`] instead of three near-identical `matmul_reuse` call sites.
+fn k_quant(ggml_type: u32) -> Option<(usize, KBlockDequant)> {
+    match ggml_type {
+        12 => Some((144, dq_q4_k_block)),
+        13 => Some((176, dq_q5_k_block)),
+        14 => Some((210, dq_q6_k_block)),
+        _ => None,
+    }
+}
+
+/// Batched K-quant `W[m×n] · X[rows×n]` with an explicit activation tile (`PH-203q`).
+///
+/// K-quants dequantize in 256-value super-blocks, so the activation tile decides how many
+/// times one super-block is expanded: with `tile = 96` each 256-block is paid for 2.67 times
+/// over the 961-row prompt, with a 256-multiple it is paid once per block-width of rows.
+#[allow(clippy::too_many_arguments)]
+fn matmul_k(
+    ggml_type: u32,
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    tile: usize,
+) -> Vec<f32> {
+    let (block_bytes, dq) = k_quant(ggml_type).expect("matmul_k: not a 256-value K-quant type");
+    debug_assert_eq!(n % 256, 0, "matmul_k: n%256");
     matmul_reuse(
         w,
         m,
         n,
         x,
         rows,
-        MATMUL_ROW_TILE,
+        tile,
         MATMUL_ROW_GROUP,
         MATMUL_R_BLOCK,
-        144,
+        block_bytes,
         256,
-        |b, o| dq_q4_k_block(b, o.try_into().expect("q4_k block buffer is 256")),
+        move |b, o| dq(b, o.try_into().expect("k-quant block buffer is 256")),
     )
+}
+
+/// Batched Q4_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
+pub fn matmul_q4_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
+    matmul_k(12, w, m, n, x, rows, k_row_tile(n))
 }
 
 /// Batched Q5_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q5_k(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
-    debug_assert_eq!(n % 256, 0, "matmul_q5_k: n%256");
-    matmul_reuse(
-        w,
-        m,
-        n,
-        x,
-        rows,
-        MATMUL_ROW_TILE,
-        MATMUL_ROW_GROUP,
-        MATMUL_R_BLOCK,
-        176,
-        256,
-        |b, o| dq_q5_k_block(b, o.try_into().expect("q5_k block buffer is 256")),
-    )
+    matmul_k(13, w, m, n, x, rows, k_row_tile(n))
 }
 
 /// Batched Q6_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q6_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
-    debug_assert_eq!(n % 256, 0, "matmul_q6_k_dispatch: n%256");
-    matmul_reuse(
-        w,
-        m,
-        n,
-        x,
-        rows,
-        MATMUL_ROW_TILE,
-        MATMUL_ROW_GROUP,
-        MATMUL_R_BLOCK,
-        210,
-        256,
-        |b, o| dq_q6_k_block(b, o.try_into().expect("q6_k block buffer is 256")),
-    )
+    matmul_k(14, w, m, n, x, rows, k_row_tile(n))
+}
+
+/// Batched K-quant `W[m×n] · X[rows×n]` with an explicit activation tile: bench/measure hook
+/// for [`k_row_tile`] (`PH-203q`). Bit-identical to the production path.
+#[doc(hidden)]
+pub fn matmul_k_tiled(
+    ggml_type: u32,
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    tile: usize,
+) -> Vec<f32> {
+    matmul_k(ggml_type, w, m, n, x, rows, tile)
 }
 
 /// Bytes of one `n`-wide row for a fused kernel type, or `None` when the type has no
@@ -2176,17 +2342,49 @@ mod tests {
     }
 
     #[test]
+    fn k_row_tile_shrinks_with_row_width_and_threads() {
+        // PH-203q: one activation tile per worker, so the tile is L3/threads bound, floored to
+        // a multiple of 8 (`MATMUL_ROW_GROUP` × 2) and capped at the 32-value block tile.
+        assert_eq!(k_row_tile_with(896, 12), MATMUL_ROW_TILE);
+        assert_eq!(k_row_tile_with(4864, 12), 24);
+        assert_eq!(k_row_tile_with(4864, 1), MATMUL_ROW_TILE);
+        assert_eq!(k_row_tile_with(16_384, 12), 8);
+    }
+
+    #[test]
+    fn matmul_k_quant_tiling_is_bit_identical() {
+        // PH-203q: the activation tile only regroups independent (row, r) writes, and the
+        // K-quant dequantizer sees the same stored bytes per super-block either way, so a
+        // 256-multiple tile must reproduce the 96-row production tile bit for bit.
+        let (m, n, rows) = (5usize, 512usize, 397usize);
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i as i32 * 11 % 19) as f32) * 0.05 - 0.4)
+            .collect();
+        for (kind, ggml_type) in [(0usize, 12u32), (1, 13), (2, 14)] {
+            let w = k_blocks(kind, m * n / 256);
+            let base = matmul_k_tiled(ggml_type, &w, m, n, &x, rows, MATMUL_ROW_TILE);
+            for tile in [MATMUL_ROW_TILE, 256, 512, 128] {
+                let got = matmul_k_tiled(ggml_type, &w, m, n, &x, rows, tile);
+                assert_eq!(got, base, "type {ggml_type} tile {tile} changed the result");
+            }
+        }
+    }
+
+    #[test]
     fn matmul_row_grouping_is_bit_identical() {
-        // PH-203n: sharing one weight-row load across 4 activations must not change a single
-        // bit — the tail rows (70 = 4×17 + 2) fall back to the single-row dot.
+        // PH-203n/203q: sharing one weight-row load across activations must not change a
+        // single bit — the tail rows (70 = 8×8 + 6, then 4, then 2) fall back to the 4-row
+        // and single-row dots.
         let (m, n, rows) = (5usize, 64usize, 70usize);
         let x: Vec<f32> = (0..rows * n)
             .map(|i| ((i as i32 * 7 % 23) as f32) * 0.04 - 0.5)
             .collect();
         let w = q5_blocks(m * n / 32);
-        let grouped = matmul_q5_0_tiled(&w, m, n, &x, rows, MATMUL_ROW_TILE);
         let single = matmul_q5_0_rows1(&w, m, n, &x, rows, MATMUL_ROW_TILE);
-        assert_eq!(grouped, single);
+        for group in [2usize, 3, 4, 6, 8] {
+            let got = matmul_q5_0_grouped(&w, m, n, &x, rows, group);
+            assert_eq!(got, single, "group {group} changed the result");
+        }
     }
 
     #[test]

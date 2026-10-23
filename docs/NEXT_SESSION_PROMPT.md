@@ -3,9 +3,10 @@
 ## Сталий стан (2026-10-22) — почати звідси
 
 - **Owner product pick: `rusty-engine`** (не автоматично: Step 0 питає продукт; тут — вже обраний).
-- HEAD = `origin/main` (PH-203p), clean; гейт fmt/clippy-0/**222** тести (+5 ignored) зелений.
-- Перф-серія prefill завершена: 961 tok **190.9 s → 6.90–7.84 s**; matmul ~84 %, attention 0.66–0.77 s, swiglu 116–123 ms, rope 33–41 ms, other **3.4–3.8 %** (див. `docs/STATUS.md`).
-- **Наступний зріз `PH-203q`:** K-квантовий dequant-once на тайлі, кратному 256 (`MATMUL_ROW_TILE` зараз 96), бо matmul — це 84 % prefill (down `896×4864` = 36–42 GMAC/s проти 63–72 у `4864×896`). Далі: attention 9.8 %, NEON, B6–B11 (build-matrix/docker/fleet/dist-MoE/UI). Плейбук агента: `docs/HANDOFF_NEW_SESSION.md` §Продовження 20–23.
+- HEAD = `origin/main` (PH-203q), clean; гейт fmt/clippy-0/**224** тести (+5 ignored) зелений.
+- Перф-серія prefill: 961 tok **190.9 s → 6.9–8.9 s** (розкид = фонове навантаження боксу); matmul ~81–86 %, attention 0.72–0.93 s, down `896×4864` **49.7–56.0 GMAC/s** (було 36–42), gate/up 58–65, swiglu 116–128 ms, rope 33–41 ms, other **3.4–3.9 %** (див. `docs/STATUS.md`).
+- **Наступний зріз `PH-203r`:** два вагових рядки на прохід (2 `rowbuf`, L1 39 KiB) — зняти load-port тиск `5 loads / 4 FMA` до `6/8`; x8-register-blocking уже виміряно й відкинуто (пул −40 %). Далі: attention (exp-bound), NEON, B6–B11 (build-matrix/docker/fleet/dist-MoE/UI). Плейбук агента: `docs/HANDOFF_NEW_SESSION.md` §Продовження 20–24.
+- Диск-дисципліна замірів: тайл/блок-свіпи міряти **в одному процесі** (`benches/kquant.rs`, `benches/quant.rs`), бо end-to-end wall на цьому боксі дрейфує ±25 %.
 - Заміри: лише на свіжому процесі, LAN-проба (`192.168.56.1:8090`), 3–4 прогони; `taskkill //IM rusty.exe //F` перед `cargo build --release`.
 
 ## Owner product pick: `rusty-engine`
