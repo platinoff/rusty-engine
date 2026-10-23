@@ -62,6 +62,50 @@ fn blocks(
     v
 }
 
+/// The production out-row split for Q5_0 (same shape as `benches/kquant.rs::pool_matmul`):
+/// split `Out` by weight rows and let the shared pool run one kernel call per worker.
+fn pool_q5(
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    tile: usize,
+    w_rows: usize,
+) -> Vec<f32> {
+    let threads = rusty_engine::pool::requested_threads().max(1);
+    let chunk = m.div_ceil(threads);
+    let jobs = m.div_ceil(chunk);
+    if jobs <= 1 {
+        return k::matmul_q5_0_wrows(w, m, n, x, rows, tile, w_rows);
+    }
+    let row_bytes = n / 32 * 22;
+    let parts = std::sync::Mutex::new(Vec::<(usize, Vec<f32>)>::with_capacity(jobs));
+    rusty_engine::pool::parallel_for(jobs, |ji| {
+        let r0 = ji * chunk;
+        let rc = chunk.min(m - r0);
+        let got = k::matmul_q5_0_wrows(
+            &w[r0 * row_bytes..(r0 + rc) * row_bytes],
+            rc,
+            n,
+            x,
+            rows,
+            tile,
+            w_rows,
+        );
+        parts.lock().expect("parts").push((ji, got));
+    });
+    let mut out = vec![0f32; rows * m];
+    for (ji, got) in parts.into_inner().expect("parts") {
+        let r0 = ji * chunk;
+        let rc = chunk.min(m - r0);
+        for row in 0..rows {
+            out[row * m + r0..row * m + r0 + rc].copy_from_slice(&got[row * rc..(row + 1) * rc]);
+        }
+    }
+    out
+}
+
 fn time<F: FnMut()>(iters: u32, mut f: F) -> Duration {
     let t = Instant::now();
     for _ in 0..iters {
@@ -375,8 +419,11 @@ fn main() {
     // PH-203n: register blocking. `rows1` = one activation per weight load, `x4` = four.
     // Measured on both the narrow (n = 896, gate/up) and the wide (n = 4864, down) shape,
     // because the profiler showed the wide one at 10 GMAC/s against 35 for the rest.
-    let shapes = [("gate/up 4864x896", gm, n), ("down    896x4864", n, gm)];
-    for (label, mm, nn) in shapes {
+    let shapes = [
+        ("gate/up 4864x896", gm, n, 96usize),
+        ("down    896x4864", n, gm, 24usize),
+    ];
+    for (label, mm, nn, tile) in shapes {
         let w_s: Vec<u8> = (0..mm * nn / 32 * 22).map(|i| (i % 251) as u8).collect();
         let x_s = fill_floats(31, rows * nn);
         let mac = rows as f64 * mm as f64 * nn as f64 / 1e9;
@@ -436,6 +483,37 @@ fn main() {
                 "    group {group:>2}  {:>8.1} ms  {:>6.2} GMAC/s",
                 bg[i],
                 mac / (bg[i] / 1e3)
+            );
+        }
+        // PH-203r: pair two dequantized weight rows per pass so the inner block runs
+        // 2 weight + 4 activation loads for 8 FMAs (6/8) instead of 5/4.
+        let wrs = [1usize, 2];
+        let mut bw = vec![f64::INFINITY; wrs.len()];
+        let mut pw = vec![f64::INFINITY; wrs.len()];
+        for _ in 0..5 {
+            for (i, &wr) in wrs.iter().enumerate() {
+                let t = time(1, || {
+                    black_box(k::matmul_q5_0_wrows(&w_s, mm, nn, &x_s, rows, tile, wr));
+                });
+                bw[i] = bw[i].min(t.as_secs_f64() * 1e3);
+            }
+        }
+        for _ in 0..3 {
+            for (i, &wr) in wrs.iter().enumerate() {
+                let t = time(1, || {
+                    black_box(pool_q5(&w_s, mm, nn, &x_s, rows, tile, wr));
+                });
+                pw[i] = pw[i].min(t.as_secs_f64() * 1e3);
+            }
+        }
+        println!("  weight-rows per pass on {label} (tile {tile}):");
+        for (i, &wr) in wrs.iter().enumerate() {
+            println!(
+                "    {wr} row  single {:>8.1} ms ({:>6.2} GMAC/s) | pool {:>8.1} ms ({:>6.2} GMAC/s)",
+                bw[i],
+                mac / (bw[i] / 1e3),
+                pw[i],
+                mac / (pw[i] / 1e3)
             );
         }
         // Tile size now only buys down the dequant pass count (one dequant per weight row per

@@ -1143,6 +1143,80 @@ pub(crate) fn dot_f32_x8_dispatch(a: &[f32], b: [&[f32]; 8]) -> [f32; 8] {
     out
 }
 
+/// Four activations against **two** dequantized weight rows: `(a0 · b, a1 · b)`.
+///
+/// The four-way block already reuses each `a` load across four dots, but it still pays one
+/// weight load per FMA, so the loop is bound by the two load ports (`PH-203m`). Holding a second
+/// dequantized row turns the inner step into `2 weight + 4 activation loads → 8 FMAs`, i.e.
+/// `6 loads / 8 FMA` instead of `5 / 4` — the second row costs L1 footprint (two 19.5 KiB
+/// `rowbuf`s at `n = 4864`), not extra DRAM traffic, because both rows are in the same weight
+/// block and the activation tile is unchanged.
+///
+/// Each output keeps its own 8-lane accumulator ascending over the row, exactly like
+/// [`dot_f32_avx2`], so the pair is bit-identical to two four-way calls.
+///
+/// # Safety
+/// Requires AVX2+FMA (gated by [`dot_f32_x4x2_dispatch`]); all three slices must be `n` long.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2_x4x2(a0: &[f32], a1: &[f32], b: [&[f32]; 4]) -> ([f32; 4], [f32; 4]) {
+    use std::arch::x86_64::*;
+    let n = a0.len();
+    debug_assert_eq!(a1.len(), n, "dot_f32_avx2_x4x2: weight rows differ");
+    for s in b {
+        debug_assert_eq!(s.len(), n, "dot_f32_avx2_x4x2: length mismatch");
+    }
+    let mut acc0 = [_mm256_setzero_ps(); 4];
+    let mut acc1 = [_mm256_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 8 <= n {
+        let av0 = _mm256_loadu_ps(a0.as_ptr().add(i));
+        let av1 = _mm256_loadu_ps(a1.as_ptr().add(i));
+        for k in 0..4 {
+            // SAFETY: `i + 8 <= n` and every `b[k]` is `n` long, so the load is in bounds.
+            let bv = _mm256_loadu_ps(b[k].as_ptr().add(i));
+            acc0[k] = _mm256_fmadd_ps(av0, bv, acc0[k]);
+            acc1[k] = _mm256_fmadd_ps(av1, bv, acc1[k]);
+        }
+        i += 8;
+    }
+    let mut out0 = [0.0f32; 4];
+    let mut out1 = [0.0f32; 4];
+    for k in 0..4 {
+        out0[k] = hsum_ps_sse2(_mm_add_ps(
+            _mm256_castps256_ps128(acc0[k]),
+            _mm256_extractf128_ps(acc0[k], 1),
+        ));
+        out1[k] = hsum_ps_sse2(_mm_add_ps(
+            _mm256_castps256_ps128(acc1[k]),
+            _mm256_extractf128_ps(acc1[k], 1),
+        ));
+        for (av, bv) in a0.iter().zip(b[k]).skip(i) {
+            out0[k] += av * bv;
+        }
+        for (av, bv) in a1.iter().zip(b[k]).skip(i) {
+            out1[k] += av * bv;
+        }
+    }
+    (out0, out1)
+}
+
+/// Runtime-dispatched [`dot_f32_avx2_x4x2`]: AVX2+FMA when reported, else two four-way calls.
+pub(crate) fn dot_f32_x4x2_dispatch(
+    a0: &[f32],
+    a1: &[f32],
+    b: [&[f32]; 4],
+) -> ([f32; 4], [f32; 4]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: gated by the runtime AVX2+FMA check above.
+            return unsafe { dot_f32_avx2_x4x2(a0, a1, b) };
+        }
+    }
+    (dot_f32_x4_dispatch(a0, b), dot_f32_x4_dispatch(a1, b))
+}
+
 /// Runtime-dispatched [`dot_f32_avx2_x4`]: AVX2+FMA when reported, else four scalar folds.
 pub(crate) fn dot_f32_x4_dispatch(a: &[f32], b: [&[f32]; 4]) -> [f32; 4] {
     #[cfg(target_arch = "x86_64")]
@@ -1208,33 +1282,16 @@ pub(crate) fn axpy_f32_dispatch(y: &mut [f32], x: &[f32], a: f32) {
 /// wide shape once a tile stops fitting the core's L2.
 const MATMUL_ROW_TILE: usize = 96;
 
-/// L3 bytes the pool may hold in activation tiles at once, shared with
-/// [`crate::qmat`]'s output-row split budget.
-const K_TILE_L3_BUDGET: usize = 6 * 1024 * 1024;
-
 /// Activation rows per tile for the 256-value K-quants ([`matmul_k`]).
 ///
-/// Dequant amortization argues for the widest tile that still fits (`PH-203q`: 256 value-blocks
-/// mean a 96-row tile expands every super-block 2.67× over a 961-row prompt), but the pooled
-/// measurement says the opposite for the wide shape: each worker keeps its **own** activation
-/// tile resident, so the tile is bounded by L3 shared across workers rather than by dequant
-/// cost. A 96-row tile on `896 × 4864` costs 109 ms against 66 ms at 24 (`benches/kquant.rs`,
-/// min of 3, 12 threads) — the dequant share it saves is a few percent, the L3 it evicts is
-/// 1.7×. Narrow rows (`n = 896`, worst case `52 → 64 GMAC/s`) still take the full 96.
-fn k_row_tile_with(n: usize, threads: usize) -> usize {
-    let threads = threads.max(1);
-    let per_row = n.saturating_mul(4).saturating_mul(threads);
-    if per_row == 0 {
-        return MATMUL_ROW_TILE;
-    }
-    let rows = K_TILE_L3_BUDGET / per_row;
-    (rows.clamp(8, MATMUL_ROW_TILE) / 8) * 8
-}
-
-/// [`k_row_tile_with`] for the live pool.
-fn k_row_tile(n: usize) -> usize {
-    k_row_tile_with(n, crate::pool::requested_threads())
-}
+/// `PH-203q` shrank this per worker (24 rows on a 4864-wide output) on the theory that each
+/// worker keeps its own activation tile; `PH-203r` falsified that: the tile is a *shared* slice
+/// of `X`, the only per-worker copies are the row buffers, and once two weight rows are held
+/// ([`MATMUL_W_ROWS`]) the pooled optimum moves straight back to the shared 96-row tile —
+/// `896 × 4864` Q6_K at 12 threads: 75 GMAC/s at 24, 99 at 48, **108 at 96**, 80 at 192
+/// (`benches/kquant.rs`, min of 3). 128 peaks at 119 GMAC/s, within the run-to-run spread and
+/// worse on Q4_K, so both quant paths keep one constant.
+const MATMUL_ROW_TILE_K: usize = MATMUL_ROW_TILE;
 
 /// Activation rows sharing one weight-row load in [`matmul_reuse`] (register blocking).
 ///
@@ -1255,12 +1312,21 @@ const MATMUL_ROW_GROUP: usize = 4;
 /// explicit so the bench can still A/B a smaller block.
 const MATMUL_R_BLOCK: usize = 1024;
 
+/// Weight rows processed per pass over the activation tile (`PH-203r`).
+///
+/// Two rows halve the weight loads per FMA in the inner block ([`dot_f32_x4x2_dispatch`]) at the
+/// cost of a second `rowbuf` (19.5 KiB at `n = 4864`, both live in L1). Measured on the
+/// `896 × 4864` down projection and the `4864 × 896` gate/up pair (`benches/quant.rs`); the
+/// golden moved into the same accumulation order, so the path stays bit-identical.
+const MATMUL_W_ROWS: usize = 2;
+
 /// Batched `W[m×n] · X[rows×n] → Out[rows×m]`. Each weight row is dequantized **once per
 /// activation tile** (`dq` over the whole `n`) and then dotted against every activation row of
 /// that tile with a single f32 reduction, so a `(row, r)` pair pays one horizontal sum instead
 /// of one per quant block. Activation rows are processed 4 at a time against one weight load
-/// ([`dot_f32_x4_dispatch`]) and the tile loop sits **outside** the weight loop, so a tile of
-/// `X` is streamed once per weight block instead of once per weight row.
+/// ([`dot_f32_x4_dispatch`]) — or two weight rows at a time ([`dot_f32_x4x2_dispatch`], see
+/// [`MATMUL_W_ROWS`]) — and the tile loop sits **outside** the weight loop, so a tile of `X` is
+/// streamed once per weight block instead of once per weight row.
 ///
 /// Summation order per `(row, r)` is the row-wide 8-lane partial accumulation inside
 /// [`dot_f32_dispatch`] — that is *not* the block-wise order the pre-`PH-203l` kernel used, so
@@ -1274,6 +1340,7 @@ fn matmul_reuse(
     rows: usize,
     tile: usize,
     group: usize,
+    w_rows: usize,
     r_block: usize,
     block_bytes: usize,
     block_vals: usize,
@@ -1282,67 +1349,44 @@ fn matmul_reuse(
     debug_assert_eq!(x.len(), rows * n, "matmul: X rows × n");
     let tile = tile.max(1);
     let group = group.clamp(1, 8);
+    let w_rows = w_rows.clamp(1, 2);
     let r_block = r_block.max(1);
     let blocks = n / block_vals;
     let row_bytes = blocks * block_bytes;
     debug_assert_eq!(w.len(), m * row_bytes, "matmul: weight size");
     let mut out = vec![0.0f32; rows * m];
     let mut rowbuf = vec![0.0f32; n];
+    let mut rowbuf2 = vec![0.0f32; n];
     let mut rb0 = 0;
     while rb0 < m {
         let rb1 = (rb0 + r_block).min(m);
         let mut r0 = 0;
         while r0 < rows {
             let r1 = (r0 + tile).min(rows);
-            for r in rb0..rb1 {
-                dequant_row(
-                    &w[r * row_bytes..(r + 1) * row_bytes],
-                    &mut rowbuf,
-                    block_bytes,
-                    block_vals,
-                    &dq,
-                );
-                let mut row = r0;
-                if group == 8 {
-                    while row + 8 <= r1 {
-                        let s = row * n;
-                        let b = [
-                            &x[s..s + n],
-                            &x[s + n..s + 2 * n],
-                            &x[s + 2 * n..s + 3 * n],
-                            &x[s + 3 * n..s + 4 * n],
-                            &x[s + 4 * n..s + 5 * n],
-                            &x[s + 5 * n..s + 6 * n],
-                            &x[s + 6 * n..s + 7 * n],
-                            &x[s + 7 * n..s + 8 * n],
-                        ];
-                        let got = dot_f32_x8_dispatch(&rowbuf, b);
-                        for (k, v) in got.into_iter().enumerate() {
-                            out[(row + k) * m + r] = v;
-                        }
-                        row += 8;
+            let mut r = rb0;
+            while r < rb1 {
+                if w_rows >= 2 && group == 4 && r + 1 < rb1 {
+                    for (dst, src) in [(&mut rowbuf, r), (&mut rowbuf2, r + 1)] {
+                        dequant_row(
+                            &w[src * row_bytes..(src + 1) * row_bytes],
+                            dst,
+                            block_bytes,
+                            block_vals,
+                            &dq,
+                        );
                     }
-                }
-                if group >= 4 {
-                    while row + 4 <= r1 {
-                        let s = row * n;
-                        let b = [
-                            &x[s..s + n],
-                            &x[s + n..s + 2 * n],
-                            &x[s + 2 * n..s + 3 * n],
-                            &x[s + 3 * n..s + 4 * n],
-                        ];
-                        let got = dot_f32_x4_dispatch(&rowbuf, b);
-                        for (k, v) in got.into_iter().enumerate() {
-                            out[(row + k) * m + r] = v;
-                        }
-                        row += 4;
-                    }
-                }
-                while row < r1 {
-                    let xs = row * n;
-                    out[row * m + r] = dot_f32_dispatch(&rowbuf, &x[xs..xs + n]);
-                    row += 1;
+                    dot_tile_rows_pair(&rowbuf, &rowbuf2, x, n, m, r, r0, r1, &mut out);
+                    r += 2;
+                } else {
+                    dequant_row(
+                        &w[r * row_bytes..(r + 1) * row_bytes],
+                        &mut rowbuf,
+                        block_bytes,
+                        block_vals,
+                        &dq,
+                    );
+                    dot_tile_rows(&rowbuf, x, n, m, r, r0, r1, group, &mut out);
+                    r += 1;
                 }
             }
             r0 = r1;
@@ -1350,6 +1394,102 @@ fn matmul_reuse(
         rb0 = rb1;
     }
     out
+}
+
+/// Dot one dequantized weight row `r` against activation rows `r0..r1`, `group` rows per load.
+#[allow(clippy::too_many_arguments)]
+fn dot_tile_rows(
+    a: &[f32],
+    x: &[f32],
+    n: usize,
+    m: usize,
+    r: usize,
+    r0: usize,
+    r1: usize,
+    group: usize,
+    out: &mut [f32],
+) {
+    let mut row = r0;
+    if group == 8 {
+        while row + 8 <= r1 {
+            let s = row * n;
+            let b = [
+                &x[s..s + n],
+                &x[s + n..s + 2 * n],
+                &x[s + 2 * n..s + 3 * n],
+                &x[s + 3 * n..s + 4 * n],
+                &x[s + 4 * n..s + 5 * n],
+                &x[s + 5 * n..s + 6 * n],
+                &x[s + 6 * n..s + 7 * n],
+                &x[s + 7 * n..s + 8 * n],
+            ];
+            let got = dot_f32_x8_dispatch(a, b);
+            for (k, v) in got.into_iter().enumerate() {
+                out[(row + k) * m + r] = v;
+            }
+            row += 8;
+        }
+    }
+    if group >= 4 {
+        while row + 4 <= r1 {
+            let s = row * n;
+            let b = [
+                &x[s..s + n],
+                &x[s + n..s + 2 * n],
+                &x[s + 2 * n..s + 3 * n],
+                &x[s + 3 * n..s + 4 * n],
+            ];
+            let got = dot_f32_x4_dispatch(a, b);
+            for (k, v) in got.into_iter().enumerate() {
+                out[(row + k) * m + r] = v;
+            }
+            row += 4;
+        }
+    }
+    while row < r1 {
+        let xs = row * n;
+        out[row * m + r] = dot_f32_dispatch(a, &x[xs..xs + n]);
+        row += 1;
+    }
+}
+
+/// Dot two dequantized weight rows (`r`, `r + 1`) against activation rows `r0..r1` with one
+/// shared activation load per four rows ([`dot_f32_x4x2_dispatch`]).
+#[allow(clippy::too_many_arguments)]
+fn dot_tile_rows_pair(
+    a0: &[f32],
+    a1: &[f32],
+    x: &[f32],
+    n: usize,
+    m: usize,
+    r: usize,
+    r0: usize,
+    r1: usize,
+    out: &mut [f32],
+) {
+    let mut row = r0;
+    while row + 4 <= r1 {
+        let s = row * n;
+        let b = [
+            &x[s..s + n],
+            &x[s + n..s + 2 * n],
+            &x[s + 2 * n..s + 3 * n],
+            &x[s + 3 * n..s + 4 * n],
+        ];
+        let (g0, g1) = dot_f32_x4x2_dispatch(a0, a1, b);
+        for k in 0..4 {
+            out[(row + k) * m + r] = g0[k];
+            out[(row + k) * m + r + 1] = g1[k];
+        }
+        row += 4;
+    }
+    while row < r1 {
+        let xs = row * n;
+        let b = &x[xs..xs + n];
+        out[row * m + r] = dot_f32_dispatch(a0, b);
+        out[row * m + r + 1] = dot_f32_dispatch(a1, b);
+        row += 1;
+    }
 }
 
 /// Dequantize one stored weight row (`blocks * block_vals` values) into `out` with the same
@@ -1427,6 +1567,7 @@ pub fn matmul_q4_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize
         rows,
         MATMUL_ROW_TILE,
         MATMUL_ROW_GROUP,
+        MATMUL_W_ROWS,
         MATMUL_R_BLOCK,
         18,
         32,
@@ -1445,6 +1586,7 @@ pub fn matmul_q5_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize
         rows,
         MATMUL_ROW_TILE,
         MATMUL_ROW_GROUP,
+        MATMUL_W_ROWS,
         MATMUL_R_BLOCK,
         22,
         32,
@@ -1473,6 +1615,7 @@ pub fn matmul_q5_0_tiled(
         rows,
         tile,
         MATMUL_ROW_GROUP,
+        MATMUL_W_ROWS,
         MATMUL_R_BLOCK,
         22,
         32,
@@ -1500,6 +1643,38 @@ pub fn matmul_q5_0_grouped(
         rows,
         MATMUL_ROW_TILE,
         group,
+        MATMUL_W_ROWS,
+        MATMUL_R_BLOCK,
+        22,
+        32,
+        dq_q5_0_block,
+    )
+}
+
+/// Batched Q5_0 with explicit tile and weight-rows-per-pass: the A/B hook for
+/// [`MATMUL_W_ROWS`] (`PH-203r`). `1` keeps the single-row inner block, `2` pairs two
+/// dequantized rows. Bit-identical for every setting.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_q5_0_wrows(
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    tile: usize,
+    w_rows: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(n % 32, 0, "matmul_q5_0_wrows: n%32");
+    matmul_reuse(
+        w,
+        m,
+        n,
+        x,
+        rows,
+        tile,
+        MATMUL_ROW_GROUP,
+        w_rows,
         MATMUL_R_BLOCK,
         22,
         32,
@@ -1526,6 +1701,7 @@ pub fn matmul_q5_0_rows1(
         x,
         rows,
         tile,
+        1,
         1,
         MATMUL_R_BLOCK,
         22,
@@ -1555,6 +1731,7 @@ pub fn matmul_q5_0_blocked(
         rows,
         tile,
         MATMUL_ROW_GROUP,
+        MATMUL_W_ROWS,
         r_block,
         22,
         32,
@@ -1582,6 +1759,7 @@ pub fn matmul_q5_0_rb1(
         rows,
         tile,
         MATMUL_ROW_GROUP,
+        MATMUL_W_ROWS,
         1,
         22,
         32,
@@ -1615,6 +1793,7 @@ pub fn matmul_q8_0_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize
         rows,
         MATMUL_ROW_TILE,
         MATMUL_ROW_GROUP,
+        MATMUL_W_ROWS,
         MATMUL_R_BLOCK,
         34,
         32,
@@ -1652,6 +1831,7 @@ fn matmul_k(
     x: &[f32],
     rows: usize,
     tile: usize,
+    w_rows: usize,
 ) -> Vec<f32> {
     let (block_bytes, dq) = k_quant(ggml_type).expect("matmul_k: not a 256-value K-quant type");
     debug_assert_eq!(n % 256, 0, "matmul_k: n%256");
@@ -1663,6 +1843,7 @@ fn matmul_k(
         rows,
         tile,
         MATMUL_ROW_GROUP,
+        w_rows,
         MATMUL_R_BLOCK,
         block_bytes,
         256,
@@ -1672,21 +1853,21 @@ fn matmul_k(
 
 /// Batched Q4_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q4_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
-    matmul_k(12, w, m, n, x, rows, k_row_tile(n))
+    matmul_k(12, w, m, n, x, rows, MATMUL_ROW_TILE_K, MATMUL_W_ROWS)
 }
 
 /// Batched Q5_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q5_k(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
-    matmul_k(13, w, m, n, x, rows, k_row_tile(n))
+    matmul_k(13, w, m, n, x, rows, MATMUL_ROW_TILE_K, MATMUL_W_ROWS)
 }
 
 /// Batched Q6_K `W[m×n] · X[rows×n]` (see [`matmul_reuse`]).
 pub fn matmul_q6_k_dispatch(w: &[u8], m: usize, n: usize, x: &[f32], rows: usize) -> Vec<f32> {
-    matmul_k(14, w, m, n, x, rows, k_row_tile(n))
+    matmul_k(14, w, m, n, x, rows, MATMUL_ROW_TILE_K, MATMUL_W_ROWS)
 }
 
 /// Batched K-quant `W[m×n] · X[rows×n]` with an explicit activation tile: bench/measure hook
-/// for [`k_row_tile`] (`PH-203q`). Bit-identical to the production path.
+/// for [`MATMUL_ROW_TILE_K`] (`PH-203q`). Bit-identical to the production path.
 #[doc(hidden)]
 pub fn matmul_k_tiled(
     ggml_type: u32,
@@ -1697,7 +1878,24 @@ pub fn matmul_k_tiled(
     rows: usize,
     tile: usize,
 ) -> Vec<f32> {
-    matmul_k(ggml_type, w, m, n, x, rows, tile)
+    matmul_k(ggml_type, w, m, n, x, rows, tile, MATMUL_W_ROWS)
+}
+
+/// Batched K-quant with explicit tile *and* weight-rows-per-pass: the interaction hook for
+/// [`MATMUL_ROW_TILE_K`] × [`MATMUL_W_ROWS`] (`PH-203r`). Bit-identical to the production path.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_k_tiled_rows(
+    ggml_type: u32,
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    rows: usize,
+    tile: usize,
+    w_rows: usize,
+) -> Vec<f32> {
+    matmul_k(ggml_type, w, m, n, x, rows, tile, w_rows)
 }
 
 /// Bytes of one `n`-wide row for a fused kernel type, or `None` when the type has no
@@ -2342,16 +2540,6 @@ mod tests {
     }
 
     #[test]
-    fn k_row_tile_shrinks_with_row_width_and_threads() {
-        // PH-203q: one activation tile per worker, so the tile is L3/threads bound, floored to
-        // a multiple of 8 (`MATMUL_ROW_GROUP` × 2) and capped at the 32-value block tile.
-        assert_eq!(k_row_tile_with(896, 12), MATMUL_ROW_TILE);
-        assert_eq!(k_row_tile_with(4864, 12), 24);
-        assert_eq!(k_row_tile_with(4864, 1), MATMUL_ROW_TILE);
-        assert_eq!(k_row_tile_with(16_384, 12), 8);
-    }
-
-    #[test]
     fn matmul_k_quant_tiling_is_bit_identical() {
         // PH-203q: the activation tile only regroups independent (row, r) writes, and the
         // K-quant dequantizer sees the same stored bytes per super-block either way, so a
@@ -2385,6 +2573,22 @@ mod tests {
             let got = matmul_q5_0_grouped(&w, m, n, &x, rows, group);
             assert_eq!(got, single, "group {group} changed the result");
         }
+    }
+
+    #[test]
+    fn matmul_two_weight_rows_is_bit_identical() {
+        // PH-203r: pairing two dequantized weight rows only shares the activation load, so the
+        // pair must match the single-row path bit for bit — including the odd-row tail (m = 5)
+        // and the odd activation-row tail (rows = 70 = 4×17 + 2).
+        let (m, n, rows) = (5usize, 64usize, 70usize);
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i as i32 * 5 % 19) as f32) * 0.03 - 0.4)
+            .collect();
+        let w = q5_blocks(m * n / 32);
+        let one = matmul_q5_0_wrows(&w, m, n, &x, rows, MATMUL_ROW_TILE, 1);
+        let two = matmul_q5_0_wrows(&w, m, n, &x, rows, MATMUL_ROW_TILE, 2);
+        assert_eq!(two, one, "two weight rows per pass changed the result");
+        assert_eq!(matmul_q5_0_dispatch(&w, m, n, &x, rows), one);
     }
 
     #[test]

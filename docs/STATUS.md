@@ -27,26 +27,30 @@ down 10.0 → 36.4 GMAC/s; golden fingerprint не зрушив)** → **`PH-203
 live prefill **9.12–9.90 s**; fingerprint збігся)** → **`PH-203p` «other» розкладено й зрізано ✅
 (нові стадії `norm/rope/kv-copy/swiglu/residual/embed` + `serial`/`unaccounted` у звіті; SwiGLU
 на пулі 676 → **118 ms**, RoPE через таблицю `(cos,sin)` 205 → **33–41 ms**, serial 1010 → **260–297 ms**,
-live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; усе біт-у-біт)** ·
-**запушено 2026-10-22** (після `PH-203p`).
+live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; усе біт-у-біт)** →
+**`PH-203q` K-тайл від L3 ✅ (down 36.8–41.9 → 49.7–56.0 GMAC/s, live 6.90–7.84 → 7.1–8.9 s на
+завантаженому боксі; тайл 256 і x8-blocking виміряно й відкинуто)** → **`PH-203r` два рядки ваг
+на прохід ✅ (пул: gate/up 76 → 102, down 77 → 108 GMAC/s; live wall **5.3–6.4 s**, matmul
+4.1–4.7 s / 77 %, down 64–69 GMAC/s; golden не зрушив)** · **запушено 2026-10-22** (після
+`PH-203r`).
 
 ## Верифікований стан (зміряно цього сеансу, не «на памʼять»)
 
 | Метрика | Значення |
 |---------|----------|
 | `git status` | **clean** (0 drift) |
-| Коміти | **101** усього (`git rev-list --count HEAD`); **44** у drain-серії B0→PH-203q (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3; **pushed 2026-10-22**) |
+| Коміти | **102** усього (`git rev-list --count HEAD`); **45** у drain-серії B0→PH-203r (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3 + PH-203r two weight rows; **pushed 2026-10-22**) |
 | Тести | **224** (205 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
-| Rust LOC | **14302** (`src` 11965 + `tests` 1317 + `xtask` 319 + `benches` 701; `wc -l`) |
+| Rust LOC | **14605** (`src` 12166 + `tests` 1317 + `xtask` 319 + `benches` 803; `wc -l`) |
 | UI LOC (glue) | **157** (html+css+js) |
 | **Rust ratio** | **98.9%** (ціль 95–100 ✓) |
-| Docs LOC | 2440 (`git ls-files docs \| xargs wc -l`) |
+| Docs LOC | 2479 (`git ls-files docs \| xargs wc -l`) |
 | Tracked files | 67 |
 | Реальна модель | `data/models/qwen2.5-0.5b-q4_k_m.gguf` (491 400 032 B, **gitignored**, sha256 `74a4da8c…`) |
 | Трекінг `data/` | лише `.gitkeep` (модель не в репо ✓) |
-| Live `:8090` (12 потоків, 961-tok prefill, `RUSTY_PROFILE=1`) | **7.1–8.9 s** (бокс дрейфує: вікно 6.9–8.9 s на однаковій роботі за сесію) · matmul **5.8–6.6 s** (~81–86 %) · attention **0.72–0.93 s** (~10–12 %) · down `896×4864` **49.7–56.0 GMAC/s** (було 36–42, 2.40–2.73 → **1.79–2.02 s**) · gate/up 58–65 · swiglu 116–128 ms · rope 33–41 ms · **other 3.4–3.9 %** · decode 10.4–27.6 tok/s (сильно залежить від фонового навантаження боксу) |
+| Live `:8090` (12 потоків, 961-tok prefill, `RUSTY_PROFILE=1`) | **5.3–6.4 s** (бокс дрейфує ±20 % на однаковій роботі; міряти лише свіжим процесом) · matmul **4.1–4.7 s** (~77 %) · attention **0.74–0.78 s** (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42; 1.46–1.56 s) · gate/up **81–92** · attention QK 84–92 · swiglu 122–132 ms · rope 32–35 ms · **other 2.4–3 %** · decode 10.4–27.6 tok/s (сильно залежить від фонового навантаження боксу) |
 
 ## Що зроблено (канон смуг → `docs/roadmap.md`)
 
@@ -72,7 +76,12 @@ block_forward → sampler → BPE` — і реальна геометрія Qwen
    GPT-J→NeoX; наш greedy тепер байт-у-байт збігається із записаним оракулом (55/12/48),
    golden перезахоплено. Гейти — `tests/moe_parity.rs`.
 2. HF-exact Qwen BPE (`PH-305b`: `qwen2` pre-regex, byte-fallback, specials) — для читабельного тексту.
-3. Далі — важкі/інфра-бенди (NEON arm64, axum-server, fleet/docker, build-matrix/apk) — кожен окремий великий зріз. **B2 x86 SIMD + bench закрито** (`PH-203`/`PH-205`), **hot dots переведено на AVX2+FMA** (`PH-203d`), **проєкції паралеляться по рядках** (`PH-203e`, `RUSTY_THREADS`, дефолт = available_parallelism) через **постійний пул** (`PH-203f`: `thread::scope` давав 750–820 µs на проєкцію, ~90 ms/токен). **RoPE тепер рахується раз на позицію**, а KV-кеш зберігає вже повернуті ключі (`PH-203g`) — prefill більше не платить `powf` за кожну пару (query, key). Prefill-attention тепер теж паралелиться по головах (`PH-203h`, `pool::parallel_for`, поріг 32 токени); залишок prefill — сам matmul. `PH-203p` закрив останній «other»: після розкладу профайлером (swiglu 8 %, rope 2.4 %, norm/residual/kv <1 % кожен) SwiGLU пішов на пул, а RoPE отримав таблицю `(cos,sin)` на позицію; serial-частка впала з 11.9 % до 3.4–3.8 %, і prefill тепер на **84 %** складається з matmul + 9.8 % attention. `PH-203q` перевірив гіпотезу «K-тайл 256» і **відкинув її виміром** (256 на down-формі −44 %), замінивши константу на похідну від L3: `k_row_tile_with(n, threads) = clamp(6 MiB/(threads·n·4), 8, 96)` — кожен воркер тримає свій активаційний тайл, тож 4864-широкий вихід отримує 24 рядки, а 896-широкий — 96. Down-проєкція **36.8–41.9 → 49.7–56.0 GMAC/s** (2.40–2.73 → 1.79–2.02 s), gate/up без змін. Register blocking x8 виміряно й відкинуто (один потік +10 %, пул −40 %), заодно виправлено хвіст `n%8` у `dot_f32_avx2_x4`. Резерв далі — структура dot-циклу (`PH-203r`: два рядки ваг на прохід), а не тайл/дейквант. `PH-203i` знайшов справжній ботлнек q8_0 (повільний `f16_to_f32` на блок, не i8→f32): точне бітове розширення дало 9.55× на dot і 11.8 GMAC/s на matvec без зміни чисел; int8-ядро лишилось оракул-тестованою альтернативою (0.89× після фіксу).
+3. Далі — важкі/інфра-бенди (NEON arm64, axum-server, fleet/docker, build-matrix/apk) — кожен окремий великий зріз. **B2 x86 SIMD + bench закрито** (`PH-203`/`PH-205`), **hot dots переведено на AVX2+FMA** (`PH-203d`), **проєкції паралеляться по рядках** (`PH-203e`, `RUSTY_THREADS`, дефолт = available_parallelism) через **постійний пул** (`PH-203f`: `thread::scope` давав 750–820 µs на проєкцію, ~90 ms/токен). **RoPE тепер рахується раз на позицію**, а KV-кеш зберігає вже повернуті ключі (`PH-203g`) — prefill більше не платить `powf` за кожну пару (query, key). Prefill-attention тепер теж паралелиться по головах (`PH-203h`, `pool::parallel_for`, поріг 32 токени); залишок prefill — сам matmul. `PH-203p` закрив останній «other»: після розкладу профайлером (swiglu 8 %, rope 2.4 %, norm/residual/kv <1 % кожен) SwiGLU пішов на пул, а RoPE отримав таблицю `(cos,sin)` на позицію; serial-частка впала з 11.9 % до 3.4–3.8 %, і prefill тепер на **84 %** складається з matmul + 9.8 % attention. `PH-203q` перевірив гіпотезу «K-тайл 256» і **відкинув її виміром** (256 на down-формі −44 %), замінивши константу на похідну від L3: `k_row_tile_with(n, threads) = clamp(6 MiB/(threads·n·4), 8, 96)` — кожен воркер тримає свій активаційний тайл, тож 4864-широкий вихід отримує 24 рядки, а 896-широкий — 96. Down-проєкція **36.8–41.9 → 49.7–56.0 GMAC/s** (2.40–2.73 → 1.79–2.02 s), gate/up без змін. Register blocking x8 виміряно й відкинуто (один потік +10 %, пул −40 %), заодно виправлено хвіст `n%8` у `dot_f32_avx2_x4`. `PH-203r` пішов далі й зняв load-port тиск: два дейквантованих рядки ваг на прохід
+(`dot_f32_avx2_x4x2`, `6 loads / 8 FMA`) — gate/up у пулі **76 → 102 GMAC/s**, down
+**77 → 108**, live wall **7.1–8.9 → 5.3–6.4 s**, matmul 4.1–4.7 s (77 %), attention 13.9 %.
+Заодно **відкинуто** гіпотезу PH-203q про «тайл ділиться на воркерів»: тайл — спільний зріз `X`,
+і з парою рядків pooled-оптимум повертається до 96 (down Q6_K: 24 → 75, 96 → 108, 128 → 119
+бенч / 55 live), тож `MATMUL_ROW_TILE_K = MATMUL_ROW_TILE` і функцію форми видалено. `PH-203i` знайшов справжній ботлнек q8_0 (повільний `f16_to_f32` на блок, не i8→f32): точне бітове розширення дало 9.55× на dot і 11.8 GMAC/s на matvec без зміни чисел; int8-ядро лишилось оракул-тестованою альтернативою (0.89× після фіксу).
 
 ## Research / позиціонування
 
@@ -85,7 +94,7 @@ vLLM v0.28 / SGLang v0.5.19 (RadixArk) / TensorRT-LLM v1.2.1 / llama.cpp / ktran
 
 Див. **`docs/NEXT_SESSION_PROMPT.md`** (`Owner product pick: rusty-engine`). **`PH-507` E2E
 зроблено** (лишається WiFi multi-host band 233 + IDE-chat `rusty/*`). **B2 x86 SIMD + bench
-(`PH-203`/`PH-205`) закрито**, перф-серія prefill доведена до matmul ~84 %; наступний зріз —
-**`PH-203r`** (два вагових рядки на прохід, load-port `6/8` замість `5/4`). Готові green-зрізи
-далі: attention (exp-bound) · NEON arm64 (`PH-203`) · `PH-501` (axum serve) · важкі/інфра-бенди
-(B6/B7).
+(`PH-203`/`PH-205`) закрито**, matmul виведено на load-port/FMA-межу (77 % prefill, gate/up
+81–92 GMAC/s, down 64–69). Наступний зріз — **`PH-203s`**: attention 13.9 % (0.74–0.78 s,
+exp-bound; онлайн-softmax блоками + таблиця `exp`, лише з новим golden). Готові green-зрізи
+далі: NEON arm64 (`PH-203`) · `PH-501` (axum serve) · важкі/інфра-бенди (B6/B7).

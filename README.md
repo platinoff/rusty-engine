@@ -35,9 +35,9 @@ cargo run --bin rusty -- --version
 cargo run --bin rusty -- --help
 ```
 
-## Status (verified 2026-10-22, PH-203q)
+## Status (verified 2026-10-22, PH-203r)
 
-**101 commits · 224 tests (+5 ignored parity) · clippy `-D` clean · Rust ratio 98.9 % (14302 LOC).**
+**102 commits · 224 tests (+5 ignored parity) · clippy `-D` clean · Rust ratio 98.9 % (14605 LOC).**
 End-to-end plumbing works: `ModelConfig → validate → GGUF dequant (Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K)
 → embed → `moe_layer_forward`/`block_forward` → sampler → byte-level BPE`. A **real**
 Qwen2.5-0.5B GGUF is parsed and run (24 layers, greedy output byte-identical to the llama-rs
@@ -47,23 +47,23 @@ Live `:8090`, Qwen2.5-0.5B Q4_K_M, 12 threads:
 
 | Path | Now | Session start |
 |------|-----|---------------|
-| prefill 961 tok | **6.9–8.9 s** (box drifts) | 190.9 s (~22–27×) |
+| prefill 961 tok | **5.3–6.4 s** (box drifts) | 190.9 s (~30–36×) |
 | prefill 321 tok | 5.6 s | 45.6 s |
 | decode | **10.4–27.6 tok/s** (load-dependent) | 2.27 tok/s |
-| Q6_K down 896×4864×961 (pool) | **50–56 GMAC/s** (1.79–2.02 s) | 10.0 GMAC/s, 4.2 s |
+| Q6_K down 896×4864×961 (pool) | **64–69 GMAC/s** (1.46–1.56 s) | 10.0 GMAC/s, 4.2 s |
 | Q5_0 matmul 4864×896×961 | 199 ms single thread / 56 ms pool | 1009 ms |
 
-Profiled split of prefill (`RUSTY_PROFILE=1`): matmul 5.8–6.6 s (~81–86 %), attention 0.72–0.93 s
-(~10–12 %), SwiGLU 116–128 ms, RoPE 33–41 ms, norm/residual/kv-copy <70 ms each — the old ~11 %
-"other" is down to **3.4–3.9 %**. Two levers got there: the K-quant activation tile is now
-derived from the shared L3 (`clamp(6 MiB / (threads·n·4), 8, 96)` rows) instead of a fixed 96,
-which took the wide down projection from 36–42 to **50–56 GMAC/s**, and the earlier SwiGLU/RoPE
-slices. A 256-multiple tile and 8-row register blocking were both measured and rejected (numbers
-in `benches/kquant.rs` / `benches/quant.rs`). Golden fingerprint `tests/data/qwen25_golden.txt`
-has not moved through the whole PH-203j…q series — every slice stayed bit-identical on the greedy
-output.
+Profiled split of prefill (`RUSTY_PROFILE=1`): matmul 4.1–4.7 s (~77 %), attention 0.74–0.78 s
+(13.9 %), SwiGLU 122–132 ms, RoPE 32–35 ms, norm/residual/kv-copy <70 ms each — the old ~11 %
+"other" is down to **2.4–3 %**. Three levers got there: `PH-203p` put SwiGLU on the pool and
+RoPE on a per-position `(cos,sin)` table, and `PH-203r` dequantizes **two weight rows per pass**
+(`dot_f32_x4x2`: `6 loads / 8 FMA` instead of `5 / 4`), which took the pooled kernels from 76 to
+102 GMAC/s on gate/up and 77 to 108 on the Q6_K down projection. A 256-multiple K-quant tile,
+8-row register blocking and a per-worker L3 tile are all measured *and rejected* — the numbers
+live in `benches/kquant.rs` / `benches/quant.rs`. Golden fingerprint
+`tests/data/qwen25_golden.txt` has not moved through the whole PH-203j…r series — every slice
+stayed bit-identical on the greedy output.
 
-Remaining: `PH-203r` (two weight rows per pass to lift the load-port ratio), attention
-(exp-bound), NEON, then `B6` build-matrix, `B7` docker, `B8` supervisor, `B9` dist-MoE, `B10` UI,
-`B11` distributions. See [`docs/STATUS.md`](docs/STATUS.md), [`docs/NEXT_SESSION_PROMPT.md`](docs/NEXT_SESSION_PROMPT.md)
+Remaining: `PH-203s` (attention 13.9 %, exp-bound — needs a new golden to move), NEON, then
+`B6` build-matrix, `B7` docker, `B8` supervisor, `B9` dist-MoE, `B10` UI, `B11` distributions. See [`docs/STATUS.md`](docs/STATUS.md), [`docs/NEXT_SESSION_PROMPT.md`](docs/NEXT_SESSION_PROMPT.md)
 and `S:/rust/GSV/docs/gsv/PRODUCTS.md` (row `rusty-engine`).

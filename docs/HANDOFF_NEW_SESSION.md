@@ -7,18 +7,19 @@
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | PH-203q (див. `git log -1`), `origin/main` синхронний, `git status` clean |
+| HEAD / origin | PH-203r (див. `git log -1`), `origin/main` синхронний, `git status` clean |
 | Гейт | fmt ok · clippy `-D` **0** · **224** тести (205 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
-| Код | Rust **14302** LOC (src 11965 / tests 1317 / xtask 319 / benches 701), UI 157 → ratio **98.9 %** · 67 tracked files · docs 2440 LOC |
-| Prefill (live `:8090`, 12 потоків, 961 tok) | **7.1–8.9 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 5.8–6.6 s (~81–86 %) · attention 0.72–0.93 s (~10–12 %) · down `896×4864` **50–56 GMAC/s** (було 36–42) · swiglu 116–128 ms · rope 33–41 ms · other **3.4–3.9 %** |
+| Код | Rust **14605** LOC (src 12166 / tests 1317 / xtask 319 / benches 803), UI 157 → ratio **98.9 %** · 67 tracked files · docs 2479 LOC |
+| Prefill (live `:8090`, 12 потоків, 961 tok) | **5.3–6.4 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 4.1–4.7 s (~77 %) · attention 0.74–0.78 s (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42) · gate/up **81–92** · swiglu 122–132 ms · rope 32–35 ms · other **2.4–3 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
 | Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…q (recapture не робився) |
 | Живий білд | `target/release/rusty.exe` + `target/live/launch_serve.vbs` (CRLF!), `threads.txt`=12, `profile.txt`=1, звіт `target/live/rusty_prof.err.log` |
 
-**Далі:** `PH-203r` — два рядки ваг на прохід (два `rowbuf` замість одного): ціль знизити
-load-port тиск `5 завантажень / 4 FMA` до `6/8`. Після PH-203q down-форма наздогнала решту
-(50–56 проти 58–65 GMAC/s), тож резерв — сама структура dot-циклу, а не тайл/дейквант.
-Attention 10–12 % (exp-bound, чіпати лише з новим golden), далі NEON (B2), потім B6/B7.
+**Далі:** `PH-203s` — attention 13.9 % (0.74–0.78 s): він тепер другий за вагою після matmul і
+єдиний великий блок, який ще не чіпали після `PH-203o`; онлайн-softmax блоками по KV і
+таблиця `exp` — єдиний шлях, що не ламає біти (exp-bound, кожна зміна порядку = новий golden).
+Matmul упирається у load-port/FMA-межу (`6 loads / 8 FMA` = 2.67 FMA/цикл при 8 ланцюгах), тож
+далі там виграш лише з памʼяті (`r_block`, non-temporal `out`), не з циклу. Потім NEON (B2), B6/B7.
 
 ## Що було зроблено (B0, campaign 2026-10-14)
 
@@ -843,4 +844,32 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
   moe-parity + dense real-model) зелені без перезахоплення.
 - **Далі:** `PH-203r` — два рядки ваг на прохід (2 `rowbuf`), щоб зняти load-port тиск
   `5 loads / 4 FMA`; потім attention (exp-bound) і NEON.
+
+### Продовження 25 — 2026-10-22: PH-203r — два рядки ваг на прохід (prefill 7.1–8.9 → 5.3–6.4 s)
+
+- **`src/kernel.rs`:** `dot_f32_avx2_x4x2` + `dot_f32_x4x2_dispatch` (AVX2 → 2× скалярний
+  fallback): чотири активації проти **двох** дейквантованих рядків ваг. Внутрішній крок став
+  `2 ваги + 4 активації = 6 завантажень / 8 FMA` (0.75) замість `5 / 4` (1.25); кожен вихід
+  зберігає власний 8-ланьовий ланцюг, тому біт-у-біт (`matmul_two_weight_rows_is_bit_identical`).
+- **`matmul_reuse`** розкладено на `dot_tile_rows` + `dot_tile_rows_pair`; новий параметр
+  `w_rows` (`MATMUL_W_ROWS = 2`, `clamp(1, 2)`), пара вмикається лише при `group == 4` і
+  непарному залишку рядків — решта йде старим шляхом. Хуки: `matmul_q5_0_wrows`,
+  `matmul_k_tiled_rows` (усі біт-у-біт).
+- **Таблиця, яка змінила тайл:** пул 12 потоків, `benches/quant.rs` + `benches/kquant.rs`
+  (min of 3): gate/up Q5_0 — 1 рядок 54.9 ms (76.3 GMAC/s) → **2 рядки 41.2 ms (101.7)**;
+  down Q5_0 — 54.2 (77.2) → **38.6 (108.5)**. Один потік: 19.1 → 30.3 і 17.7 → 24.0 GMAC/s.
+- **Гіпотеза PH-203q про «тайл ділиться на воркерів» — відкинута:** тайл — це **спільний**
+  зріз `X`, у воркера лише власні `rowbuf`-и. З парою рядків pooled-оптимум down Q6_K:
+  24 → 75, 48 → 99, **96 → 108**, 128 → 119, 192 → 80 GMAC/s. 128 дав +4 % у бенчі, але в live
+  down **55.4** проти **64–69** при 96, тому `MATMUL_ROW_TILE_K = MATMUL_ROW_TILE` (96) для
+  обох шляхів, а `k_row_tile_with`/`k_row_tile` і тест на форму видалено.
+- **Live (свіжий процес, 12 потоків, LAN-проба):** wall **5.34/5.60/5.81/6.03/6.11/6.41 s**
+  (було 7.1–8.9); matmul **4.1–4.7 s (77 %)**; down `896×4864` **1.46–1.56 s = 64–69 GMAC/s**
+  (було 1.79–2.02 s / 50–56); gate/up **81–92**; attention QK `896×896` **84–92**;
+  attention 0.74–0.78 s (13.9 %); swiglu 122–132 ms; rope 32–35 ms; other 2.4–3 %.
+- **Гейт:** 205 lib + integration = **224** тести, clippy 0, fmt ok, `--ignored` (golden +
+  moe-parity + dense real-model) зелені; golden не перезахоплювався.
+- **Висновок:** matmul тепер упирається у FMA/load межу (2 FMA/цикл × 16 MAC), а не в тайл чи
+  дейквант. Наступний великий резерв — attention (13.9 %), далі памʼять (`r_block`,
+  non-temporal store) і NEON.
 

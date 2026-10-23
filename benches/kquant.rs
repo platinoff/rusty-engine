@@ -62,7 +62,9 @@ fn time(iters: usize, mut f: impl FnMut()) -> Duration {
 ///
 /// This is the shape the live server actually runs, and it is the only way to see the tile
 /// trade-off: single-threaded (above) a bigger tile always wins because dequant is amortized,
-/// while under 12 workers a bigger tile means a bigger per-thread activation working set.
+/// while under 12 workers the activation tile is shared but each worker adds its own row
+/// buffers, so the pooled optimum is not the single-thread optimum.
+#[allow(clippy::too_many_arguments)]
 fn pool_matmul(
     ty: u32,
     w: &[u8],
@@ -71,19 +73,20 @@ fn pool_matmul(
     x: &[f32],
     rows: usize,
     tile: usize,
+    w_rows: usize,
 ) -> Vec<f32> {
     let threads = rusty_engine::pool::requested_threads().max(1);
     let chunk = m.div_ceil(threads);
     let jobs = m.div_ceil(chunk);
     if jobs <= 1 {
-        return k::matmul_k_tiled(ty, w, m, n, x, rows, tile);
+        return k::matmul_k_tiled_rows(ty, w, m, n, x, rows, tile, w_rows);
     }
     let row_bytes = k::quant_row_bytes(ty, n).expect("kquant: fused row");
     let parts = std::sync::Mutex::new(Vec::<(usize, Vec<f32>)>::with_capacity(jobs));
     rusty_engine::pool::parallel_for(jobs, |ji| {
         let r0 = ji * chunk;
         let rc = chunk.min(m - r0);
-        let got = k::matmul_k_tiled(
+        let got = k::matmul_k_tiled_rows(
             ty,
             &w[r0 * row_bytes..(r0 + rc) * row_bytes],
             rc,
@@ -91,6 +94,7 @@ fn pool_matmul(
             x,
             rows,
             tile,
+            w_rows,
         );
         parts.lock().expect("parts").push((ji, got));
     });
@@ -107,7 +111,7 @@ fn pool_matmul(
 
 fn main() {
     let rows = 961usize;
-    let tiles = [16usize, 24, 32, 48, 64, 96];
+    let tiles = [16usize, 24, 32, 48, 64, 96, 128, 192, 256];
     // (label, ggml_type, block_bytes, d_off, m, n)
     let shapes = [
         (
@@ -145,13 +149,14 @@ fn main() {
         }
         let base = best[0];
         println!(
-            "  best {:>4} vs tile 96: {:>5.2}x",
+            "  best {:>4} vs tile {}: {:>5.2}x",
             tiles[best
                 .iter()
                 .enumerate()
                 .min_by(|a, b| a.1.partial_cmp(b.1).expect("finite"))
                 .expect("tiles")
                 .0],
+            tiles[0],
             base / best.iter().cloned().fold(f64::INFINITY, f64::min)
         );
 
@@ -161,7 +166,7 @@ fn main() {
         for _ in 0..3 {
             for (i, &tile) in tiles.iter().enumerate() {
                 let t = time(1, || {
-                    black_box(pool_matmul(ty, &w, m, n, &x, rows, tile));
+                    black_box(pool_matmul(ty, &w, m, n, &x, rows, tile, 2));
                 });
                 pooled[i] = pooled[i].min(t.as_secs_f64() * 1e3);
             }
@@ -183,9 +188,28 @@ fn main() {
             .min_by(|a, b| a.1.partial_cmp(b.1).expect("finite"))
             .expect("tiles");
         println!(
-            "  pooled best tile {}: {:>5.2}x vs tile 96",
+            "  pooled best tile {}: {:>5.2}x vs tile {}",
             tiles[best_i],
-            pooled[0] / pooled[best_i]
+            pooled[0] / pooled[best_i],
+            tiles[0]
         );
+
+        // PH-203r: pairing two weight rows changes which tile the pool wants, so the two knobs
+        // are measured together instead of reusing the single-row conclusion.
+        println!("  pooled w_rows x tile (min of 3, GMAC/s):");
+        for wr in [1usize, 2] {
+            let mut line = format!("    w_rows {wr}:");
+            for &tile in &[24usize, 48, 96, 192] {
+                let mut ms = f64::INFINITY;
+                for _ in 0..3 {
+                    let t = time(1, || {
+                        black_box(pool_matmul(ty, &w, m, n, &x, rows, tile, wr));
+                    });
+                    ms = ms.min(t.as_secs_f64() * 1e3);
+                }
+                line.push_str(&format!("  t{tile:<3} {:>6.2}", mac / (ms / 1e3)));
+            }
+            println!("{line}");
+        }
     }
 }
