@@ -47,6 +47,13 @@ chat_template: 7 249 chars (Jinja, hard-disable thinking)
 повноувагова кожна 4-та шар)**. Існуючий qwen2-шлях (`forward.rs`, `model.rs`) його
 НЕ покриває — це новий бенд **B13** (див. §3).
 
+> **PH-1301 (того ж дня): `rusty validate data/models/MiniCPM-V-4_7-1B-Q4_K_M.gguf` = OK.**
+> 24 шари, 6 full (blk.3 включно), всі dims збігаються з config-формулами
+> (`model.rs`: `LayerKind::{Recurrent, Full}`, qkv 3·inner, attn_q 2·q). Додатковий
+> факт із валідації: **`ffn_norm.weight` у qwen35 немає** — перед-FFN норму грає
+> `post_attention_norm.weight` (дві норми на блок); гибридна гілка `validate` саме це
+> й вимагає.
+
 ## 2. Vision mmproj: clip, 548M, повний BF16
 
 ```
@@ -62,7 +69,7 @@ clip.projector_type = "minicpmv4_7", scale_factor = 4, max_slice_nums = 9,
   · mm.{input_norm, up 4608→4608, down 4608→1024} — фінальний MLP-projection.
 ```
 
-**Глин:** `GGML_TYPE_BF16 = 30` (канон ggml.h: I8=24, IQ1_M=29, BF16=30). Таблиця
+**Глюк:** `GGML_TYPE_BF16 = 30` (канон ggml.h: I8=24, IQ1_M=29, BF16=30). Таблиця
 rusty-mape мала хибний `24 → BF16` — виправлено цим зрізом (`gguf::ggml_dtype`,
 `quant::block_info`, `dequant` arm 30: bf16 = верхні 16 біт f32, widening = `<< 16`;
 тест `dequant_bf16_widens_by_left_shift`). Усі vision-ваги — 2-байтові без блоків →

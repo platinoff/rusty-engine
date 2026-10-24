@@ -299,7 +299,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B13 — Text core `qwen35` (ГІБРИД GDN + full-attention)  **`[ ]`** (owner-план 2026-10-24, з `PH-1201`)
+## Band B13 — Text core `qwen35` (ГІБРИД GDN + full-attention)  **`[~]`** (`PH-1301` done, 2026-10-24)
 
 > Мета: LLM-каркас MiniCPM-V 4.7 — **`qwen35`**: 24 шари × d_model 1024, **18 GDN-шарів
 > (Gated DeltaNet: mixed qkv 6144, depthwise conv k4, delta-rule стан 16×128×128, out
@@ -312,7 +312,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
-| PH-1301 | `model.rs`: arch `qwen35` — config-ключі (ssm.*, full_attention_interval, key/value_length, rope sections) + `Geometry`-розширення + `validate` під нові імена тензорів (attn_qkv/attn_gate/ssm_* vs attn_q/k/v+norm) | `[ ]` | `src/model.rs` + unit (synth qwen35) |
+| PH-1301 | `model.rs`: arch `qwen35` — config-ключі (ssm.*, full_attention_interval, key/value_length, rope sections) + `Geometry`-розширення + `validate` під нові імена тензорів (attn_qkv/attn_gate/ssm_* vs attn_q/k/v+norm) | `[x]` | `src/model.rs` — `LayerKind::{Recurrent,Full}`, `layer_kind()` (Bool-масив > interval), `head_dim()=key_length`, `gdn_qkv_dim`/`full_q_dim`; validate-гілка per-kind (pre-FFN norm = `post_attention_norm`, `ffn_norm` немає); 4 synth-тести + `#[ignore]` real: `rusty validate MiniCPM-V-4_7-1B-Q4_K_M.gguf` = OK |
 | PH-1302 | **GDN-шар** (`src/gdn.rs`): mixed qkv → depthwise conv1d(k4, F32) → delta-rule recurent (16 груп × 128×128 стан, dt/alpha/beta, ssm_norm) → out-gate → 1024; prefill-скан по行 + O(1) decode-крок; bit-stable oracle на synth | `[ ]` | `src/gdn.rs` + unit + contract-тест |
 | PH-1303 | **full-attn шар**: GQA 8/2 head_dim 256 + **QK-norm** + q-gate (attn_q 4096) + zyxt-sectioned rope [11,11,10,0]; reuse `attention_*` з винесеними нормами | `[ ]` | `src/forward.rs` (qwen35-гілка) + unit |
 | PH-1304 | pre-tokenizer `qwen35` (`gpt2.rs`-сімейство) + chat-template specials (248045/6) + `DenseRunner`-wire 18+6 шарів; CLI `rusty run` на qwen35-файлі | `[ ]` | `src/gpt2.rs`/`runner.rs` + text round-trip |

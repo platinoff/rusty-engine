@@ -7,9 +7,9 @@
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | PH-1201 spike (див. §Продовження 26–28 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` (gitignored) |
-| Гейт | fmt ok · clippy `-D` **0** · **227** тести (208 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
-| Код | Rust **15173** LOC (src 12387 / tests 1317 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 69 tracked files · docs 2735 LOC |
+| HEAD / origin | PH-1301 `model.rs` qwen35-hybrid (див. §Продовження 26–29 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` (gitignored) |
+| Гейт | fmt ok · clippy `-D` **0** · **230** тести (211 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 6 `#[ignore]` parity ( incl. real MiniCPM-V validate), усі зелені |
+| Код | Rust **15535** LOC (src 12749 / tests 1317 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 69 tracked files · docs 2781+ LOC |
 | Prefill (live `:8090`, 12 потоків, 961 tok) | **5.3–6.4 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 4.1–4.7 s (~77 %) · attention 0.74–0.78 s (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42) · gate/up **81–92** · swiglu 122–132 ms · rope 32–35 ms · other **2.4–3 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
 | Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…r; recapture PH-203s збігся з ним байт-у-байт і не застосовувався (зріз відкату) |
@@ -21,9 +21,10 @@ exp-bound, `benches/attn.rs`) і `PH-203t` (matmul `w_rows=4` quad-pass + NT-sto
 PH-203r-подібні (bit-identical, golden не рухався). **`PH-1201` spike зроблено
 2026-10-24 (§Продовження 28):** MiniCPM-V 4.7-1B = text-core **`qwen35`-гібрид**
 (18 GDN + 6 full-attn, QK-norm, zyxt-rope, vocab 248 094) + vision-clip BF16
-(`ggml_dtype(30)` фікс). Наступний зріз — **`PH-1301`** (бенд **B13**: config/geometry
-qwen35 → 1302 GDN → 1303 full-attn → 1304 pre-tokenizer/runner → 1305 E2E-паритет проти
-`llama.cpp-omni` → 1306 serve); B12-vision (1202/1203) будується паралельно, image-prefix
+(`ggml_dtype(30)` фікс). **`PH-1301` закрито того ж дня (§Продовження 29: config/geometry
+qwen35 + `rusty validate` на реальному файлі = OK); наступний зріз — 1302 GDN**
+→ 1303 full-attn → 1304 pre-tokenizer/runner → 1305 E2E-паритет проти
+`llama.cpp-omni` → 1306 serve; B12-vision (1202/1203) будується паралельно, image-prefix
 (1204) чекає B13. **Паралельно
 (owner 2026-10-24): модельна політика** — цільова модель **MiniCPM-V 4.7** (official GGUF,
 без Python; `src/vit.rs` + 4×/16× compressor + image-prefix + multimodal serve;
@@ -977,4 +978,33 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
 - **Далі:** **`PH-1301`** — `model.rs`: config `qwen35` + Geometry + validate; далі —
   1302 GDN-шар, 1303 full-attn, 1304 pre-tokenizer+runner, 1305 E2E-паритет проти
   `llama.cpp-omni` CLI, 1306 serve.
+
+### Продовження 29 — 2026-10-24: PH-1301 — `model.rs` читає qwen35-гібрид; `rusty validate` на реальному MiniCPM-V = OK
+
+- **`LayerKind::{Recurrent, Full}` + `layer_kind(i)`** (Bool-массив `recurrent_layers`
+  вигріває над правилом `(i+1) % full_attention_interval == 0`; не-гібриди = завжди
+  Full, qwen2-шлях не чіпається). `head_dim()` тепер = `attention.key_length` (256),
+  якщо він є — інакше стара формула d/n_heads.
+- **Нові поля config** (усі опційні, default 0/порожні): key_length, interval,
+  recurrent_layers, ssm_* (conv4/state128/groups16/rank16/inner2048),
+  rope.dimension_count + dimension_sections [11,11,10,0] + section_order "zyxt";
+  хелпери `gdn_qkv_dim()` (=3·inner) і `full_q_dim()` (=n_heads·head_dim).
+- **`validate`-гібрид**: GDN-шар вимагає attn_qkv [dm,3·inner], attn_gate [dm,inner],
+  ssm_a/alpha/beta/dt [rank], ssm_conv1d [conv,3·inner], ssm_norm [state], ssm_out
+  [inner,dm]; full-шар — attn_q [dm,2·q], k/v [dm,kv], attn_output [q,dm],
+  attn_q_norm/attn_k_norm [hd]; обидва — attn_norm + **post_attention_norm**
+  (являється і перед-FFN нормою: **`ffn_norm` у qwen35 немає** — це єдине, на що
+  реальний файл спочатку порігся, фікс закріплений тестом).
+- **Тести:** synth-config (2 шари R+F, усі поля + kind-матриця), synth-validate
+  (чисто) + 2 missmatch-тести (attn_k у qwen2, ssm_conv1d у GDN) +
+  `#[ignore] real_minicpm_v47_1b_config_and_validate` — **на реальному файлі green**:
+  validate == [], 24 шари, key_length 256, sections [11,11,10,0], 6 full шарів;
+  CLI `rusty validate data/models/MiniCPM-V-4_7-1B-Q4_K_M.gguf` → OK.
+- **Гейт:** fmt ok · clippy `-D` 0 · **230** тестів (211 lib + 19 integration) +
+  6 ignored (усі зелені); Rust **15535** LOC (src 12749 / tests 1317 / xtask 319 /
+  benches 1150), ratio **99.0 %**; qwen2-шлях біт-у-біт (golden не рухався).
+- **Далі:** **`PH-1302`** — `src/gdn.rs` (Gated DeltaNet: conv1d k4 + delta-rule
+  стан 16×128², O(1) decode). Увага при впровадженні: `post_attention_norm` =
+  pre-FFN norm; q/k/v у GDN — один `attn_qkv` 6144 (2048×3), head_dim GDN =
+  state_size = 128 (groups 16), а НЕ 256.
 
