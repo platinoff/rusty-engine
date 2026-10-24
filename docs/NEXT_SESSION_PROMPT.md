@@ -14,6 +14,17 @@
   (`benches/kquant.rs` A/B, біт-у-біт або окрема чисельна зміна з owner-питанням). Далі:
   NEON (B2), B6–B11 (build-matrix/docker/fleet/dist-MoE/UI). Плейбук агента:
   `docs/HANDOFF_NEW_SESSION.md` §Продовження 20–26.
+- **Модельна політика (owner 2026-10-24):** цільова модель = **MiniCPM-V 4.7**
+  (1B + 35B-A3B MoE; official-GGUF з HF, Apache-2.0; Python-репо OpenBMB — лише джерело
+  ваг/специфікації, у рантаймі його немає). Qwen3-30B-A3B / Mixtral **прибрано з цілей**;
+  Qwen2.5-0.5B — внутрішній числовий оракул (golden `PH-405`), llama-rs — інструмент-оракул.
+- **Паралельний бенд B12 (vision, тікети на борді):** `PH-1201` spike (завантажити
+  `MiniCPM-V-4.7-1B-gguf` у gitignored `data/models/`, `rusty inspect` віжен-тензорів +
+  arch KV, дока `docs/research/minicpm-v-4.7.md`) → `PH-1202` `src/vit.rs` (ViT tower
+  поверх існуючих ядер, golden з `llama.cpp-omni` mtmd CLI) → `PH-1203` 4×/16×
+  visual-token compressor + projector → `PH-1204` image-token prefix у prefill →
+  `PH-1205` multimodal serve + provider-row `rusty-vision` → `PH-1206` 35B-A3B
+  через `ExpertCache` (окремий вузол, S0-диск gate).
 - Диск-дисципліна замірів: тайл/блок-свіпи міряти **в одному процесі** (`benches/kquant.rs`, `benches/quant.rs`), бо end-to-end wall на цьому боксі дрейфує ±25 %.
 - Заміри: лише на свіжому процесі, LAN-проба (`192.168.56.1:8090`), 3–4 прогони; `taskkill //IM rusty.exe //F` перед `cargo build --release`.
 

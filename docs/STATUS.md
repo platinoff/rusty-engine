@@ -50,7 +50,7 @@ live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; �
 | **Rust ratio** | **99.0%** (ціль 95–100 ✓) |
 | Docs LOC | 2524 (`git ls-files docs \| xargs wc -l`) |
 | Tracked files | 68 |
-| Реальна модель | `data/models/qwen2.5-0.5b-q4_k_m.gguf` (491 400 032 B, **gitignored**, sha256 `74a4da8c…`) |
+| Реальна модель | `data/models/qwen2.5-0.5b-q4_k_m.gguf` (491 400 032 B, **gitignored**, sha256 `74a4da8c…`) — **лише внутрішній числовий оракул**; цільова модель = **MiniCPM-V 4.7** (B12, owner 2026-10-24) |
 | Трекінг `data/` | лише `.gitkeep` (модель не в репо ✓) |
 | Live `:8090` (12 потоків, 961-tok prefill, `RUSTY_PROFILE=1`) | **5.3–6.4 s** (бокс дрейфує ±20 % на однаковій роботі; міряти лише свіжим процесом) · matmul **4.1–4.7 s** (~77 %) · attention **0.74–0.78 s** (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42; 1.46–1.56 s) · gate/up **81–92** · attention QK 84–92 · swiglu 122–132 ms · rope 32–35 ms · **other 2.4–3 %** · decode 10.4–27.6 tok/s (сильно залежить від фонового навантаження боксу) |
 
@@ -66,6 +66,7 @@ live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; �
 | **B4** MoE-core | 🟡 | `PH-401..403` (router softmax/sigmoid/group, SwiGLU, shared) + `PH-406a` `moe_layer_forward` + **`PH-404` expert-cache LRU** (`src/cache.rs`, budgeted + pin + prefetch); parity/run/bench (405/406/407) open |
 | **B5** serve | 🟡 | PH-501a/b (std HTTP + real TextRunner), PH-502 (SSE), PH-503 (slot-cache), PH-504 (heartbeat), PH-505 (**metrics + per-process RAM**), PH-506 (serve integration tests ✅); **PH-507 hub provider-row E2E ✅ (`rusty-serve` через хаб, JSON+SSE)** |
 | B6 build-matrix(exe/bin/apk) / B7 docker / B8 supervisor / B9 dist-MoE / B10 UI / B11 distribs | ☐ | заплановано (бенди в роадмепі) |
+| **B12** vision (MiniCPM-V 4.7) | ☐ | цільова модель owner 2026-10-24: `src/vit.rs` + 4×/16× compressor + image-prefix + multimodal serve; `PH-1201..1206` (тікети на борді); Qwen3/Mixtral із цілей **прибрано**, Qwen2.5 = оракул |
 
 **Між конекцій:** від токена до logits стек повний — `config → validate → dequant → embed →
 block_forward → sampler → BPE` — і реальна геометрія Qwen2.5 підтверджена (`rusty validate` = OK).
@@ -99,5 +100,7 @@ vLLM v0.28 / SGLang v0.5.19 (RadixArk) / TensorRT-LLM v1.2.1 / llama.cpp / ktran
 закрито**, matmul виведено на load-port/FMA-межу (77 % prefill, gate/up 81–92 GMAC/s, down
 64–69). **`PH-203s` (attention softmax) виміряно й відкинуто** — exp не є ботлнеком.
 Наступний зріз — **`PH-203t`**: памʼять matmul (`r_block`, non-temporal store на wide-out),
-A/B у `benches/kquant.rs`. Готові green-зрізи далі: NEON arm64 (`PH-203`) · `PH-501`
+A/B у `benches/kquant.rs`. **Паралельна черга (owner 2026-10-24): бенд B12 — MiniCPM-V 4.7**
+(цільова модель; spike `PH-1201` = official GGUF + `rusty inspect` віжен-тензорів; тікети
+`PH-1201..1206` на борді GSV). Готові green-зрізи далі: NEON arm64 (`PH-203`) · `PH-501`
 (axum serve) · важкі/інфра-бенди (B6/B7).

@@ -26,6 +26,7 @@ need their own feature gates.
 | `serve` | OpenAI-compat HTTP (`/v1/models`, `/v1/chat/completions`), SSE stream | B5 |
 | `node` | slave/worker runtime over local Wi-Fi/LAN | B7/B8 |
 | `hub` | GSV-native master supervisor («Rust k8s-lite»): registry, heartbeat, placement | B8 |
+| `vit` | **Vision tower (MiniCPM-V 4.7)**: patch-embed + ViT blocks + GELU MLP + 4×/16× visual-token compressor + projector → image-prefix into prefill; kernels reused from `qmat`/`kernel` | B12 |
 
 ```
 GGUF file

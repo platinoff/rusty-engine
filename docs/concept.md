@@ -105,3 +105,16 @@ KV-reuse), KTransformers (CPU/GPU expert offload), MixtureServe / MoE-Exchange
 3. Оркестрація = **GSV-native Rust-супервізор** (master/slave), не k3s.
 4. Формат моделей = **GGUF-first** (safetensors — пізніше, опційно).
 5. Android — **без Docker** (cargo-ndk/Termux `.apk/.bin` як slave); Docker лише Win/Linux.
+
+## 12. Вирішення owner (2026-10-24) — цільова модель
+
+1. Цільова модель двигуна = **MiniCPM-V 4.7** (1B dense + 35B-A3B MoE), official-GGUF
+   з HF (`openbmb/MiniCPM-V-4.7-*-gguf`, Apache-2.0 і на ваги, і на код) — **без Python
+   у рантаймі**; їхній репозитарій — лише джерело ваг і специфікації архітектури.
+2. **Інші модельні цілі з роадмепу прибрано** (Qwen3-30B-A3B / Mixtral — не підтримуємо
+   як продуктові моделі). Qwen2.5-0.5B лишається **внутрішнім числовим оракулом**
+   (dev-фікстура, golden `PH-405`, llama-rs-оракул — інструмент, не продукт).
+3. Віжен-шлях реалізується у Rust: `src/vit.rs` (vision tower) + 4×/16× visual-token
+   compressor + projector + image-prefix у prefill — бенд **B12** у `docs/roadmap.md`.
+4. Чисельний оракул для vision-фіксайтів — `llama.cpp-omni` (mtmd) CLI як
+   вимірювальний інструмент; до продукту не входить.

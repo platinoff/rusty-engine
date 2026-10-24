@@ -4,9 +4,16 @@
 
 No open PH-* without a band. «agi» у сесії (GSV hub) створює тікети по цьому роадмепу
 через `gsv_tickets_create { product:"rusty-engine", scenario_id }` / `gsv_tickets_hook`
-(catalog id `rusty-engine-bootstrap` / `rusty-engine-gguf` / `rusty-engine-moe-core`,
-додаються за потребою). Канон концепції: [`concept.md`](./concept.md). Глобальні правила:
-`S:/rust/GSV/AGENTS.md`.
+(catalog id `rusty-engine-bootstrap` / `rusty-engine-gguf` / `rusty-engine-moe-core` /
+`rusty-engine-vision`, додаються за потребою). Канон концепції: [`concept.md`](./concept.md).
+Глобальні правила: `S:/rust/GSV/AGENTS.md`.
+
+> **Модельна політика (owner, 2026-10-24).** Цільова модель двигуна =
+> **MiniCPM-V 4.7** (HF `openbmb/MiniCPM-V-4.7-1B-gguf` + `...-35B-A3B-gguf`, Apache-2.0,
+> GGUF-official). Qwen2.5-0.5B — **лише внутрішній числовий оракул** (dev-фікстура,
+> golden `PH-405`, еталонні заміри). Інші модельні цілі з планів **прибрано**
+> (Qwen3-30B-A3B / Mixtral → не підтримуємо як ціль; llama-rs лишається інструментом-
+> оракулом, не продуктом). Віжен-бенд = **B12** (нижче).
 
 ## Легенда стану
 
@@ -17,7 +24,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 `фундамент → контейнер(GGUF) → ядра(quant) → dense-контроль → **MoE-ядро** → сервер →
 портативність(exe/bin/apk) → Rust-docker-хости → Rust-супервізор(master/slave) →
-розподілений MoE → Web-UI → дистр/версії/publish`.
+розподілений MoE → Web-UI → дистр/версії/publish → **vision (MiniCPM-V 4.7, B12)**`.
 
 ---
 
@@ -132,10 +139,11 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ## Band B4 — MoE-ядро (ДИФЕРЕНЦІЯТОР)  **`[~]` (PH-401/401b/402/403/403b/404/404b/406a done, 2026-10-14)**
 
-> Мета: Qwen3-30B-A3B / Mixtral GGUF **нативно в Rust**, минаючи llama.cpp.
+> Мета: **MiniCPM-V 4.7-35B-A3B** (перший on-device MoE у серії) GGUF **нативно в Rust**,
+> минаючи llama.cpp. (Ретаргет 2026-10-24: Qwen3-30B-A3B / Mixtral із цілей прибрано.)
 > **Повний compute-цикл MoE-шара вже зʼєднаний і детермінований** (`moe_layer_forward`);
 > лишилось підвʼязати реальні деquant-тензори (PH-406) + оптимізації (PH-404/407) + parity (PH-405).
-> Підлога: llama-rs Qwen3-30B-A3B ≈ 0.497 tok/s decode — ціль ≥ parity.
+> Еталонна підлога (інструмент, не ціль): llama-rs Qwen3-30B-A3B ≈ 0.497 tok/s decode — ціль ≥ parity.
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
@@ -149,7 +157,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-404b | **MoE forward через cache** (top-k experts on demand) | `[x]` | `src/moe.rs` — `moe_layer_forward_cached(...&mut ExpertCache, load)`: route→`get_or_load` per expert; == `moe_layer_forward` (deterministic loader, 1e-6) навіть при budget<resident; hit⇒loader not called (2 unit) |
 | PH-405 | **numeric regression gate** (real Qwen2.5 greedy fingerprint) | `[x]` | `tests/numeric_parity.rs` + `tests/data/qwen25_golden.txt` — детерм. greedy-відбиток 24-шарового `DenseRunner.generate` на справжній моделі (guard quant/forward/KV/sampler); `#[ignore]` release-job (~60s), CI без моделі skip. llama-rs semantic parity → окремий зріз |
 | PH-405b | **llama-rs semantic greedy-parity + HF `tokenizer.json` byte-exact** | `[x]` | `tests/moe_parity.rs` — Гейт A (vocab 151936/merges 151387/id-точки/`qwen2` pre-regex) PASS; Гейт B: наш greedy байт-у-байт із записаним оракулом (55/12/48). **Фікс:** додано q/k/v-біаси Qwen2 (`BlockWeights.{q,k,v}_bias`) + RoPE GPT-J→NeoX rotate-half. Факти — `docs/research/llama-rs-parity.md`; golden перезахоплено |
-| PH-406 | run Qwen3-30B-A3B / Mixtral GGUF pure-Rust | `[ ]` | `src/moe/forward.rs` |
+| PH-406 | run **MiniCPM-V 4.7-35B-A3B** GGUF pure-Rust (text/MoE path; ваги через B12 spike PH-1201; Qwen3-30B/Mixtral — не цілі) | `[ ]` | `src/moe/forward.rs` |
 | PH-407 | bench tok/s vs llama-rs baseline | `[ ]` | `benches/moe.rs` |
 
 ---
@@ -265,3 +273,23 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-1104 | MIT-compliance: third-party attribution scan → `THIRD-PARTY-NOTICES.md` | `[ ]` | `xtask/notice.rs` |
 | PH-1105 | GitHub publish (private→MIT) `github.com/platinoff/rusty-engine` (згода owner, push тільки тут) | `[ ]` | remote `origin` |
 | PH-1106 | ratio/LOC-gate + docs final sync (`xtask record-speed`/`record-rust`/`sync`) | `[ ]` | `docs/vision/*.json` |
+
+---
+
+## Band B12 — Vision: MiniCPM-V 4.7 (цільова модель, owner 2026-10-24)  **`[ ]`**
+
+> Мета: **MiniCPM-V 4.7** — цільова модель двигуна — біжить у чистій Rust без Python:
+> ваги official-GGUF (Apache-2.0, HF `openbmb/MiniCPM-V-4.7-1B-gguf` / `...-35B-A3B-gguf`),
+> віжен-башта + компресор токенов + image-prefix — нові модулі; текст-путь = вже живий
+> dense/MoE forward. Оракул чисельності — `llama.cpp-omni` CLI (mtmd) як **вимірювальний
+> інструмент** (прецедент llama-rs-оракула), у продукт не входить. 1B — перший; 35B-A3B —
+> через expert-cache (PH-404) і лише на вузлі з диском.
+
+| ID | Задача | Стан | Доказ |
+|----|--------|------|-------|
+| PH-1201 | **spike: official GGUF + layout** — завантажити `MiniCPM-V-4.7-1B-gguf` (gitignored `data/models/`), `rusty inspect`: arch KV, vision-тензори, розміри/кванти, image-token vocab; факти → `docs/research/minicpm-v-4.7.md` | `[ ]` | `src/bin/rusty.rs` inspect + research-дока |
+| PH-1202 | **vision tower у Rust** (`src/vit.rs`): patch-embed, LayerNorm, ViT-attention, GELU MLP, RoPE/pos-інтерполяція — повністю поверх існуючих `QMat`/`matmul`/dequant-ядер; golden-фіксайти з `llama.cpp-omni` mtmd CLI (in-process bench-паритет, як `benches/attn.rs`) | `[ ]` | `src/vit.rs` + unit + `#[ignore]` parity |
+| PH-1203 | **visual-token компресор 4×/16× + projector** (фішка 4.6/4.7 — мало image-токенів → дешевий prefill): pooling/merger + linear projection у hidden-size LLM | `[ ]` | `src/vit.rs` (merge/project) + фіксація форми |
+| PH-1204 | **image-token prefix у prefill**: вставка vision-ембедингів за placeholdern-токенами, chat-шаблон + specials для мови MiniCPM; `DenseDecoder::prefill` + `block_forward_seq` — embedding-комбінування без re-prefill | `[ ]` | `src/runner.rs`/`textgen.rs` + інтеграція (text-only regression green) |
+| PH-1205 | **serve мультимодальний**: `messages[].images` base64 (PNG/JPEG через `image` crate — pure Rust; MVP: PPM/BMP без залежностей), E2E greedy-parity з mtmd-оракулом на 3–5 зображеннях, provider-row `rusty-vision` у GSV-каталозі (heartbeat-gated) | `[ ]` | `src/http.rs`/`serve.rs` + `tests/vision.rs` + GSV catalog |
+| PH-1206 | **MiniCPM-V 4.7-35B-A3B** (MoE) через `ExpertCache` (PH-404): longest-first pin + NVMe-offload + LES-style lookahead-прелоад оцінка; runs only на виділеному вузлі (диск-gate S0) | `[ ]` | `src/moe.rs` + bench + fleet-дрен |

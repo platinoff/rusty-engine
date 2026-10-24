@@ -20,7 +20,10 @@ exp-таблиця) виміряно в `benches/attn.rs` і відкинуто:
 не в `exp`. Наступний зріз `PH-203t` — памʼять matmul (`r_block`, non-temporal store на
 wide-out) з A/B у `benches/kquant.rs`: matmul упирається у load-port/FMA-межу
 (`6 loads / 8 FMA` = 2.67 FMA/цикл при 8 ланцюгах), тож там виграш лише з памʼяті, не з циклу.
-Потім NEON (B2), B6/B7.
+Потім NEON (B2), B6/B7. **Паралельно (owner 2026-10-24): модельна політика + бенд B12 —**
+цільова модель **MiniCPM-V 4.7** (official GGUF, без Python; `src/vit.rs` + 4×/16×
+compressor + image-prefix + multimodal serve; `PH-1201..1206` на борді GSV; Qwen3/Mixtral
+з цілей прибрано, Qwen2.5 = оракул).
 
 ## Що було зроблено (B0, campaign 2026-10-14)
 
