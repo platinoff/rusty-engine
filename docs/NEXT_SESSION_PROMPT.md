@@ -1,11 +1,19 @@
 # NEXT_SESSION_PROMPT — rusty-engine
 
-## Сталий стан (2026-10-22) — почати звідси
+## Сталий стан (2026-10-24) — почати звідси
 
 - **Owner product pick: `rusty-engine`** (не автоматично: Step 0 питає продукт; тут — вже обраний).
-- HEAD = `origin/main` (PH-203r), clean; гейт fmt/clippy-0/**224** тести (+5 ignored) зелений.
+- HEAD = `origin/main` (PH-203s rejection; код forward = PH-203r), clean; гейт fmt/clippy-0/**225** тести (+5 ignored) зелений.
 - Перф-серія prefill: 961 tok **190.9 s → 5.3–6.4 s** (розкид = фонове навантаження боксу); matmul 4.1–4.7 s (77 %), attention 0.74–0.78 s (13.9 %), down `896×4864` **64–69 GMAC/s** (було 36–42), gate/up **81–92**, swiglu 122–132 ms, rope 32–35 ms, other **2.4–3 %** (див. `docs/STATUS.md`).
-- **Наступний зріз `PH-203s`:** attention 13.9 % — онлайн-softmax блоками по KV + таблиця `exp`; єдиний блок, де ще є десятки відсотків, але будь-яка зміна порядку = новий golden (спершу питати owner). Matmul уже на load-port/FMA-межі (`6 loads / 8 FMA`), там лишились памʼять (`r_block`, non-temporal store) і NEON. Далі: B6–B11 (build-matrix/docker/fleet/dist-MoE/UI). Плейбук агента: `docs/HANDOFF_NEW_SESSION.md` §Продовження 20–25.
+- **`PH-203s` закрито виміром (2026-10-24):** онлайн-softmax блоками по KV + exp-таблиця
+  реалізовані й прогнані в `benches/attn.rs` (min-of-5, один процес): **+8–15 % проти
+  3-pass libm** — стейдж не exp-bound, а score-dot/axpy-bound; skip `p<1e-8` не спрацьовує.
+  Продакшн `forward.rs` відкату до PH-203o (golden не зрушив — recapture збігся і не
+  застосований). Хуки `kernel::exp_neg_fast`/`exp2_table_ref` лишились для бенчу.
+- **Наступний зріз `PH-203t`:** памʼять matmul — `r_block` і non-temporal store на wide-out
+  (`benches/kquant.rs` A/B, біт-у-біт або окрема чисельна зміна з owner-питанням). Далі:
+  NEON (B2), B6–B11 (build-matrix/docker/fleet/dist-MoE/UI). Плейбук агента:
+  `docs/HANDOFF_NEW_SESSION.md` §Продовження 20–26.
 - Диск-дисципліна замірів: тайл/блок-свіпи міряти **в одному процесі** (`benches/kquant.rs`, `benches/quant.rs`), бо end-to-end wall на цьому боксі дрейфує ±25 %.
 - Заміри: лише на свіжому процесі, LAN-проба (`192.168.56.1:8090`), 3–4 прогони; `taskkill //IM rusty.exe //F` перед `cargo build --release`.
 

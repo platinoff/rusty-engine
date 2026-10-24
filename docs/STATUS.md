@@ -1,6 +1,8 @@
 # rusty-engine — PROJECT STATUS
 
-**Snapshot:** 2026-10-22 (agi-ланцюг: B0→B1 GGUF→B2 quant→B3 dense/KV/sampler/BPE→B4 MoE→B5
+**Snapshot:** 2026-10-24 (останній зріз: **`PH-203s` онлайн-softmax + exp-таблиця ❌ — виміряно
+в `benches/attn.rs` і відкинуто; продакшн-forward лишився PH-203o**. Попередній ланцюг:
+2026-10-22 agi-ланцюг: B0→B1 GGUF→B2 quant→B3 dense/KV/sampler/BPE→B4 MoE→B5
 serve/heartbeat → **PH-405b forward-parity з llama-rs ✅** → **PH-507 hub provider-row E2E ✅
 (JSON + SSE) через живий хаб `:9999`** → **B2 SIMD bench ✅ (`PH-203` x86 / `PH-205`, 1.8–5.3×)**
 → **`PH-505` residual ✅ (per-process RAM у `/metrics`)** → **`PH-203d` AVX2+FMA fused dots ✅
@@ -39,15 +41,15 @@ live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; �
 | Метрика | Значення |
 |---------|----------|
 | `git status` | **clean** (0 drift) |
-| Коміти | **103** усього (`git rev-list --count HEAD`); **45** у drain-серії B0→PH-203r (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3 + PH-203r two weight rows; **pushed 2026-10-22**) |
-| Тести | **224** (205 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
+| Коміти | **104** усього (`git rev-list --count HEAD`); **46** у drain-серії B0→PH-203s (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3 + PH-203r two weight rows + PH-203s measured-rejection bench/hooks; **pushed 2026-10-24**) |
+| Тести | **225** (206 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
-| Rust LOC | **14605** (`src` 12166 + `tests` 1317 + `xtask` 319 + `benches` 803; `wc -l`) |
+| Rust LOC | **14990** (`src` 12237 + `tests` 1317 + `xtask` 319 + `benches` 1117; `wc -l`) |
 | UI LOC (glue) | **157** (html+css+js) |
-| **Rust ratio** | **98.9%** (ціль 95–100 ✓) |
-| Docs LOC | 2479 (`git ls-files docs \| xargs wc -l`) |
-| Tracked files | 67 |
+| **Rust ratio** | **99.0%** (ціль 95–100 ✓) |
+| Docs LOC | 2524 (`git ls-files docs \| xargs wc -l`) |
+| Tracked files | 68 |
 | Реальна модель | `data/models/qwen2.5-0.5b-q4_k_m.gguf` (491 400 032 B, **gitignored**, sha256 `74a4da8c…`) |
 | Трекінг `data/` | лише `.gitkeep` (модель не в репо ✓) |
 | Live `:8090` (12 потоків, 961-tok prefill, `RUSTY_PROFILE=1`) | **5.3–6.4 s** (бокс дрейфує ±20 % на однаковій роботі; міряти лише свіжим процесом) · matmul **4.1–4.7 s** (~77 %) · attention **0.74–0.78 s** (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42; 1.46–1.56 s) · gate/up **81–92** · attention QK 84–92 · swiglu 122–132 ms · rope 32–35 ms · **other 2.4–3 %** · decode 10.4–27.6 tok/s (сильно залежить від фонового навантаження боксу) |
@@ -81,7 +83,7 @@ block_forward → sampler → BPE` — і реальна геометрія Qwen
 **77 → 108**, live wall **7.1–8.9 → 5.3–6.4 s**, matmul 4.1–4.7 s (77 %), attention 13.9 %.
 Заодно **відкинуто** гіпотезу PH-203q про «тайл ділиться на воркерів»: тайл — спільний зріз `X`,
 і з парою рядків pooled-оптимум повертається до 96 (down Q6_K: 24 → 75, 96 → 108, 128 → 119
-бенч / 55 live), тож `MATMUL_ROW_TILE_K = MATMUL_ROW_TILE` і функцію форми видалено. `PH-203i` знайшов справжній ботлнек q8_0 (повільний `f16_to_f32` на блок, не i8→f32): точне бітове розширення дало 9.55× на dot і 11.8 GMAC/s на matvec без зміни чисел; int8-ядро лишилось оракул-тестованою альтернативою (0.89× після фіксу).
+бенч / 55 live), тож `MATMUL_ROW_TILE_K = MATMUL_ROW_TILE` і функцію форми видалено. `PH-203i` знайшов справжній ботлнек q8_0 (повільний `f16_to_f32` на блок, не i8→f32): точне бітове розширення дало 9.55× на dot і 11.8 GMAC/s на matvec без зміни чисел; int8-ядро лишилось оракул-тестованою альтернативою (0.89× після фіксу). **`PH-203s` (2026-10-24) перевірив тезу «attention exp-bound» і спростував її:** онлайн-softmax блоками по 128 ключів + `exp2`-таблиця (1024+1 entry, лінійна інтерполяція) реалізовані й прогнані в новому `benches/attn.rs` (min-of-5, один процес, Qwen-геометрія 961×64): варіанти **10.5–10.9 ms/head проти 9.4–10.5 у 3-pass libm** — таблиця не швидша за `f32::exp` цього бокса, а блокування додає +3–6 %; skip мертвих ключів не спрацьовує (`p<1e-8`: kept 100 %; `1e-4`: −8 % axpy без виграшу). Продакшн `forward.rs` відкату до PH-203o (біт-у-біт, golden не зрушив — recapture був байт-ідентичний); хуки `kernel::exp_neg_fast`/`exp2_table_ref` + бенч лишились як доказ. Attention-левер закрито: стейдж спирається у `dot_f32_x4`/axpy (обидва AVX2), далі — лише памʼять matmul (`PH-203t`) і NEON.
 
 ## Research / позиціонування
 
@@ -94,7 +96,8 @@ vLLM v0.28 / SGLang v0.5.19 (RadixArk) / TensorRT-LLM v1.2.1 / llama.cpp / ktran
 
 Див. **`docs/NEXT_SESSION_PROMPT.md`** (`Owner product pick: rusty-engine`). **`PH-507` E2E
 зроблено** (лишається WiFi multi-host band 233 + IDE-chat `rusty/*`). **B2 x86 SIMD + bench
-(`PH-203`/`PH-205`) закрито**, matmul виведено на load-port/FMA-межу (77 % prefill, gate/up
-81–92 GMAC/s, down 64–69). Наступний зріз — **`PH-203s`**: attention 13.9 % (0.74–0.78 s,
-exp-bound; онлайн-softmax блоками + таблиця `exp`, лише з новим golden). Готові green-зрізи
-далі: NEON arm64 (`PH-203`) · `PH-501` (axum serve) · важкі/інфра-бенди (B6/B7).
+закрито**, matmul виведено на load-port/FMA-межу (77 % prefill, gate/up 81–92 GMAC/s, down
+64–69). **`PH-203s` (attention softmax) виміряно й відкинуто** — exp не є ботлнеком.
+Наступний зріз — **`PH-203t`**: памʼять matmul (`r_block`, non-temporal store на wide-out),
+A/B у `benches/kquant.rs`. Готові green-зрізи далі: NEON arm64 (`PH-203`) · `PH-501`
+(axum serve) · важкі/інфра-бенди (B6/B7).

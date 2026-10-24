@@ -30,6 +30,11 @@ name = "kquant"
 path = "benches/kquant.rs"
 harness = false
 
+[[bench]]
+name = "attn"
+path = "benches/attn.rs"
+harness = false
+
 [features]
 # SIMD-backend markers for `PH-203` dispatch (`src/backend.rs`); all off by default so the
 # portable scalar oracle is the baseline build. `select()` picks the strongest enabled one.

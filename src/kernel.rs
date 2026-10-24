@@ -1025,7 +1025,7 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Runtime-dispatched f32 dot: AVX2+FMA when the CPU reports support, else a scalar fold.
-pub(crate) fn dot_f32_dispatch(a: &[f32], b: &[f32]) -> f32 {
+pub fn dot_f32_dispatch(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -1218,7 +1218,7 @@ pub(crate) fn dot_f32_x4x2_dispatch(
 }
 
 /// Runtime-dispatched [`dot_f32_avx2_x4`]: AVX2+FMA when reported, else four scalar folds.
-pub(crate) fn dot_f32_x4_dispatch(a: &[f32], b: [&[f32]; 4]) -> [f32; 4] {
+pub fn dot_f32_x4_dispatch(a: &[f32], b: [&[f32]; 4]) -> [f32; 4] {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -1259,7 +1259,7 @@ unsafe fn axpy_f32_avx2(y: &mut [f32], x: &[f32], a: f32) {
 }
 
 /// Runtime-dispatched [`axpy_f32_avx2`], bit-identical to the scalar loop.
-pub(crate) fn axpy_f32_dispatch(y: &mut [f32], x: &[f32], a: f32) {
+pub fn axpy_f32_dispatch(y: &mut [f32], x: &[f32], a: f32) {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
@@ -1271,6 +1271,51 @@ pub(crate) fn axpy_f32_dispatch(y: &mut [f32], x: &[f32], a: f32) {
     for (d, s) in y.iter_mut().zip(x) {
         *d += a * *s;
     }
+}
+
+/// Fractional steps of the [`exp_neg_fast`] table over one octave of `exp2`.
+pub const EXP_NEG_STEPS: usize = 1024;
+
+/// `exp2(i / EXP_NEG_STEPS)` for `i = 0..=EXP_NEG_STEPS` (1025 entries, 4 KiB: stays L1-hot
+/// while a softmax sweep walks it by mantissa index).
+fn exp2_table() -> Box<[f32; EXP_NEG_STEPS + 1]> {
+    let mut tab = Box::new([0.0f32; EXP_NEG_STEPS + 1]);
+    for (i, v) in tab.iter_mut().enumerate() {
+        *v = ((i as f32) / (EXP_NEG_STEPS as f32)).exp2();
+    }
+    tab
+}
+
+/// Process-wide [`exp2_table`] handle: take it once outside a hot loop so every element
+/// conversion skips the `OnceLock` check.
+pub fn exp2_table_ref() -> &'static [f32; EXP_NEG_STEPS + 1] {
+    static TAB: std::sync::OnceLock<Box<[f32; EXP_NEG_STEPS + 1]>> = std::sync::OnceLock::new();
+    TAB.get_or_init(exp2_table)
+}
+
+/// `exp(x)` for `x <= 0` as `exp2(x·log2e)` split into `2ⁿ · exp2(frac)` with the fractional
+/// part linearly interpolated on [`EXP_NEG_STEPS`] table entries.
+///
+/// **A/B hook, not wired into production (`PH-203s` rejection).** Benchmarked against the
+/// three-pass libm softmax in `benches/attn.rs` (Qwen-0.5B geometry, min-of-5 in one
+/// process): the table is at parity or slower than `f32::exp` on this box's libm, and the
+/// blocked online softmax it enables costs another 8–15 %. Attention is score-dot bound,
+/// not exp bound. Max relative error of the table itself is fine (< 1e-5 over [-87, 0]);
+/// it simply does not pay. `-inf` yields `0`; `x > 0` is a programming error (running-max
+/// softmax always passes `s − m ≤ 0`).
+#[inline]
+pub fn exp_neg_fast(x: f32, tab: &[f32; EXP_NEG_STEPS + 1]) -> f32 {
+    let t = x * std::f32::consts::LOG2_E;
+    if t < -126.0 {
+        return 0.0; // exp underflows f32 well before this (exp(-88)); also maps -inf → 0
+    }
+    let n = t.floor();
+    let f = (t - n) * EXP_NEG_STEPS as f32; // [0, 1024], the f32 rounding of t−n can land on 1
+    let i = (f as usize).min(EXP_NEG_STEPS - 1);
+    let frac = f - i as f32; // [0, 1]
+    let e = tab[i] + (tab[i + 1] - tab[i]) * frac;
+    // n in [-126, 0]: 2ⁿ as a normal f32 via the exponent field.
+    e * f32::from_bits(((n as i32 + 127) as u32) << 23)
 }
 
 /// Activation rows per matmul cache tile (see [`matmul_reuse`]).
@@ -2623,5 +2668,31 @@ mod tests {
                 "row-wise vs block-wise drift at {i}: {a} vs {b}"
             );
         }
+    }
+
+    #[test]
+    fn exp_neg_fast_tracks_libm_exp() {
+        // The PH-203s table hook: accurate enough that the rejection is a pure speed call,
+        // not a numerics call. Exact at the running max (exp(0) = 1 keeps the online
+        // denominator ≥ 1), 0 at -inf, < 1e-5 relative error over [-87, 0].
+        let tab = exp2_table_ref();
+        assert_eq!(exp_neg_fast(0.0, tab), 1.0, "exp(0) must be exact");
+        assert_eq!(
+            exp_neg_fast(f32::NEG_INFINITY, tab),
+            0.0,
+            "-inf must map to 0"
+        );
+        let mut worst = 0.0f32;
+        let mut x = 0.0f32;
+        while x >= -87.0 {
+            let got = exp_neg_fast(x, tab);
+            let want = x.exp();
+            let rel = (got - want).abs() / want.max(f32::MIN_POSITIVE);
+            if rel > worst {
+                worst = rel;
+            }
+            x -= 0.003_906_25; // 1/256 of the range
+        }
+        assert!(worst < 1e-5, "max relative error over [-87, 0] was {worst}");
     }
 }

@@ -3,23 +3,24 @@
 **Продукт:** `rusty-engine` · Сесійна мова: «концепція → роадмеп → тікети → drain».
 **Host:** GSV hub (`S:/rust/GSV`, `:9999`) = master; це — portable plugin.
 
-## Сталий стан (2026-10-22, перевірено в репо)
+## Сталий стан (2026-10-24, перевірено в репо)
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | PH-203r (див. `git log -1`), `origin/main` синхронний, `git status` clean |
-| Гейт | fmt ok · clippy `-D` **0** · **224** тести (205 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
-| Код | Rust **14605** LOC (src 12166 / tests 1317 / xtask 319 / benches 803), UI 157 → ratio **98.9 %** · 67 tracked files · docs 2479 LOC |
+| HEAD / origin | PH-203s **rejection** (див. §Продовження 26 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o без змін |
+| Гейт | fmt ok · clippy `-D` **0** · **225** тести (206 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
+| Код | Rust **14990** LOC (src 12237 / tests 1317 / xtask 319 / benches 1117), UI 157 → ratio **99.0 %** · 68 tracked files · docs 2479+ LOC |
 | Prefill (live `:8090`, 12 потоків, 961 tok) | **5.3–6.4 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 4.1–4.7 s (~77 %) · attention 0.74–0.78 s (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42) · gate/up **81–92** · swiglu 122–132 ms · rope 32–35 ms · other **2.4–3 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
-| Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…q (recapture не робився) |
+| Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…r; recapture PH-203s збігся з ним байт-у-байт і не застосовувався (зріз відкату) |
 | Живий білд | `target/release/rusty.exe` + `target/live/launch_serve.vbs` (CRLF!), `threads.txt`=12, `profile.txt`=1, звіт `target/live/rusty_prof.err.log` |
 
-**Далі:** `PH-203s` — attention 13.9 % (0.74–0.78 s): він тепер другий за вагою після matmul і
-єдиний великий блок, який ще не чіпали після `PH-203o`; онлайн-softmax блоками по KV і
-таблиця `exp` — єдиний шлях, що не ламає біти (exp-bound, кожна зміна порядку = новий golden).
-Matmul упирається у load-port/FMA-межу (`6 loads / 8 FMA` = 2.67 FMA/цикл при 8 ланцюгах), тож
-далі там виграш лише з памʼяті (`r_block`, non-temporal `out`), не з циклу. Потім NEON (B2), B6/B7.
+**Далі:** attention у prefill **закрито softmax-левером** — `PH-203s` (онлайн-блокування +
+exp-таблиця) виміряно в `benches/attn.rs` і відкинуто: стейдж спирається у `dot_f32_x4`/axpy,
+не в `exp`. Наступний зріз `PH-203t` — памʼять matmul (`r_block`, non-temporal store на
+wide-out) з A/B у `benches/kquant.rs`: matmul упирається у load-port/FMA-межу
+(`6 loads / 8 FMA` = 2.67 FMA/цикл при 8 ланцюгах), тож там виграш лише з памʼяті, не з циклу.
+Потім NEON (B2), B6/B7.
 
 ## Що було зроблено (B0, campaign 2026-10-14)
 
@@ -872,4 +873,40 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
 - **Висновок:** matmul тепер упирається у FMA/load межу (2 FMA/цикл × 16 MAC), а не в тайл чи
   дейквант. Наступний великий резерв — attention (13.9 %), далі памʼять (`r_block`,
   non-temporal store) і NEON.
+
+### Продовження 26 — 2026-10-24: PH-203s — онлайн-softmax + exp-таблиця в attention: ВІМІРЯНО й ВІДКИНУТО
+
+- **Owner GO** на зріз із новим golden (2026-10-24, question-пік «PH-203s: attention»).
+- **Реалізовано повністю:** `exp_neg_fast` (`exp2(x·log2e)`, 1024+1 entry таблиця, лінійна
+  інтерполяція, `OnceLock` хост поза хот-лупом) + `attention_head_ctx` на онлайн-softmax
+  блоками по 128 ключів (running max/sum, рескейл акумулятора, пропуск нульових ваг).
+  Спершу fused-варіант (exp+axpy в одному лупі) — −15 % на live; перекомпонування на
+  split-pass (exp+sum, потім чистий axpy-пас) — повернуло live до паритету з PH-203o.
+- **Golden перезахоплено (`RUSTY_CAPTURE_GOLDEN=1`) — і він збігся з старим байт-у-байт**
+  (16-токенний greedy fingerprint не зрушив, drift ~3e-7 на логітах); повна `--ignored`
+  parity включно з llama-rs oracle — зелена. Тобто чисельно зріз був безпечний.
+- **Вердикт дав in-process бенч `benches/attn.rs` (нова A/B-підмодуля, std-only,
+  min-of-5, Qwen-0.5B геометрія 961 рядок × hd 64, 336 head-pass):**
+  | варіант | ms/head (3 прогони) |
+  |---|---|
+  | PH-203o 3-pass libm (продакшн) | **9.41 / 10.07 / 10.47** |
+  | онлайн-128 + exp-таблиця | 10.73 / 10.56 / 10.93 |
+  | 3-pass, лише таблиця замість libm exp | 10.49 / 10.52 / 10.57 |
+  | 3-pass + skip `p<1e-8` / `1e-6` | 9.56 / 9.59 — **kept 100 %**, нульових ключів нема |
+  | 3-pass + skip `p<1e-4` | 9.71 — зрізає 8 % axpy, виграшу немає (гілка бʼє SIMD-стрім) |
+- **Висновок:** преміза «attention exp-bound» — хибна. `f32::exp` на libm цього бокса
+  швидший за ланцюжок таблиці (roundss + 2 конверсії + залежні gather-Loads), а онлайн-
+  блокування додає ще 3–6 %. Attention-стейдж спирається у `dot_f32_x4` + axpy, обидва
+  вже AVX2-фордовані; softmax-паси — одиниці відсотків стейджу.
+- **Рішення (прецедент PH-203q):** `src/forward.rs` **повернуто до PH-203o** (біт-у-біт зі
+  старим golden — recapture не потрібен). Хуки лишились: `kernel::exp_neg_fast` /
+  `exp2_table_ref` (pub, з тестом `< 1e-5` rel на [-87, 0]), `dot_f32_dispatch` /
+  `dot_f32_x4_dispatch` / `axpy_f32_dispatch` promoted to pub для бенча, `benches/attn.rs`
+  збережено як доказ. `Cargo.toml`: `[[bench]] attn`.
+- **Гейт після відкату:** fmt ok, clippy `-D` 0, **206** lib (205 + exp-тест) + integration
+  = **225** (+5 ignored) зелені; `--ignored` parity проти старого golden — ok; реліз-серв
+  перезапущено (`launch_serve.vbs`), heartbeat свіжий.
+- **Далі:** attention у prefill закрито виміром (не softmax-lever). Наступний зріз
+  `PH-203t` — памʼять matmul (`r_block`, non-temporal store на wide-out) з A/B у
+  `benches/kquant.rs`; потім NEON (B2) і B6–B11.
 
