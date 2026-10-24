@@ -23,6 +23,7 @@ need their own feature gates.
 | `gguf` | GGUF v3 header + KV-metadata + tensor-info; mmap/mlock staged loader | B1 |
 | `moe` | **DIFFERENTIATOR**: softmax, top-k gating, expert FFN, shared experts | B0→B4 |
 | `infer` | attention (GQA/MQA + RoPE), paged KV-cache, sampler chain | B3 |
+| `gdn` | **Gated DeltaNet** (qwen35 recurrent block): conv1d + delta-rule matrix state, O(1) decode | B13 |
 | `serve` | OpenAI-compat HTTP (`/v1/models`, `/v1/chat/completions`), SSE stream | B5 |
 | `node` | slave/worker runtime over local Wi-Fi/LAN | B7/B8 |
 | `hub` | GSV-native master supervisor («Rust k8s-lite»): registry, heartbeat, placement | B8 |

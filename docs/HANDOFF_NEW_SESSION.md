@@ -7,9 +7,9 @@
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | PH-1301 `model.rs` qwen35-hybrid (див. §Продовження 26–29 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` (gitignored) |
-| Гейт | fmt ok · clippy `-D` **0** · **230** тести (211 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 6 `#[ignore]` parity ( incl. real MiniCPM-V validate), усі зелені |
-| Код | Rust **15535** LOC (src 12749 / tests 1317 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 69 tracked files · docs 2781+ LOC |
+| HEAD / origin | PH-1302 `src/gdn.rs` (див. §Продовження 26–30 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` (gitignored) |
+| Гейт | fmt ok · clippy `-D` **0** · **236** тести (217 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 6 `#[ignore]` parity (incl. real MiniCPM-V validate), усі зелені |
+| Код | Rust **16084** LOC (src 13298 / tests 1317 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 70 tracked files · docs 2781+ LOC |
 | Prefill (live `:8090`, 12 потоків, 961 tok) | **5.3–6.4 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 4.1–4.7 s (~77 %) · attention 0.74–0.78 s (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42) · gate/up **81–92** · swiglu 122–132 ms · rope 32–35 ms · other **2.4–3 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
 | Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…r; recapture PH-203s збігся з ним байт-у-байт і не застосовувався (зріз відкату) |
@@ -22,8 +22,10 @@ PH-203r-подібні (bit-identical, golden не рухався). **`PH-1201` 
 2026-10-24 (§Продовження 28):** MiniCPM-V 4.7-1B = text-core **`qwen35`-гібрид**
 (18 GDN + 6 full-attn, QK-norm, zyxt-rope, vocab 248 094) + vision-clip BF16
 (`ggml_dtype(30)` фікс). **`PH-1301` закрито того ж дня (§Продовження 29: config/geometry
-qwen35 + `rusty validate` на реальному файлі = OK); наступний зріз — 1302 GDN**
-→ 1303 full-attn → 1304 pre-tokenizer/runner → 1305 E2E-паритет проти
+qwen35 + `rusty validate` на реальному файлі = OK); **`PH-1302` теж закрито** (§30:
+`src/gdn.rs` — delta-rule стан, prefill==steps bit-identical); **наступний зріз —
+1303 full-attn**
+→ 1304 pre-tokenizer/runner → 1305 E2E-паритет проти
 `llama.cpp-omni` → 1306 serve; B12-vision (1202/1203) будується паралельно, image-prefix
 (1204) чекає B13. **Паралельно
 (owner 2026-10-24): модельна політика** — цільова модель **MiniCPM-V 4.7** (official GGUF,
@@ -1007,4 +1009,33 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
   стан 16×128², O(1) decode). Увага при впровадженні: `post_attention_norm` =
   pre-FFN norm; q/k/v у GDN — один `attn_qkv` 6144 (2048×3), head_dim GDN =
   state_size = 128 (groups 16), а НЕ 256.
+
+### Продовження 30 — 2026-10-24: PH-1302 — `src/gdn.rs`: Gated DeltaNet з O(1)-decode
+
+- **Новий модуль `gdn.rs`** (pure std, без I/O — проекції позичені `QMat`-ами):
+  `GdnGeom::from_config` (валідний лише при `inner == groups·dk`), `GdnWeights`
+  (qkv/gate/alpha/beta/out + a_log/dt_bias/conv_w[ch·K+j]/norm_w), `GdnState`
+  (conv-вікно + `groups × dk × dv` матриць).
+- **Ядро — `delta_step`**: `S·=e^g → pred=kᵀS → vnew=(v−pred)·β → S+=k⊗vnew → o=Sᵀq̃`
+  (row-major, порядок фіксований). Гейти: `g = -exp(A_log)·softplus(a+dt_bias)`
+  (стабільний softplus, плато |x|>20), `β=σ(b)`; q/k — L2-норм на голову + `dk^-0.5`
+  на q (fla `use_qk_l2norm`); після скану — **gated head-RMSNorm
+  `rmsnorm(o)·w·swish(z)`** і `ssm_out`. `gate_act` — єдине місце з конвенцією
+  (swish vs sigmoid gate), яку запінить `PH-1305` проти оракула.
+- **Інваріанта зрізу:** `gdn_prefill` (батч-проекції + row-conv зі станом вікна) веде
+  токени тим самим `delta_step` — **bit-identical** крокуючому `gdn_decode_step`
+  (тест — і стан, і conv-вікно). `delta_step_matches_the_textbook_rule` — точні
+  ручні f32; contract стану qwen35: **16·128·128·f32 = рівно 1 MiB** на
+  recurrent-блок (×18 = 18 MiB фіксованого стану замість KV-кешу, що росте).
+- **Обмеження v1 (зафіксовані в коді):** scratch `delta_step` — фіксований `dv ≤ 128`
+  (qwen35 = 128); prefill-скан послідовний per-group — пул-розклад по (layer, group)
+  і чанк-версія поїдуть у `PH-1304` wire; llama.cpp-omni parity-фіксації — `PH-1305`
+  (оракул-білд на боксі ще не зібрано).
+- **qwen2-шлях не чіпаний:** golden + 5 старих ignored зелені; новий 6-й ignored
+  (real qwen35 validate) green.
+- **Гейт:** fmt ok · clippy `-D` 0 · **236** тестів (217 lib + 19 integration) +
+  6 ignored; Rust **16084** LOC (src 13298 / tests 1317 / xtask 319 / benches 1150),
+  ratio **99.0 %**; serve перезапущено на новому білді.
+- **Далі:** **`PH-1303`** — full-attn шар qwen35 (GQA 8/2×256 + QK-norm + q-gate +
+  zyxt-sectioned rope) у `forward.rs`-гілці.
 

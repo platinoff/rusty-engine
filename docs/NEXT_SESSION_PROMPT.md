@@ -3,7 +3,7 @@
 ## Сталий стан (2026-10-24) — почати звідси
 
 - **Owner product pick: `rusty-engine`** (не автоматично: Step 0 питає продукт; тут — вже обраний).
-- HEAD = `origin/main` (PH-203s/PH-203t rejections + **PH-1201 MiniCPM-V spike** + **PH-1301 qwen35 config/validate**, §research/minicpm-v-4.7.md; код forward/ядра = PH-203r), clean; гейт fmt/clippy-0/**230** тести (+6 ignored) зелений.
+- HEAD = `origin/main` (PH-203s/PH-203t rejections + **PH-1201 MiniCPM-V spike** + **PH-1301/1302 qwen35 config+GDN**, §research/minicpm-v-4.7.md; код forward/ядра = PH-203r), clean; гейт fmt/clippy-0/**236** тести (+6 ignored) зелений.
 - Перф-серія prefill: 961 tok **190.9 s → 5.3–6.4 s** (розкид = фонове навантаження боксу); matmul 4.1–4.7 s (77 %), attention 0.74–0.78 s (13.9 %), down `896×4864` **64–69 GMAC/s** (було 36–42), gate/up **81–92**, swiglu 122–132 ms, rope 32–35 ms, other **2.4–3 %** (див. `docs/STATUS.md`).
 - **`PH-203s` закрито виміром (2026-10-24):** онлайн-softmax блоками по KV + exp-таблиця
   реалізовані й прогнані в `benches/attn.rs` (min-of-5, один процес): **+8–15 % проти
@@ -15,8 +15,8 @@
   rowbuf-и звалюють спільний L3, четверте підтвердження ефекту PH-203n/q); NT-store на `out`
   — верхня межа <1 %, пораховано й пропущено. Продакшн `MATMUL_W_ROWS = 2`, golden не рухався
   (біт-у-біт); хуки + **interleaved t48-vs-t96** (t48 11/12 по медіані, min паритет) лишились
-  у бенчах. **`PH-1301` вже закрито** (config/geometry/validate qwen35; real `rusty validate` = OK, §29);
-  наступний зріз — **`PH-1302`** (`src/gdn.rs`); perf-черга
+  у бенчах. **`PH-1301`+`PH-1302` вже закрито** (config/validate + `src/gdn.rs`);
+  наступний зріз — **`PH-1303`** (full-attn qwen35); perf-черга
   відкривається з NEON (B2).
   Плейбук агента: `docs/HANDOFF_NEW_SESSION.md` §Продовження 20–27.
 - **Модельна політика (owner 2026-10-24):** цільова модель = **MiniCPM-V 4.7**
@@ -32,10 +32,12 @@
   бенд B13 `PH-1301..1306`**. Віжен = clip-548M **BF16(30)**: 27×v.blk 1152/GELU4304 +
   v.vit_merger (4× ds_ln/ds_ffn 17216 + attn) + mm MLP→1024 (фікс `ggml_dtype(30)` +
   `dequant` 30 уже влиті). **`PH-1301` готовий** (`model.rs`: qwen35 config/Geometry/
-  validate + `LayerKind` + real-file green); **наступний зріз — `PH-1302`**: `src/gdn.rs`
-  (GDN: conv1d k4 + delta-rule стан 16×128², O(1) decode; head_dim GDN = state 128 ×
-  groups 16, не 256; pre-FFN norm = post_attention_norm); далі 1303
-  full-attn, 1304 pre-tokenizer+runner, 1305 E2E greedy-паритет проти `llama.cpp-omni`
+  validate + `LayerKind` + real-file green); **`PH-1302` готовий** (`src/gdn.rs`:
+  delta-step `S·=e^g → pred → Δ-write → read`, L2 q/k + `dk^-0.5`, gated head-RMSNorm
+  swish(z), prefill==steps bit-identical, стан рівно 1 MiB/блок; scratch `dv ≤ 128`,
+  gate-конвенція і константи — під `PH-1305`); **наступний зріз — `PH-1303`**:
+  full-attn шар (GQA 8/2×256 + QK-norm + q-gate + zyxt-rope).
+  Далі 1304 pre-tokenizer+runner, 1305 E2E greedy-паритет проти `llama.cpp-omni`
   CLI + perf, 1306 serve. B12: 1202/1203 (vit/merger) паралельно, 1204 image-prefix
   чекає B13; 1205/1206 далі.
 - Диск-дисципліна замірів: тайл/блок-свіпи міряти **в одному процесі** (`benches/kquant.rs`, `benches/quant.rs`), бо end-to-end wall на цьому боксі дрейфує ±25 %.

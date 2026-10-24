@@ -36,6 +36,7 @@ pub mod backend;
 pub mod cache;
 pub mod core;
 pub mod forward;
+pub mod gdn;
 pub mod gguf;
 pub mod gpt2;
 pub mod http;
