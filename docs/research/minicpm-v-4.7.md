@@ -51,8 +51,17 @@ chat_template: 7 249 chars (Jinja, hard-disable thinking)
 > 24 шари, 6 full (blk.3 включно), всі dims збігаються з config-формулами
 > (`model.rs`: `LayerKind::{Recurrent, Full}`, qkv 3·inner, attn_q 2·q). Додатковий
 > факт із валідації: **`ffn_norm.weight` у qwen35 немає** — перед-FFN норму грає
-> `post_attention_norm.weight` (дві норми на блок); гибридна гілка `validate` саме це
+> `post_attention_norm.weight` (дві норми на блок). Гібридна гілка `model.rs::validate` саме це
 > й вимагає.
+
+> **PH-1303 — розшифровка rope-ключів (llama.cpp PR #29416, MiniCPM-V 4.7 support):**
+> `rope.dimension_sections = [11,11,10,0]` + `rope.section_order = "zyxt"` — це M-RoPE:
+> 32 частотні пари діляться на секції 11/11/10/0, кожна секція живиться своїм
+> position-slot (z,y,x,t у порядку рядка). Для тексту всі слоти = позиція токена ⇒
+> `src/q35.rs` реалізує стандартну **partial RoPE (перші 64 з 256 dims, NeoX)** і це
+> точний text-випадок; багатослотовий поділ знадобиться з image-prefix (PH-1204).
+> Додатково з метаданих: `qwen35.nextn_predict_layers = 1` — MTP/dspark head
+> (окремий `dspark-*.gguf`, 438 MB) — кандидата спекулятивної декодації на майбутнє.
 
 ## 2. Vision mmproj: clip, 548M, повний BF16
 

@@ -6,6 +6,9 @@
 clip-548M **BF16(30)** (+фікс dtype-таблиці й dequant). **`PH-1301` того ж дня:** `model.rs`
 читає qwen35 (`LayerKind` + head_dim=key_length + ssm/rope-секції), `rusty validate` на
 реальному файлі = **OK** (24 шари, 6 full; pre-FFN norm = `post_attention_norm`).
+**`PH-1303`: `src/q35.rs`** — QK-norm + q-gate `σ` + partial NeoX 64/256;
+rope-секції розшифровано з llama.cpp PR #29416: `[11,11,10,0]`/`zyxt` = M-RoPE
+position-слоти, text-дегенерація точна. Також `nextn_predict_layers=1` (dspark head).
 **`PH-1302`: `src/gdn.rs`** — delta-rule стан 16×128², prefill==steps bit-identical,
 gated head-RMSNorm (swish-конвенція — під `PH-1305`), 1 MiB/блок замість KV-кешу.
 Раніше цього ж дня: **`PH-203s` ❌**
@@ -50,11 +53,11 @@ live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; �
 | Метрика | Значення |
 |---------|----------|
 | `git status` | **clean** (0 drift) |
-| Коміти | **109** усього (`git rev-list --count HEAD`); **50** у drain-серії B0→PH-1302 (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3 + PH-203r two weight rows + PH-203s measured-rejection bench/hooks + PH-203t measured-rejection wrows4/interleaved (docs+bench) + model-policy B12 docs + PH-1201 MiniCPM-V spike (inspect KV/histogram, BF16-fix); **pushed 2026-10-24**) |
-| Тести | **236** (217 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +6 ignored parity, включно real-MiniCPM validate), 0 failed |
+| Коміти | **110** усього (`git rev-list --count HEAD`); **51** у drain-серії B0→PH-1303 (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3 + PH-203r two weight rows + PH-203s measured-rejection bench/hooks + PH-203t measured-rejection wrows4/interleaved (docs+bench) + model-policy B12 docs + PH-1201 MiniCPM-V spike (inspect KV/histogram, BF16-fix); **pushed 2026-10-24**) |
+| Тести | **241** (222 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +6 ignored parity, включно real-MiniCPM validate), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
-| Rust LOC | **16084** (`src` 13298 + `tests` 1317 + `xtask` 319 + `benches` 1150; `wc -l`) |
+| Rust LOC | **16523** (`src` 13737 + `tests` 1317 + `xtask` 319 + `benches` 1150; `wc -l`) |
 | UI LOC (glue) | **157** (html+css+js) |
 | **Rust ratio** | **99.0%** (ціль 95–100 ✓) |
 | Docs LOC | 2781 (`git ls-files docs \| xargs wc -l`) |
@@ -76,7 +79,7 @@ live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; �
 | **B5** serve | 🟡 | PH-501a/b (std HTTP + real TextRunner), PH-502 (SSE), PH-503 (slot-cache), PH-504 (heartbeat), PH-505 (**metrics + per-process RAM**), PH-506 (serve integration tests ✅); **PH-507 hub provider-row E2E ✅ (`rusty-serve` через хаб, JSON+SSE)** |
 | B6 build-matrix(exe/bin/apk) / B7 docker / B8 supervisor / B9 dist-MoE / B10 UI / B11 distribs | ☐ | заплановано (бенди в роадмепі) |
 | **B12** vision (MiniCPM-V 4.7) | 🟡 | **`PH-1201` spike ✅ 2026-10-24** (`rusty inspect` KV+histogram, ваги у data/models/,research-дока); PH-1202/1203 (ViT-1152/27× + vit_merger, BF16) — далі; image-prefix (1204) **чекає B13** |
-| **B13** text-core qwen35 (гібрид GDN+full) | 🟡 | **`PH-1301` ✅ + `PH-1302` ✅ 2026-10-24**: `LayerKind` + qwen35 config/validate (real `rusty validate` = OK) + `src/gdn.rs` (delta_step фікс-порядок, prefill==steps bit-identical, gated RMSNorm swish(z) — константи під 1305, стан 1 MiB/блок); далі 1303 full-attn → 1304 wire → 1305 parity → 1306 serve |
+| **B13** text-core qwen35 (гібрид GDN+full) | 🟡 | **`PH-1301..1303` ✅ 2026-10-24**: `LayerKind`+config/validate (real `rusty validate` = OK), `src/gdn.rs` (delta-rule, prefill==steps bit-identical, 1 MiB/блок), `src/q35.rs` (QK-norm, q-gate σ, partial NeoX — zyxt=M-RoPE за PR #29416); далі 1304 wire → 1305 parity → 1306 serve |
 
 **Між конекцій:** від токена до logits стек повний — `config → validate → dequant → embed →
 block_forward → sampler → BPE` — і реальна геометрія Qwen2.5 підтверджена (`rusty validate` = OK).
@@ -110,10 +113,11 @@ vLLM v0.28 / SGLang v0.5.19 (RadixArk) / TensorRT-LLM v1.2.1 / llama.cpp / ktran
 закрито**, matmul виведено на load-port/FMA-межу (77 % prefill, gate/up 81–92 GMAC/s, down
 64–69). **`PH-203s` (attention softmax) і `PH-203t` (matmul w_rows=4 + NT-store) — обидва
 виміряно й відкинуто 2026-10-24; левери prefill закрито до NEON.**
-**`PH-1301` і `PH-1302` закрито** (`model.rs` qwen35 + `src/gdn.rs`: delta-rule
-стан 16×128², prefill==steps bit-identical, 1 MiB/блок; gate-конвенції — під 1305).
-Наступний зріз — **`PH-1303`**: full-attn шар (GQA 8/2×256 + QK-norm + q-gate +
-zyxt-rope); далі 1304 wire →
+**`PH-1301`–`PH-1303` закрито** (`model.rs` qwen35 + `src/gdn.rs` delta-rule + `src/q35.rs`
+full-attn: QK-norm, q-gate, partial NeoX; prefill==steps скрізь біт-у-біт; gate/swish
+конвенції — під `PH-1305`).
+Наступний зріз — **`PH-1304`**: pre-tokenizer `qwen35` + specials + `DenseRunner`-wire
+18 GDN + 6 full (residual/norms); далі
 1305 E2E-паритет проти `llama.cpp-omni` CLI → 1306 serve. B12 vision
 (1202/1203, `PH-1201` spike готовий — `docs/research/minicpm-v-4.7.md`; `PH-1301`
 config/validate теж готовий) — паралельно; image-prefix (1204) чекає B13. Готові

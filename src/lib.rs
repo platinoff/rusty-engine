@@ -49,6 +49,7 @@ pub mod moe;
 pub mod node;
 pub mod pool;
 pub mod profile;
+pub mod q35;
 pub mod qmat;
 pub mod quant;
 pub mod repack;

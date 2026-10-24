@@ -7,9 +7,9 @@
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | PH-1302 `src/gdn.rs` (див. §Продовження 26–30 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` (gitignored) |
-| Гейт | fmt ok · clippy `-D` **0** · **236** тести (217 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 6 `#[ignore]` parity (incl. real MiniCPM-V validate), усі зелені |
-| Код | Rust **16084** LOC (src 13298 / tests 1317 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 70 tracked files · docs 2781+ LOC |
+| HEAD / origin | PH-1303 `src/q35.rs` (див. §Продовження 26–31 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` (gitignored) |
+| Гейт | fmt ok · clippy `-D` **0** · **241** тести (222 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 6 `#[ignore]` parity (incl. real MiniCPM-V validate), усі зелені |
+| Код | Rust **16523** LOC (src 13737 / tests 1317 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 71 tracked files · docs 2781+ LOC |
 | Prefill (live `:8090`, 12 потоків, 961 tok) | **5.3–6.4 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 4.1–4.7 s (~77 %) · attention 0.74–0.78 s (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42) · gate/up **81–92** · swiglu 122–132 ms · rope 32–35 ms · other **2.4–3 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
 | Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…r; recapture PH-203s збігся з ним байт-у-байт і не застосовувався (зріз відкату) |
@@ -23,8 +23,9 @@ PH-203r-подібні (bit-identical, golden не рухався). **`PH-1201` 
 (18 GDN + 6 full-attn, QK-norm, zyxt-rope, vocab 248 094) + vision-clip BF16
 (`ggml_dtype(30)` фікс). **`PH-1301` закрито того ж дня (§Продовження 29: config/geometry
 qwen35 + `rusty validate` на реальному файлі = OK); **`PH-1302` теж закрито** (§30:
-`src/gdn.rs` — delta-rule стан, prefill==steps bit-identical); **наступний зріз —
-1303 full-attn**
+`src/gdn.rs` — delta-rule стан, prefill==steps bit-identical); **`PH-1303` закрито**
+(§31: `src/q35.rs`, zyxt = M-RoPE слоти за llama.cpp PR #29416); **наступний зріз —
+1304 pre-tokenizer + runner-wire**
 → 1304 pre-tokenizer/runner → 1305 E2E-паритет проти
 `llama.cpp-omni` → 1306 serve; B12-vision (1202/1203) будується паралельно, image-prefix
 (1204) чекає B13. **Паралельно
@@ -1038,4 +1039,26 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
   ratio **99.0 %**; serve перезапущено на новому білді.
 - **Далі:** **`PH-1303`** — full-attn шар qwen35 (GQA 8/2×256 + QK-norm + q-gate +
   zyxt-sectioned rope) у `forward.rs`-гілці.
+
+### Продовження 31 — 2026-10-24: PH-1303 — `src/q35.rs`: GQA 256 + QK-norm + q-gate; rope-секції розшифровано (M-RoPE)
+
+- **Розшифровка з llama.cpp PR #29416:** `[11,11,10,0]`/`"zyxt"` = **M-RoPE slots**
+  (кожна секція пари-частот живить свій t/y/x/z-слот); для тексту всі слоти
+  збігаються ⇒ `src/q35.rs` = коректна **partial NeoX rope (64/256)**, крос-тест
+  збігається з `infer::rope_in_place` при rope_dim==hd. Плюс знайдено
+  `qwen35.nextn_predict_layers = 1` (dspark/MTP head — кандидата future spec-decode).
+- **`Q35Geom::from_config`** — лише hybrid + `key_length>0` + парний `rope_dim ≤ hd`
+  (qwen2 не кваліфікується); `q_dim` 2048, `kv_dim` 512, GQA 8/2.
+- **`q35_decode_step` / `q35_prefill`** — загальні `project_rope_append` (QK-RMSNorm
+  `attn_q_norm/attn_k_norm` після проекції, до rope; повернуті+нормовані K в кеш,
+  policy PH-203g) і `attend_row` (scale `hd^-0.5`, libm softmax — lesson PH-203s).
+  **attn_q [dm,2·q]: друга половина = gate**, `o ·= sigmoid(gate)` перед `attn_output`
+  (`gate_act` — єдине місце, конвенція під pin `PH-1305`). Shape-guard на rows.
+- **Інваріанта:** prefill == покроковий decode **біт-у-біт** (і виходи, і кеш) — 5
+  нових unit; zero-in→zero-out; geom-контракт з реальних значень.
+- **Гейт:** fmt ok · clippy `-D` 0 · **241** тест (222 lib + 19 integration) + 6
+  ignored (qwen2 golden не рухався); Rust **16523** LOC (src 13737, 71 tracked).
+- **Далі:** **`PH-1304`** — pre-tokenizer `qwen35` + specials + `DenseRunner`-wire
+  18 GDN + 6 full за `recurrent_layers` (residual/norms тут же; M-RoPE слоти — на
+  image-prefix 1204).
 
