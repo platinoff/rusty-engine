@@ -7,9 +7,9 @@
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | PH-1303 `src/q35.rs` (див. §Продовження 26–31 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` (gitignored) |
-| Гейт | fmt ok · clippy `-D` **0** · **241** тести (222 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 6 `#[ignore]` parity (incl. real MiniCPM-V validate), усі зелені |
-| Код | Rust **16523** LOC (src 13737 / tests 1317 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 71 tracked files · docs 2781+ LOC |
+| HEAD / origin | PH-1304 `src/runner35.rs` (див. §Продовження 26–32 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` (gitignored) |
+| Гейт | fmt ok · clippy `-D` **0** · **244** тести (222 lib + 22 integration) + 7 `#[ignore]` parity (incl. real MiniCPM-V runner35 smokes), усі зелені |
+| Код | Rust **17426** LOC (src 14177 / tests 1780 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 73 tracked files · docs 2781+ LOC |
 | Prefill (live `:8090`, 12 потоків, 961 tok) | **5.3–6.4 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 4.1–4.7 s (~77 %) · attention 0.74–0.78 s (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42) · gate/up **81–92** · swiglu 122–132 ms · rope 32–35 ms · other **2.4–3 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
 | Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…r; recapture PH-203s збігся з ним байт-у-байт і не застосовувався (зріз відкату) |
@@ -24,8 +24,9 @@ PH-203r-подібні (bit-identical, golden не рухався). **`PH-1201` 
 (`ggml_dtype(30)` фікс). **`PH-1301` закрито того ж дня (§Продовження 29: config/geometry
 qwen35 + `rusty validate` на реальному файлі = OK); **`PH-1302` теж закрито** (§30:
 `src/gdn.rs` — delta-rule стан, prefill==steps bit-identical); **`PH-1303` закрито**
-(§31: `src/q35.rs`, zyxt = M-RoPE слоти за llama.cpp PR #29416); **наступний зріз —
-1304 pre-tokenizer + runner-wire**
+(§31: `src/q35.rs`, zyxt = M-RoPE слоти за llama.cpp PR #29416) і **`PH-1304` закрито**
+(§32: `src/runner35.rs` — реальний MiniCPM-V генерує, 244 тести + 7 ignored); **наступний
+зріз — 1305** (pin-пара проти `llama.cpp-omni` + batched-prefill perf)
 → 1304 pre-tokenizer/runner → 1305 E2E-паритет проти
 `llama.cpp-omni` → 1306 serve; B12-vision (1202/1203) будується паралельно, image-prefix
 (1204) чекає B13. **Паралельно
@@ -1061,4 +1062,30 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
 - **Далі:** **`PH-1304`** — pre-tokenizer `qwen35` + specials + `DenseRunner`-wire
   18 GDN + 6 full за `recurrent_layers` (residual/norms тут же; M-RoPE слоти — на
   image-prefix 1204).
+
+### Продовження 32 — 2026-10-24: PH-1304 — `src/runner35.rs`: гібрид біжить РЕАЛЬНИЙ MiniCPM-V
+
+- **`runner35.rs`**: `Q35Runner::from_model` будує блоки за `layer_kind()` (GDN-частини
+  + full-частини + FFN; проекції лишаються квантовими `QMat`, дейквантуються лише дрібні
+  F32-вектори), `Q35Decoder` несе 18 delta-станів + 6 KV-кешів; топологія Qwen3-Next:
+  `h = x + attn(rmsnorm(x, attn_norm)); y = h + ffn(rmsnorm(h, post_attention_norm))`
+  (без `ffn_norm` — факт §29).
+- **pre-tokenizer `qwen35`** (`tokenizer.rs`): мапиться на qwen-сьомейний single-digit
+  splitter (гіпотеза до пін-тесту 1305); specials 248044–7 атомарні з token_type GGUF.
+- **CLI `rusty run`**: `-t` іди → `Q35Runner`; `-p` текст → `textgen::TextRunner35`
+  (BPE-in/BPE-out). **Реальний запуск:** prompt `[151644,872,198]` + 6 токени =
+  `…24273,1710,271,12,271,328` за **2.36 s**; `-p "The capital of France is"` →
+  звʼязний text-вихід за 2.10 s. Семантика ще не запинена (gate-конвенції, pre-split) —
+  це предмет 1305; панік/NaN немає, рядки детерміновані.
+- **Тести `tests/runner35_gen.rs`:** synth-qwen35 GGUF (R+F, 16 KV, 28 тензорів):
+  config→validate→load обох kindʼів; residual-only greedy = той самий токен, що
+  qwen2-synth (wire-еквівалентність); live-GDN: скінченні лоґіти + два декодери
+  збігаються; `#[ignore]` real-смoke (24 шари, prefill finite, 7-токенний greedy
+  deterministic) — **ok у release**.
+- **Гейт:** fmt ok · clippy `-D` 0 · **244** тести (222 lib + 22 integration) +
+  **7 ignored** green; Rust **17426** LOC (src 14177 / tests 1780 / xtask 319 /
+  benches 1150), ratio **99.0 %**; serve перезапущено (qwen2-серв не зачеплений).
+- **Далі:** **`PH-1305`** — build `llama.cpp-omni` CLI як оракул; pin `gate_act`
+  (GDN swish vs sigmoid; attention σ), pre-split, softplus-плато; golden-файкстури
+  `tests/data/qwen35_*.txt`; batched-prefill perf (GDN-скан по групах на пулі).
 

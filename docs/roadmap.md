@@ -299,7 +299,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 ---
 
-## Band B13 — Text core `qwen35` (ГІБРИД GDN + full-attention)  **`[~]`** (`PH-1301` done, 2026-10-24)
+## Band B13 — Text core `qwen35` (ГІБРИД GDN + full-attention)  **`[~]`** (`PH-1301..1304` done, 2026-10-24)
 
 > Мета: LLM-каркас MiniCPM-V 4.7 — **`qwen35`**: 24 шари × d_model 1024, **18 GDN-шарів
 > (Gated DeltaNet: mixed qkv 6144, depthwise conv k4, delta-rule стан 16×128×128, out
@@ -315,6 +315,6 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-1301 | `model.rs`: arch `qwen35` — config-ключі (ssm.*, full_attention_interval, key/value_length, rope sections) + `Geometry`-розширення + `validate` під нові імена тензорів (attn_qkv/attn_gate/ssm_* vs attn_q/k/v+norm) | `[x]` | `src/model.rs` — `LayerKind::{Recurrent,Full}`, `layer_kind()` (Bool-масив > interval), `head_dim()=key_length`, `gdn_qkv_dim`/`full_q_dim`; validate-гілка per-kind (pre-FFN norm = `post_attention_norm`, `ffn_norm` немає); 4 synth-тести + `#[ignore]` real: `rusty validate MiniCPM-V-4_7-1B-Q4_K_M.gguf` = OK |
 | PH-1302 | **GDN-шар** (`src/gdn.rs`): mixed qkv → depthwise conv1d(k4, F32) → delta-rule recurrent (16 груп × 128×128 стан, dt/alpha/beta, ssm_norm) → out-gate → 1024; prefill-скан по рядках + O(1) decode-крок; bit-stable oracle на synth | `[x]` | `src/gdn.rs` — `delta_step` (фікс-порядок pred→Δ→update→read), L2 q/k + `dk^-0.5`, gated head-RMSNorm `swish(z)` (конвенція — `PH-1305`); `prefill_is_bit_identical_to_decode_steps` + textbook-тест + contract 1 MiB/блок; scratch `dv ≤ 128` |
 | PH-1303 | **full-attn шар**: GQA 8/2 head_dim 256 + **QK-norm** + q-gate (attn_q 4096) + zyxt-sectioned rope [11,11,10,0]; reuse `attention_*` з винесеними нормами | `[x]` | `src/q35.rs` — `Q35Geom::from_config`, `project_rope_append` (norm→rope→кеш), `attend_row` (scale `hd^-0.5`, libm softmax), `o·σ(gate)` (конвенція — 1305), shape-guard; 5 unit incl. prefill==steps біт-і + cross-check rope==`infer::rope_in_place`; zyxt = M-RoPE слоти (PR #29416), text = partial NeoX 64/256 |
-| PH-1304 | pre-tokenizer `qwen35` (`gpt2.rs`-сімейство) + chat-template specials (248045/6) + `DenseRunner`-wire 18+6 шарів; CLI `rusty run` на qwen35-файлі | `[ ]` | `src/gpt2.rs`/`runner.rs` + text round-trip |
+| PH-1304 | pre-tokenizer `qwen35` (`gpt2.rs`-сімейство) + chat-template specials (248045/6) + `DenseRunner`-wire 18+6 шарів; CLI `rusty run` на qwen35-файлі | `[x]` | `src/runner35.rs` (`Q35Runner::from_model` per-kind, `Q35Decoder` 18 станів + 6 KV) + `textgen::TextRunner35` + CLI `-t`/`-p`; `tokenizer.rs`: pre `qwen35` → qwen-splitter (пін — 1305); `tests/runner35_gen.rs`: synth R+F (residual-only greedy == dense-еталон, live-GDN finite/deterministic) + `#[ignore]` real smoke — **MiniCPM-V-4.7-1B: 7 токенов = 2.36 s** |
 | PH-1305 | **text E2E greedy-паритет** 1B-Q4_K_M проти `llama.cpp-omni` CLI (3–5 промптів, `#[ignore]` release-тест + golden-файкстура) + perf-зріз (prefill/decode на 12 потоків) | `[ ]` | `tests/qwen35_parity.rs` + `docs/research/qwen35-parity.md` |
 | PH-1306 | (далі) serve на qwen35-core: text-only provider + перемикання id `rusty-05`→`rusty-mcp-v47` у GSV-каталозі; B12-PH-1204 розблоковано | `[ ]` | `src/serve.rs` + GSV catalog row |

@@ -13,6 +13,7 @@ use crate::core::{EngineError, Result};
 use crate::loader::MmapModel;
 use crate::model::ModelConfig;
 use crate::runner::{DenseDecoder, DenseRunner};
+use crate::runner35::{Q35Decoder, Q35Runner};
 use crate::tokenizer::{Bpe, TokenizerMeta};
 
 /// A dense runner paired with the model's byte-level BPE, for text in / text out.
@@ -88,6 +89,57 @@ impl TextRunner {
         let out = dec.generate_incremental(&ids, max_new);
         let new = &out[ids.len().min(out.len())..];
         Ok(self.bpe.decode(new))
+    }
+}
+
+/// `qwen35` text pipeline — band B13 `PH-1304`. Same shape as [`TextRunner`] (BPE in,
+/// greedy hybrid generation, BPE out) over the [`Q35Runner`] delta-state decoder. The
+/// serve wiring lands in `PH-1306`; this is the CLI + test path.
+pub struct TextRunner35 {
+    pub runner: Q35Runner,
+    pub bpe: Bpe,
+}
+
+impl TextRunner35 {
+    /// Build from a mapped GGUF (config must be the validated `qwen35` geometry).
+    pub fn from_model(model: &MmapModel) -> Result<Self> {
+        let header = model.header();
+        let cfg = ModelConfig::from_file(header)?;
+        let problems = cfg.validate(header);
+        if !problems.is_empty() {
+            return Err(EngineError {
+                message: format!("textgen35: geometry invalid: {}", problems[0]),
+            });
+        }
+        let meta = TokenizerMeta::from_file(header);
+        if meta.tokens.is_empty() {
+            return Err(EngineError {
+                message: "textgen35: model has no tokenizer.ggml.tokens".to_string(),
+            });
+        }
+        let runner = Q35Runner::from_model(model, &cfg)?;
+        let bpe = Bpe::from_meta(meta);
+        Ok(Self { runner, bpe })
+    }
+
+    /// Encode, greedily generate up to `max_new` tokens (EOS stops), decode the new
+    /// tokens only.
+    pub fn run_text(&self, prompt: &str, max_new: usize) -> Result<String> {
+        let ids = self.bpe.encode(prompt)?;
+        if ids.is_empty() {
+            return Err(EngineError {
+                message: "textgen35: prompt tokenized to empty".to_string(),
+            });
+        }
+        let mut dec = Q35Decoder::new(&self.runner);
+        let out = dec.generate_incremental(&ids, max_new);
+        let new = &out[ids.len().min(out.len())..];
+        Ok(self.bpe.decode(new))
+    }
+
+    /// Encode + echo token ids.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        self.bpe.encode(text)
     }
 }
 

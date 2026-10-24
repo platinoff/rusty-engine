@@ -54,6 +54,7 @@ pub mod qmat;
 pub mod quant;
 pub mod repack;
 pub mod runner;
+pub mod runner35;
 pub mod serve;
 pub mod slot;
 pub mod textgen;

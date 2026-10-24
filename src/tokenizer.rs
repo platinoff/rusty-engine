@@ -233,12 +233,13 @@ impl Bpe {
 
     /// Encode text to token ids. Special/control tokens (`token_type >= 3`) are atomic;
     /// between them the byte-level BPE runs with byte-fallback for unseen merges.
-    /// The pre-tokenizer variant follows GGUF `tokenizer.ggml.pre`: `qwen2` uses the
-    /// HF single-digit `\p{N}` split (`PH-405b` byte-exact gate), everything else the
-    /// classic GPT-2 `\p{N}{1,3}` splitter.
+    /// The pre-tokenizer variant follows GGUF `tokenizer.ggml.pre`: `qwen2` and `qwen35`
+    /// use the HF single-digit `\p{N}` split (`PH-405b` byte-exact gate; `PH-1304` maps
+    /// the new `qwen35` pre onto the same qwen-family splitter until `PH-1305` proves a
+    /// divergence), everything else the classic GPT-2 `\p{N}{1,3}` splitter.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let mut ids = Vec::new();
-        let qwen2 = self.meta.pre.as_deref() == Some("qwen2");
+        let qwen2 = matches!(self.meta.pre.as_deref(), Some("qwen2") | Some("qwen35"));
         for segment in split_on_specials(text, &self.specials) {
             match segment {
                 Segment::Special(s) => ids.push(self.specials[&s]),

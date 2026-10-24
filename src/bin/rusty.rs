@@ -356,8 +356,29 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
             std::process::exit(1);
         }
     };
-    // Text pipeline (PH-306b): needs tokenizer.ggml.* meta.
+    // Text pipeline (PH-306b): needs tokenizer.ggml.* meta. PH-1304: `qwen35` arches
+    // route to the hybrid runner (delta-state GDN + gated full attention).
     if let Some(text) = prompt {
+        let q35 = rusty_engine::model::ModelConfig::from_file(model.header())
+            .map(|c| c.arch == "qwen35")
+            .unwrap_or(false);
+        if q35 {
+            let tr = match rusty_engine::textgen::TextRunner35::from_model(&model) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("rusty run {path}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match tr.run_text(&text, max_new) {
+                Ok(got) => println!("[{}] {}", tr.runner.n_layers, got),
+                Err(e) => {
+                    eprintln!("rusty run {path}: {e}");
+                    std::process::exit(1);
+                }
+            }
+            std::process::exit(0);
+        }
         let tr = match rusty_engine::textgen::TextRunner::from_model(&model) {
             Ok(t) => t,
             Err(e) => {
@@ -388,6 +409,26 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
     if let Some(prob) = cfg.validate(model.header()).first() {
         eprintln!("rusty run {path}: geometry invalid: {prob}");
         std::process::exit(1);
+    }
+    if cfg.arch == "qwen35" {
+        let runner = match rusty_engine::runner35::Q35Runner::from_model(&model, &cfg) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("rusty run {path}: runner35: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut dec = rusty_engine::runner35::Q35Decoder::new(&runner);
+        let out = dec.generate_incremental(&tokens, max_new);
+        let ids: Vec<String> = out.iter().map(|t| t.to_string()).collect();
+        println!(
+            "[{}] {} layers (hybrid) — prompt {:?} -> {}",
+            cfg.arch,
+            cfg.n_layers,
+            tokens,
+            ids.join(",")
+        );
+        std::process::exit(0);
     }
     let runner = match rusty_engine::runner::DenseRunner::from_model(&model, &cfg) {
         Ok(r) => r,
