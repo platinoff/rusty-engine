@@ -7,9 +7,9 @@
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | PH-203s **rejection** + PH-203t **rejection** (див. §Продовження 26–27 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін |
-| Гейт | fmt ok · clippy `-D` **0** · **226** тести (207 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
-| Код | Rust **15073** LOC (src 12287 / tests 1317 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 68 tracked files · docs 2479+ LOC |
+| HEAD / origin | PH-1201 spike (див. §Продовження 26–28 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` (gitignored) |
+| Гейт | fmt ok · clippy `-D` **0** · **227** тести (208 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
+| Код | Rust **15173** LOC (src 12387 / tests 1317 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 69 tracked files · docs 2735 LOC |
 | Prefill (live `:8090`, 12 потоків, 961 tok) | **5.3–6.4 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 4.1–4.7 s (~77 %) · attention 0.74–0.78 s (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42) · gate/up **81–92** · swiglu 122–132 ms · rope 32–35 ms · other **2.4–3 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
 | Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…r; recapture PH-203s збігся з ним байт-у-байт і не застосовувався (зріз відкату) |
@@ -18,12 +18,17 @@
 **Далі:** обидва perf-левери prefill закриті виміром: `PH-203s` (attention softmax — не
 exp-bound, `benches/attn.rs`) і `PH-203t` (matmul `w_rows=4` quad-pass + NT-store — без
 стійкого пул-виграшу, на wide down мінус, §Продовження 27). Продакшн ядра лишились
-PH-203r-подібні (bit-identical, golden не рухався). Наступний зріз — **`PH-1201`** (бенд
-**B12**: official MiniCPM-V 4.7-1B GGUF + `rusty inspect` vision-layout → `docs/research/
-minicpm-v-4.7.md`); perf-черга відкривається з NEON (B2) після B12-spike. **Паралельно
+PH-203r-подібні (bit-identical, golden не рухався). **`PH-1201` spike зроблено
+2026-10-24 (§Продовження 28):** MiniCPM-V 4.7-1B = text-core **`qwen35`-гібрид**
+(18 GDN + 6 full-attn, QK-norm, zyxt-rope, vocab 248 094) + vision-clip BF16
+(`ggml_dtype(30)` фікс). Наступний зріз — **`PH-1301`** (бенд **B13**: config/geometry
+qwen35 → 1302 GDN → 1303 full-attn → 1304 pre-tokenizer/runner → 1305 E2E-паритет проти
+`llama.cpp-omni` → 1306 serve); B12-vision (1202/1203) будується паралельно, image-prefix
+(1204) чекає B13. **Паралельно
 (owner 2026-10-24): модельна політика** — цільова модель **MiniCPM-V 4.7** (official GGUF,
 без Python; `src/vit.rs` + 4×/16× compressor + image-prefix + multimodal serve;
-`PH-1201..1206` на борді GSV; Qwen3/Mixtral з цілей прибрано, Qwen2.5 = оракул).
+`PH-1201..1206` + `PH-1301..1306` на борді GSV; Qwen3/Mixtral з цілей прибрано,
+Qwen2.5 = оракул).
 
 ## Що було зроблено (B0, campaign 2026-10-14)
 
@@ -944,4 +949,32 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
   + 5 text-gen) + 5 ignored; Rust **15073** LOC, ratio **99.0 %**; serve перезапущено.
 - **Далі:** perf-черга matmul закрита до NEON/B12-контексту; наступний зріз — **`PH-1201`**
   (B12 spike: official MiniCPM-V 4.7-1B GGUF + `rusty inspect` vision-layout).
+
+### Продовження 28 — 2026-10-24: PH-1201 — MiniCPM-V 4.7 spike: core = qwen35-ГІБРИД, vision = BF16-clip
+
+- **Ваги:** official HF `openbmb/MiniCPM-V-4.7-1B-gguf` → `data/models/` (gitignored):
+  `MiniCPM-V-4_7-1B-Q4_K_M.gguf` 672 MB + `mmproj-model-f16.gguf` 1.11 GB (548M, arch
+  `clip`, type `mmproj`).
+- **`rusty inspect` прокачано** (PH-1201 скоуп, без forward-правок): повний KV-дамп
+  (скорочений — chat_template 7 249 chars обрізається), **tensor-name prefix
+  histogram**, `[N]` — скільки тензорів показати; дампи:
+  `target/live/inspect_ph1201_{main,mmproj}_full.txt`, факты:
+  [`research/minicpm-v-4.7.md`](research/minicpm-v-4.7.md).
+- **Головне відкриття:** text-core 4.7-1B — **НЕ qwen2, а `qwen35`** — Qwen3-Next-подібний
+  **гібрид**: 18 шарів GDN (Gated DeltaNet: mixed `attn_qkv` 6144, depthwise
+  `ssm_conv1d` k4, delta-rule стан 16 груп × 128², `ssm_norm` 128, out-gate) + 6
+  full-attn шарів (кожний 4-й; GQA 8q/2kv head_dim 256, **QK-norm**, q-gate 4096) +
+  sectioned RoPE `[11,11,10,0]` "zyxt" + pre-tokenizer `qwen35` + vocab 248 094.
+  → новий **бенд B13** (`PH-1301..1306`) у roadmap; B12-PH-1204 (image-prefix) тепер
+  чекає B13. GDN-декод = O(1)/токен — наступний диференціатор після MoE.
+- **Баг-фікс по дорозі:** канон ggml.h — `BF16 = 30` (не 24; 24 = I8). MMproj тримає
+  **усі** vision-ваги як BF16. Додано: `ggml_dtype(30)=BF16` (+тест), `block_info(30)`,
+  `dequant` arm 30 (bf16 = верхні 16 біт f32, `<< 16` без таблиці) +
+  `dequant_bf16_widens_by_left_shift`. Без цього mmproj не читався б взагалі.
+- **Гейт:** fmt ok · clippy `-D` 0 · **227** тестів (208 lib + 19 integration) + 5
+  ignored parity; Rust **15173** LOC (src 12387 / tests 1317 / xtask 319 / benches
+  1150), ratio **99.0 %**; serve перезапущено після збірки.
+- **Далі:** **`PH-1301`** — `model.rs`: config `qwen35` + Geometry + validate; далі —
+  1302 GDN-шар, 1303 full-attn, 1304 pre-tokenizer+runner, 1305 E2E-паритет проти
+  `llama.cpp-omni` CLI, 1306 serve.
 

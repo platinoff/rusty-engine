@@ -16,7 +16,7 @@ fn main() {
             println!();
             println!("  --version, -V   print crate version");
             println!("  --help, -h      print this banner");
-            println!("  inspect <file>            GGUF metadata summary      (PH-107)");
+            println!("  inspect <file> [N]        GGUF metadata summary      (PH-107)");
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  config <file>             read model hyperparameters (PH-305c)");
             println!("  validate <file>           check tensor names/dims vs config (PH-305e)");
@@ -33,7 +33,7 @@ fn main() {
             );
         }
         Some("inspect") => match args.next() {
-            Some(path) => inspect(&path),
+            Some(path) => inspect(&path, args.next().as_deref()),
             None => {
                 eprintln!("usage: rusty inspect <model.gguf>");
                 std::process::exit(2);
@@ -73,8 +73,47 @@ fn main() {
     }
 }
 
-/// Print the GGUF header: counts, alignment, architecture and the first tensor rows.
-fn inspect(path: &str) {
+/// Compact one-line rendering of a GGUF KV value: scalars as-is, strings truncated
+/// (chat templates run to kilobytes), arrays as `kind[len]` with inline contents only
+/// for short numeric arrays (`PH-1201` vision-layout spike).
+fn kv_summary(v: &rusty_engine::gguf::Value) -> String {
+    use rusty_engine::gguf::Value;
+    match v {
+        Value::Str(s) => {
+            if s.chars().count() > 88 {
+                let head: String = s.chars().take(88).collect();
+                format!("\"{head}…\" ({} chars)", s.chars().count())
+            } else {
+                format!(
+                    "\"{}\"",
+                    s.replace('\\', "\\\\")
+                        .replace('\n', "\\n")
+                        .replace('\t', "\\t")
+                )
+            }
+        }
+        Value::Array(kind, vals) => {
+            let short = vals.len() <= 8
+                && !vals.is_empty()
+                && vals
+                    .iter()
+                    .all(|x| !matches!(x, Value::Str(_) | Value::Array(_, _)));
+            if short {
+                let items: Vec<String> = vals.iter().map(kv_summary).collect();
+                format!("{kind:?}[{}] = [{}]", vals.len(), items.join(", "))
+            } else {
+                format!("{kind:?}[{}]", vals.len())
+            }
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+/// Print the GGUF header: counts, alignment, architecture, every KV key (abbreviated)
+/// with a tensor-name prefix histogram, and the first tensor rows. The KV dump + histogram
+/// are the `PH-1201` vision-layout spike: what a container carries hangs on the non-qwen2
+/// keys and the name prefixes, not on the first ten tensor lines.
+fn inspect(path: &str, show_n: Option<&str>) {
     match rusty_engine::gguf::parse_file(Path::new(path), rusty_engine::gguf::INSPECT_WINDOW) {
         Ok(f) => {
             println!(
@@ -87,9 +126,31 @@ fn inspect(path: &str) {
             if let Some(rusty_engine::gguf::Value::Str(arch)) = f.get("general.architecture") {
                 println!("  architecture: {arch}");
             }
-            let show = f.tensors.len().min(10);
+            println!("  metadata:");
+            for (k, v) in &f.metadata {
+                println!("    {k} = {}", kv_summary(v));
+            }
+            let mut hist: std::collections::BTreeMap<String, (usize, u64)> =
+                std::collections::BTreeMap::new();
+            for t in &f.tensors {
+                let root = t.name.split('.').next().unwrap_or("").to_string();
+                let e = hist.entry(root).or_default();
+                e.0 += 1;
+                e.1 += t.nbytes().unwrap_or(0) as u64;
+            }
+            println!("  tensor-name prefixes:");
+            for (p, (n, bytes)) in &hist {
+                println!(
+                    "    {p:<30} {n:>5} tensors  {:>9.1} MiB",
+                    *bytes as f64 / (1 << 20) as f64
+                );
+            }
+            let show = match show_n {
+                Some(n) => n.parse::<usize>().unwrap_or(10).min(f.tensors.len()),
+                None => f.tensors.len().min(10),
+            };
             println!("  tensors (showing {show} of {}):", f.tensors.len());
-            for t in f.tensors.iter().take(10) {
+            for t in f.tensors.iter().take(show) {
                 println!(
                     "    {:<40} {:?} ggml={} dtype={:?} offset={}",
                     t.name, t.dims, t.ggml_type, t.dtype, t.offset

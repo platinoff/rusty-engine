@@ -48,7 +48,7 @@ pub fn f16_to_f32(h: u16) -> f32 {
 pub fn block_info(ggml_type: u32) -> Option<BlockInfo> {
     let (elements, bytes) = match ggml_type {
         0 => (1, 4),      // F32
-        1 | 24 => (1, 2), // F16 / BF16
+        1 | 30 => (1, 2), // F16 / BF16 (canonical ggml.h: I8=24, BF16=30 — PH-1201 mmproj)
         2 => (32, 18),    // Q4_0
         6 => (32, 22),    // Q5_0
         8 => (32, 34),    // Q8_0
@@ -267,6 +267,20 @@ pub fn dequant(ggml_type: u32, data: &[u8]) -> Result<Vec<f32>> {
             Ok(data
                 .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect())
+        }
+        // GGML_TYPE_BF16 = 30 (canonical ggml.h) — the MiniCPM-V 4.7 mmproj stores every
+        // vision weight as a 2-byte BF16 (`PH-1201`); bf16 is the truncated top half of an
+        // f32, so widening is a left-shift, no table.
+        30 => {
+            if data.len() % 2 != 0 {
+                return Err(EngineError {
+                    message: format!("BF16 data len {} not a multiple of 2", data.len()),
+                });
+            }
+            Ok(data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
                 .collect())
         }
         2 => {
@@ -568,6 +582,24 @@ mod tests {
             .collect();
         let out = dequant(1, &bytes).expect("F16 dequant");
         assert_eq!(out, vec![1.0, 2.0, -16.0]);
+    }
+
+    #[test]
+    fn dequant_bf16_widens_by_left_shift() {
+        // PH-1201: GGML_TYPE_BF16 = 30, every MiniCPM-V mmproj weight. 1.0 = 0x3F80,
+        // 0.5 = 0x3F00, -2.0 = 0xC000, 1234.5 keeps the top 16 bits of its f32.
+        let bytes: Vec<u8> = [0x3F80u16, 0x3F00, 0xC000, 0x4452]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let out = dequant(30, &bytes).expect("BF16 dequant");
+        assert_eq!(out, vec![1.0, 0.5, -2.0, 840.0]);
+        assert_eq!(
+            dequant(30, &[0u8; 3])
+                .expect_err("BF16 length must be even")
+                .message,
+            "BF16 data len 3 not a multiple of 2"
+        );
     }
 
     #[test]

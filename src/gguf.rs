@@ -166,7 +166,10 @@ pub fn ggml_dtype(code: u32) -> Option<DType> {
         12 => DType::Q4_K,
         13 => DType::Q5_K,
         14 => DType::Q6_K,
-        24 => DType::BF16,
+        // Canonical ggml.h: I8 = 24, IQ1_M = 29, BF16 = 30. The MiniCPM-V 4.7 mmproj
+        // (`PH-1201`) stores its vision weights as 30 — the earlier 24 → BF16 guess was
+        // wrong (24 is I8) and is only reachable through BF16 now.
+        30 => DType::BF16,
         _ => return None,
     })
 }
@@ -468,6 +471,10 @@ mod tests {
         assert_eq!(ggml_dtype(1), Some(DType::F16));
         assert_eq!(ggml_dtype(8), Some(DType::Q8_0));
         assert_eq!(ggml_dtype(6), Some(DType::Q5_0)); // Q5_0 now mapped
+                                                      // ggml.h tail: I8 = 24, IQ1_M = 29, BF16 = 30 — the MiniCPM-V 4.7 mmproj ships
+                                                      // its vision weights as 30 (`PH-1201`); 24 was a stale BF16 guess.
+        assert_eq!(ggml_dtype(30), Some(DType::BF16));
+        assert_eq!(ggml_dtype(24), None); // I8 — not a float/quant DType
         assert_eq!(ggml_dtype(16), None); // IQ2_XXS, later band
     }
 

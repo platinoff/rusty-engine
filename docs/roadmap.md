@@ -24,7 +24,8 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 `фундамент → контейнер(GGUF) → ядра(quant) → dense-контроль → **MoE-ядро** → сервер →
 портативність(exe/bin/apk) → Rust-docker-хости → Rust-супервізор(master/slave) →
-розподілений MoE → Web-UI → дистр/версії/publish → **vision (MiniCPM-V 4.7, B12)**`.
+розподілений MoE → Web-UI → дистр/версії/publish → **text-core qwen35-hybrid (B13)** →
+**vision MiniCPM-V 4.7 (B12, image-prefix після B13)**`.
 
 ---
 
@@ -280,16 +281,40 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 
 > Мета: **MiniCPM-V 4.7** — цільова модель двигуна — біжить у чистій Rust без Python:
 > ваги official-GGUF (Apache-2.0, HF `openbmb/MiniCPM-V-4.7-1B-gguf` / `...-35B-A3B-gguf`),
-> віжен-башта + компресор токенов + image-prefix — нові модулі; текст-путь = вже живий
-> dense/MoE forward. Оракул чисельності — `llama.cpp-omni` CLI (mtmd) як **вимірювальний
+> віжен-башта + компресор токенов + image-prefix — нові модулі; текст-путь = **бенд B13**
+> (`PH-1201` spike 2026-10-24 показав: LLM-core = `qwen35`-гібрид, НЕ qwen2 — див.
+> [`research/minicpm-v-4.7.md`](research/minicpm-v-4.7.md); image-prefix і serve чекають
+> на B13). Оракул чисельності — `llama.cpp-omni` (mtmd) CLI як **вимірювальний
 > інструмент** (прецедент llama-rs-оракула), у продукт не входить. 1B — перший; 35B-A3B —
 > через expert-cache (PH-404) і лише на вузлі з диском.
 
 | ID | Задача | Стан | Доказ |
 |----|--------|------|-------|
 | PH-1201 | **spike: official GGUF + layout** — завантажити `MiniCPM-V-4.7-1B-gguf` (gitignored `data/models/`), `rusty inspect`: arch KV, vision-тензори, розміри/кванти, image-token vocab; факти → `docs/research/minicpm-v-4.7.md` | `[ ]` | `src/bin/rusty.rs` inspect + research-дока |
-| PH-1202 | **vision tower у Rust** (`src/vit.rs`): patch-embed, LayerNorm, ViT-attention, GELU MLP, RoPE/pos-інтерполяція — повністю поверх існуючих `QMat`/`matmul`/dequant-ядер; golden-фіксайти з `llama.cpp-omni` mtmd CLI (in-process bench-паритет, як `benches/attn.rs`) | `[ ]` | `src/vit.rs` + unit + `#[ignore]` parity |
-| PH-1203 | **visual-token компресор 4×/16× + projector** (фішка 4.6/4.7 — мало image-токенів → дешевий prefill): pooling/merger + linear projection у hidden-size LLM | `[ ]` | `src/vit.rs` (merge/project) + фіксація форми |
-| PH-1204 | **image-token prefix у prefill**: вставка vision-ембедингів за placeholdern-токенами, chat-шаблон + specials для мови MiniCPM; `DenseDecoder::prefill` + `block_forward_seq` — embedding-комбінування без re-prefill | `[ ]` | `src/runner.rs`/`textgen.rs` + інтеграція (text-only regression green) |
+| PH-1202 | **vision tower у Rust** (`src/vit.rs`): 27× `v.blk` (attn q/k/v/out на 16 голів, ln1/ln2, GELU-MLP 1152→4304), patch-embed [14,14,3→1152], position_embd 70×70 + 2D-інтерполяція, post_ln — усі ваги **BF16(30)** через дейквант з PH-1201; поверх існуючих `QMat`/`matmul`-ядер; golden-фіксайти з `llama.cpp-omni` mtmd CLI (in-process bench-паритет, як `benches/attn.rs`) | `[ ]` | `src/vit.rs` + unit + `#[ignore]` parity |
+| PH-1203 | **`v.vit_merger` (4×/16× компресор: ds_ln 4608 + attn + ds_ffn 4608↔17216) + `mm.{input_norm,up,down}` MLP → 1024-dim image-токени**; slice-nums ≤ 9, `wa_layer_indexes=[6]` | `[ ]` | `src/vit.rs` (merge/project) + фіксація форми |
+| PH-1204 | **image-token prefix у prefill** (чекає B13-core): вставка vision-ембедингів за placeholder-токенами, chat-шаблон + specials для мови MiniCPM; `DenseDecoder::prefill` + `block_forward_seq` — embedding-комбінування без re-prefill | `[ ]` | `src/runner.rs`/`textgen.rs` + інтеграція (text-only regression green) |
 | PH-1205 | **serve мультимодальний**: `messages[].images` base64 (PNG/JPEG через `image` crate — pure Rust; MVP: PPM/BMP без залежностей), E2E greedy-parity з mtmd-оракулом на 3–5 зображеннях, provider-row `rusty-vision` у GSV-каталозі (heartbeat-gated) | `[ ]` | `src/http.rs`/`serve.rs` + `tests/vision.rs` + GSV catalog |
 | PH-1206 | **MiniCPM-V 4.7-35B-A3B** (MoE) через `ExpertCache` (PH-404): longest-first pin + NVMe-offload + LES-style lookahead-прелоад оцінка; runs only на виділеному вузлі (диск-gate S0) | `[ ]` | `src/moe.rs` + bench + fleet-дрен |
+
+---
+
+## Band B13 — Text core `qwen35` (ГІБРИД GDN + full-attention)  **`[ ]`** (owner-план 2026-10-24, з `PH-1201`)
+
+> Мета: LLM-каркас MiniCPM-V 4.7 — **`qwen35`**: 24 шари × d_model 1024, **18 GDN-шарів
+> (Gated DeltaNet: mixed qkv 6144, depthwise conv k4, delta-rule стан 16×128×128, out
+> gate 2048)** + **6 full-attn шарів (кожний 4-й; GQA 8q/2kv, head_dim 256, QK-norm,
+> q-gate 4096)** + sectioned RoPE `[11,11,10,0]` "zyxt" + pre-tokenizer `qwen35` +
+> vocab 248 094. Це головний диференціатор after-MoE: **лінійна увага в чистій Rust**
+> (декод O(1)/токен — стан, а не KV). Без нього B12 image-prefix і serve не куди
+> вставляти. Оракул: `llama.cpp-omni` CLI greedy-паритет (вимірювальний інструмент).
+> Деталі layout — [`research/minicpm-v-4.7.md`](research/minicpm-v-4.7.md).
+
+| ID | Задача | Стан | Доказ |
+|----|--------|------|-------|
+| PH-1301 | `model.rs`: arch `qwen35` — config-ключі (ssm.*, full_attention_interval, key/value_length, rope sections) + `Geometry`-розширення + `validate` під нові імена тензорів (attn_qkv/attn_gate/ssm_* vs attn_q/k/v+norm) | `[ ]` | `src/model.rs` + unit (synth qwen35) |
+| PH-1302 | **GDN-шар** (`src/gdn.rs`): mixed qkv → depthwise conv1d(k4, F32) → delta-rule recurent (16 груп × 128×128 стан, dt/alpha/beta, ssm_norm) → out-gate → 1024; prefill-скан по行 + O(1) decode-крок; bit-stable oracle на synth | `[ ]` | `src/gdn.rs` + unit + contract-тест |
+| PH-1303 | **full-attn шар**: GQA 8/2 head_dim 256 + **QK-norm** + q-gate (attn_q 4096) + zyxt-sectioned rope [11,11,10,0]; reuse `attention_*` з винесеними нормами | `[ ]` | `src/forward.rs` (qwen35-гілка) + unit |
+| PH-1304 | pre-tokenizer `qwen35` (`gpt2.rs`-сімейство) + chat-template specials (248045/6) + `DenseRunner`-wire 18+6 шарів; CLI `rusty run` на qwen35-файлі | `[ ]` | `src/gpt2.rs`/`runner.rs` + text round-trip |
+| PH-1305 | **text E2E greedy-паритет** 1B-Q4_K_M проти `llama.cpp-omni` CLI (3–5 промптів, `#[ignore]` release-тест + golden-файкстура) + perf-зріз (prefill/decode на 12 потоків) | `[ ]` | `tests/qwen35_parity.rs` + `docs/research/qwen35-parity.md` |
+| PH-1306 | (далі) serve на qwen35-core: text-only provider + перемикання id `rusty-05`→`rusty-mcp-v47` у GSV-каталозі; B12-PH-1204 розблоковано | `[ ]` | `src/serve.rs` + GSV catalog row |

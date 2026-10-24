@@ -1,9 +1,11 @@
 # rusty-engine — PROJECT STATUS
 
-**Snapshot:** 2026-10-24 (останні зрізи: **`PH-203s` онлайн-softmax + exp-таблиця ❌** і
-**`PH-203t` w_rows=4 quad-pass + NT-store ❌** — обидва виміряно в бенчах і відкинуто;
-продакшн-forward/ядра лишились PH-203o/PH-203r, golden не рухався. Модельна політика:
-цільова модель = **MiniCPM-V 4.7**, бенд **B12** (PH-1201..1206). Попередній ланцюг:
+**Snapshot:** 2026-10-24 (останнє: **`PH-1201` spike ✅ — MiniCPM-V 4.7-1B у `data/models/`,
+`rusty inspect` прокачано (KV-дамп+histogram+`[N]`); text-core = **`qwen35`-гібрид**
+(18 GDN + 6 full-attn, QK-norm, zyxt-rope, vocab 248 094) → **новий бенд B13**; vision =
+clip-548M **BF16(30)** (+фікс dtype-таблиці й dequant). Раніше цього ж дня: **`PH-203s` ❌**
+і **`PH-203t` ❌** (обидва левери prefill виміряно й відкинуто; продакшн = PH-203o/PH-203r,
+golden не рухався). Модельна політика: цільова модель = **MiniCPM-V 4.7**. Попередній ланцюг:
 2026-10-22 agi-ланцюг: B0→B1 GGUF→B2 quant→B3 dense/KV/sampler/BPE→B4 MoE→B5
 serve/heartbeat → **PH-405b forward-parity з llama-rs ✅** → **PH-507 hub provider-row E2E ✅
 (JSON + SSE) через живий хаб `:9999`** → **B2 SIMD bench ✅ (`PH-203` x86 / `PH-205`, 1.8–5.3×)**
@@ -43,11 +45,11 @@ live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; �
 | Метрика | Значення |
 |---------|----------|
 | `git status` | **clean** (0 drift) |
-| Коміти | **106** усього (`git rev-list --count HEAD`); **47** у drain-серії B0→PH-203t (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3 + PH-203r two weight rows + PH-203s measured-rejection bench/hooks + PH-203t measured-rejection wrows4/interleaved (docs+bench) + model-policy B12 docs; **pushed 2026-10-24**) |
-| Тести | **226** (207 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
+| Коміти | **107** усього (`git rev-list --count HEAD`); **48** у drain-серії B0→PH-1201 (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3 + PH-203r two weight rows + PH-203s measured-rejection bench/hooks + PH-203t measured-rejection wrows4/interleaved (docs+bench) + model-policy B12 docs + PH-1201 MiniCPM-V spike (inspect KV/histogram, BF16-fix); **pushed 2026-10-24**) |
+| Тести | **227** (208 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen; +5 ignored parity), 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
-| Rust LOC | **15073** (`src` 12287 + `tests` 1317 + `xtask` 319 + `benches` 1150; `wc -l`) |
+| Rust LOC | **15173** (`src` 12387 + `tests` 1317 + `xtask` 319 + `benches` 1150; `wc -l`) |
 | UI LOC (glue) | **157** (html+css+js) |
 | **Rust ratio** | **99.0%** (ціль 95–100 ✓) |
 | Docs LOC | 2524 (`git ls-files docs \| xargs wc -l`) |
@@ -68,7 +70,8 @@ live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; �
 | **B4** MoE-core | 🟡 | `PH-401..403` (router softmax/sigmoid/group, SwiGLU, shared) + `PH-406a` `moe_layer_forward` + **`PH-404` expert-cache LRU** (`src/cache.rs`, budgeted + pin + prefetch); parity/run/bench (405/406/407) open |
 | **B5** serve | 🟡 | PH-501a/b (std HTTP + real TextRunner), PH-502 (SSE), PH-503 (slot-cache), PH-504 (heartbeat), PH-505 (**metrics + per-process RAM**), PH-506 (serve integration tests ✅); **PH-507 hub provider-row E2E ✅ (`rusty-serve` через хаб, JSON+SSE)** |
 | B6 build-matrix(exe/bin/apk) / B7 docker / B8 supervisor / B9 dist-MoE / B10 UI / B11 distribs | ☐ | заплановано (бенди в роадмепі) |
-| **B12** vision (MiniCPM-V 4.7) | ☐ | цільова модель owner 2026-10-24: `src/vit.rs` + 4×/16× compressor + image-prefix + multimodal serve; `PH-1201..1206` (тікети на борді); Qwen3/Mixtral із цілей **прибрано**, Qwen2.5 = оракул |
+| **B12** vision (MiniCPM-V 4.7) | 🟡 | **`PH-1201` spike ✅ 2026-10-24** (`rusty inspect` KV+histogram, ваги у data/models/,research-дока); PH-1202/1203 (ViT-1152/27× + vit_merger, BF16) — далі; image-prefix (1204) **чекає B13** |
+| **B13** text-core qwen35 (гібрид GDN+full) | ☐ | відкриття `PH-1201`: 18 GDN-шарів (mixed qkv 6144, conv1d k4, delta-rule 16×128²) + 6 full-attn (GQA 8/2×256, **QK-norm**, q-gate) + zyxt-rope + pre `qwen35` + vocab 248 094; `PH-1301..1306`, оракул `llama.cpp-omni` |
 
 **Між конекцій:** від токена до logits стек повний — `config → validate → dequant → embed →
 block_forward → sampler → BPE` — і реальна геометрія Qwen2.5 підтверджена (`rusty validate` = OK).
@@ -102,7 +105,9 @@ vLLM v0.28 / SGLang v0.5.19 (RadixArk) / TensorRT-LLM v1.2.1 / llama.cpp / ktran
 закрито**, matmul виведено на load-port/FMA-межу (77 % prefill, gate/up 81–92 GMAC/s, down
 64–69). **`PH-203s` (attention softmax) і `PH-203t` (matmul w_rows=4 + NT-store) — обидва
 виміряно й відкинуто 2026-10-24; левери prefill закрито до NEON.**
-Наступний зріз — **`PH-1201`**: B12 spike — official `MiniCPM-V-4.7-1B-gguf` +
-`rusty inspect` віжен-тензорів → `docs/research/minicpm-v-4.7.md` (model target, owner
-2026-10-24; підлеглі `PH-1202..1206` на борді). Готові green-зрізи далі: NEON arm64
-(`PH-203`) · `PH-501` (axum serve) · важкі/інфра-бенди (B6/B7).
+Наступний зріз — **`PH-1301`**: бенд **B13** — text-core `qwen35`-гібрид (`model.rs`
+config/Geometry/validate → GDN 1302 → full-attn 1303 → pre-tokenizer/runner 1304 →
+E2E greedy-паритет проти `llama.cpp-omni` CLI + perf 1305 → serve 1306). B12 vision
+(1202/1203, `PH-1201` spike готовий — `docs/research/minicpm-v-4.7.md`) — паралельно;
+image-prefix (1204) чекає B13. Готові green-зрізи далі: NEON arm64 (`PH-203`) · `PH-501`
+(axum serve) · важкі/інфра-бенди (B6/B7).
