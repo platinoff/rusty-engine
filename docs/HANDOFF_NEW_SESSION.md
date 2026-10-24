@@ -7,23 +7,23 @@
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | PH-203s **rejection** (див. §Продовження 26 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o без змін |
-| Гейт | fmt ok · clippy `-D` **0** · **225** тести (206 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
-| Код | Rust **14990** LOC (src 12237 / tests 1317 / xtask 319 / benches 1117), UI 157 → ratio **99.0 %** · 68 tracked files · docs 2479+ LOC |
+| HEAD / origin | PH-203s **rejection** + PH-203t **rejection** (див. §Продовження 26–27 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін |
+| Гейт | fmt ok · clippy `-D` **0** · **226** тести (207 lib + 5 dense-gen + 4 scaffold + 5 serve + 5 text-gen) + 5 `#[ignore]` parity, усі зелені |
+| Код | Rust **15073** LOC (src 12287 / tests 1317 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 68 tracked files · docs 2479+ LOC |
 | Prefill (live `:8090`, 12 потоків, 961 tok) | **5.3–6.4 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 4.1–4.7 s (~77 %) · attention 0.74–0.78 s (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42) · gate/up **81–92** · swiglu 122–132 ms · rope 32–35 ms · other **2.4–3 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
 | Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…r; recapture PH-203s збігся з ним байт-у-байт і не застосовувався (зріз відкату) |
 | Живий білд | `target/release/rusty.exe` + `target/live/launch_serve.vbs` (CRLF!), `threads.txt`=12, `profile.txt`=1, звіт `target/live/rusty_prof.err.log` |
 
-**Далі:** attention у prefill **закрито softmax-левером** — `PH-203s` (онлайн-блокування +
-exp-таблиця) виміряно в `benches/attn.rs` і відкинуто: стейдж спирається у `dot_f32_x4`/axpy,
-не в `exp`. Наступний зріз `PH-203t` — памʼять matmul (`r_block`, non-temporal store на
-wide-out) з A/B у `benches/kquant.rs`: matmul упирається у load-port/FMA-межу
-(`6 loads / 8 FMA` = 2.67 FMA/цикл при 8 ланцюгах), тож там виграш лише з памʼяті, не з циклу.
-Потім NEON (B2), B6/B7. **Паралельно (owner 2026-10-24): модельна політика + бенд B12 —**
-цільова модель **MiniCPM-V 4.7** (official GGUF, без Python; `src/vit.rs` + 4×/16×
-compressor + image-prefix + multimodal serve; `PH-1201..1206` на борді GSV; Qwen3/Mixtral
-з цілей прибрано, Qwen2.5 = оракул).
+**Далі:** обидва perf-левери prefill закриті виміром: `PH-203s` (attention softmax — не
+exp-bound, `benches/attn.rs`) і `PH-203t` (matmul `w_rows=4` quad-pass + NT-store — без
+стійкого пул-виграшу, на wide down мінус, §Продовження 27). Продакшн ядра лишились
+PH-203r-подібні (bit-identical, golden не рухався). Наступний зріз — **`PH-1201`** (бенд
+**B12**: official MiniCPM-V 4.7-1B GGUF + `rusty inspect` vision-layout → `docs/research/
+minicpm-v-4.7.md`); perf-черга відкривається з NEON (B2) після B12-spike. **Паралельно
+(owner 2026-10-24): модельна політика** — цільова модель **MiniCPM-V 4.7** (official GGUF,
+без Python; `src/vit.rs` + 4×/16× compressor + image-prefix + multimodal serve;
+`PH-1201..1206` на борді GSV; Qwen3/Mixtral з цілей прибрано, Qwen2.5 = оракул).
 
 ## Що було зроблено (B0, campaign 2026-10-14)
 
@@ -912,4 +912,36 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
 - **Далі:** attention у prefill закрито виміром (не softmax-lever). Наступний зріз
   `PH-203t` — памʼять matmul (`r_block`, non-temporal store на wide-out) з A/B у
   `benches/kquant.rs`; потім NEON (B2) і B6–B11.
+
+### Продовження 27 — 2026-10-24: PH-203t — w_rows=4 quad-pass і NT-store: ВІМІРЯНО й ВІДКИНУТО
+
+- **Plumbing:** `matmul_reuse` clamp піднято до 4; quad-pass = два `dot_f32_x4x2` по **одному
+  й тому самому** activation-quad → X-тайл стрімиться `m/4`, а не `m/2` разів на проєкцію;
+  `rowbuf3/4` аллокуються лише при `w_rows == 4` (продакшн-шлях не видихає нічого).
+  Біт-ідентичність гарантована структурою (кожен вихід — своя 8-ланьова цеп):
+  `matmul_four_weight_rows_is_bit_identical` (m=9 — лесідра 4→2→1).
+- **Пулове A/B, три проходи `benches/kquant.rs` + `quant.rs` (GMAC/s, min):**
+  | форма · тайл | wr2 | wr4 |
+  |---|---|---|
+  | gate/up Q6_K t96 (3 проходи) | 87.8 / 92.0 / 86.7 | 89.2 / 89.4 / 82.9 |
+  | down Q6_K t96 | 78.7 / 79.7 / 98.3 | **39.0 / 76.2 / 65.5** |
+  | down Q6_K t48 | 94.3 / 104.6 / 98.1 | 91.8 / 96.6 / 93.8 |
+  | gate/up Q5_0 t96 (1 прохід quant.rs) | 92.4 | 96.2 |
+  Жодного стійкого виграшу; на wide down — стійкий мінус (4×19.4 KiB rowbuf-ів на воркер
+  звалив спільний L3 — четверте підтвердження ефекту PH-203n/q).
+- **NT-store:** пораховано, не мірялось — `out` пишеться по одному разу; write+RFO трафік
+  gate/up ≈ 37 MB/проєкцію проти ~250–400 GB/s сукупного stage → верхня межа виграшу
+  **<1 %**; `stream`-store вимагав би вирівнювання стридів — не варте риски.
+- **Побічна знахідка (методологія):** послідовні тайл-свіпи брешуть на цьому боксі — новий
+  **interleaved t48-vs-t96 (12 раундів, per-round win count)** у `kquant.rs`: min
+  43.5 vs 43.5 мс, **t48 виграв 11/12 по медіані** → тайл впливає на хвіст розподілу, не на
+  best-case; `MATMUL_ROW_TILE_K = 96` лишається, але черговий тайл-зріз мірити лише
+  альтернованими раундами.
+- **Рішення:** продакшн `MATMUL_W_ROWS = 2` без змін; чисельно все біт-у-біт — golden не
+  рухався (`--ignored` 5/5 ok, включно з llama-rs oracle). Хуки `wrows(...,4)` +
+  інтерлейвд-блок у бенчах лишились як доказ.
+- **Гейт:** fmt ok · clippy `-D` 0 · **226** тестів (207 lib + 5 dense + 4 scaffold + 5 serve
+  + 5 text-gen) + 5 ignored; Rust **15073** LOC, ratio **99.0 %**; serve перезапущено.
+- **Далі:** perf-черга matmul закрита до NEON/B12-контексту; наступний зріз — **`PH-1201`**
+  (B12 spike: official MiniCPM-V 4.7-1B GGUF + `rusty inspect` vision-layout).
 

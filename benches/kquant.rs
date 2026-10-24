@@ -195,9 +195,10 @@ fn main() {
         );
 
         // PH-203r: pairing two weight rows changes which tile the pool wants, so the two knobs
-        // are measured together instead of reusing the single-row conclusion.
+        // are measured together instead of reusing the single-row conclusion. PH-203t extends
+        // the sweep to four rows per activation quad (X streamed m/4 per projection).
         println!("  pooled w_rows x tile (min of 3, GMAC/s):");
-        for wr in [1usize, 2] {
+        for wr in [1usize, 2, 4] {
             let mut line = format!("    w_rows {wr}:");
             for &tile in &[24usize, 48, 96, 192] {
                 let mut ms = f64::INFINITY;
@@ -210,6 +211,37 @@ fn main() {
                 line.push_str(&format!("  t{tile:<3} {:>6.2}", mac / (ms / 1e3)));
             }
             println!("{line}");
+        }
+
+        // PH-203t: back-to-back pooled sweeps disagree on whether the down Q6_K optimum is
+        // t48 or t96 — the box drifts faster than the sweep runs. Alternate the two configs
+        // inside one round and count round wins: drift hits both arms equally.
+        if label.trim_start().starts_with("down") && ty == 14 {
+            let mut m48 = f64::INFINITY;
+            let mut m96 = f64::INFINITY;
+            let mut wins48 = 0u32;
+            let mut rounds = 0u32;
+            for _ in 0..12 {
+                let t48 = time(1, || {
+                    black_box(pool_matmul(ty, &w, m, n, &x, rows, 48, 2));
+                })
+                .as_secs_f64()
+                    * 1e3;
+                let t96 = time(1, || {
+                    black_box(pool_matmul(ty, &w, m, n, &x, rows, 96, 2));
+                })
+                .as_secs_f64()
+                    * 1e3;
+                if t48 < t96 {
+                    wins48 += 1;
+                }
+                rounds += 1;
+                m48 = m48.min(t48);
+                m96 = m96.min(t96);
+            }
+            println!(
+                "  interleaved t48 vs t96 ({rounds} rounds): min {m48:.1} vs {m96:.1} ms · t48 wins {wins48}/{rounds}"
+            );
         }
     }
 }

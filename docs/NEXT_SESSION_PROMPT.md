@@ -3,17 +3,20 @@
 ## Сталий стан (2026-10-24) — почати звідси
 
 - **Owner product pick: `rusty-engine`** (не автоматично: Step 0 питає продукт; тут — вже обраний).
-- HEAD = `origin/main` (PH-203s rejection; код forward = PH-203r), clean; гейт fmt/clippy-0/**225** тести (+5 ignored) зелений.
+- HEAD = `origin/main` (PH-203s + PH-203t rejections; код forward/ядра = PH-203r), clean; гейт fmt/clippy-0/**226** тести (+5 ignored) зелений.
 - Перф-серія prefill: 961 tok **190.9 s → 5.3–6.4 s** (розкид = фонове навантаження боксу); matmul 4.1–4.7 s (77 %), attention 0.74–0.78 s (13.9 %), down `896×4864` **64–69 GMAC/s** (було 36–42), gate/up **81–92**, swiglu 122–132 ms, rope 32–35 ms, other **2.4–3 %** (див. `docs/STATUS.md`).
 - **`PH-203s` закрито виміром (2026-10-24):** онлайн-softmax блоками по KV + exp-таблиця
   реалізовані й прогнані в `benches/attn.rs` (min-of-5, один процес): **+8–15 % проти
   3-pass libm** — стейдж не exp-bound, а score-dot/axpy-bound; skip `p<1e-8` не спрацьовує.
   Продакшн `forward.rs` відкату до PH-203o (golden не зрушив — recapture збігся і не
   застосований). Хуки `kernel::exp_neg_fast`/`exp2_table_ref` лишились для бенчу.
-- **Наступний зріз `PH-203t`:** памʼять matmul — `r_block` і non-temporal store на wide-out
-  (`benches/kquant.rs` A/B, біт-у-біт або окрема чисельна зміна з owner-питанням). Далі:
-  NEON (B2), B6–B11 (build-matrix/docker/fleet/dist-MoE/UI). Плейбук агента:
-  `docs/HANDOFF_NEW_SESSION.md` §Продовження 20–26.
+- **`PH-203t` (2026-10-24) — закрито виміром:** `w_rows=4` quad-pass (X-тайл стрімиться `m/4`)
+  не дає стійкого пул-виграшу (gate/up +1.5…−4.4 %; down Q6_K t96 **мінус до −50 %** — 4
+  rowbuf-и звалюють спільний L3, четверте підтвердження ефекту PH-203n/q); NT-store на `out`
+  — верхня межа <1 %, пораховано й пропущено. Продакшн `MATMUL_W_ROWS = 2`, golden не рухався
+  (біт-у-біт); хуки + **interleaved t48-vs-t96** (t48 11/12 по медіані, min паритет) лишились
+  у бенчах. **Наступний зріз — `PH-1201`** (B12 spike); perf-черга відкривається з NEON (B2).
+  Плейбук агента: `docs/HANDOFF_NEW_SESSION.md` §Продовження 20–27.
 - **Модельна політика (owner 2026-10-24):** цільова модель = **MiniCPM-V 4.7**
   (1B + 35B-A3B MoE; official-GGUF з HF, Apache-2.0; Python-репо OpenBMB — лише джерело
   ваг/специфікації, у рантаймі його немає). Qwen3-30B-A3B / Mixtral **прибрано з цілей**;

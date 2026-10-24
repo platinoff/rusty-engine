@@ -1357,12 +1357,15 @@ const MATMUL_ROW_GROUP: usize = 4;
 /// explicit so the bench can still A/B a smaller block.
 const MATMUL_R_BLOCK: usize = 1024;
 
-/// Weight rows processed per pass over the activation tile (`PH-203r`).
+/// Weight rows processed per pass over the activation tile (`PH-203r`, sweep extended to 4
+/// for `PH-203t`).
 ///
 /// Two rows halve the weight loads per FMA in the inner block ([`dot_f32_x4x2_dispatch`]) at the
 /// cost of a second `rowbuf` (19.5 KiB at `n = 4864`, both live in L1). Measured on the
 /// `896 × 4864` down projection and the `4864 × 896` gate/up pair (`benches/quant.rs`); the
-/// golden moved into the same accumulation order, so the path stays bit-identical.
+/// golden moved into the same accumulation order, so the path stays bit-identical. Four rows
+/// run two pairs over the SAME activation quad, so the X tile streams `m/4` times per
+/// projection instead of `m/2` — production keeps two until the pooled sweep says otherwise.
 const MATMUL_W_ROWS: usize = 2;
 
 /// Batched `W[m×n] · X[rows×n] → Out[rows×m]`. Each weight row is dequantized **once per
@@ -1394,7 +1397,7 @@ fn matmul_reuse(
     debug_assert_eq!(x.len(), rows * n, "matmul: X rows × n");
     let tile = tile.max(1);
     let group = group.clamp(1, 8);
-    let w_rows = w_rows.clamp(1, 2);
+    let w_rows = w_rows.clamp(1, 4);
     let r_block = r_block.max(1);
     let blocks = n / block_vals;
     let row_bytes = blocks * block_bytes;
@@ -1402,6 +1405,16 @@ fn matmul_reuse(
     let mut out = vec![0.0f32; rows * m];
     let mut rowbuf = vec![0.0f32; n];
     let mut rowbuf2 = vec![0.0f32; n];
+    let mut rowbuf3 = if w_rows == 4 {
+        vec![0.0f32; n]
+    } else {
+        Vec::new()
+    };
+    let mut rowbuf4 = if w_rows == 4 {
+        vec![0.0f32; n]
+    } else {
+        Vec::new()
+    };
     let mut rb0 = 0;
     while rb0 < m {
         let rb1 = (rb0 + r_block).min(m);
@@ -1410,7 +1423,29 @@ fn matmul_reuse(
             let r1 = (r0 + tile).min(rows);
             let mut r = rb0;
             while r < rb1 {
-                if w_rows >= 2 && group == 4 && r + 1 < rb1 {
+                if w_rows >= 4 && group == 4 && r + 3 < rb1 {
+                    for (dst, src) in [
+                        (&mut rowbuf, r),
+                        (&mut rowbuf2, r + 1),
+                        (&mut rowbuf3, r + 2),
+                        (&mut rowbuf4, r + 3),
+                    ] {
+                        dequant_row(
+                            &w[src * row_bytes..(src + 1) * row_bytes],
+                            dst,
+                            block_bytes,
+                            block_vals,
+                            &dq,
+                        );
+                    }
+                    // Two pairs over the SAME activation quad: the second pass hits L1/L2
+                    // instead of re-streaming the tile, so the X tile is walked m/4 times
+                    // per projection instead of m/2 (`PH-203t`). Each output still keeps
+                    // its own 8-lane chain — bit-identical to the one-row-per-pass path.
+                    dot_tile_rows_pair(&rowbuf, &rowbuf2, x, n, m, r, r0, r1, &mut out);
+                    dot_tile_rows_pair(&rowbuf3, &rowbuf4, x, n, m, r + 2, r0, r1, &mut out);
+                    r += 4;
+                } else if w_rows >= 2 && group == 4 && r + 1 < rb1 {
                     for (dst, src) in [(&mut rowbuf, r), (&mut rowbuf2, r + 1)] {
                         dequant_row(
                             &w[src * row_bytes..(src + 1) * row_bytes],
@@ -2634,6 +2669,21 @@ mod tests {
         let two = matmul_q5_0_wrows(&w, m, n, &x, rows, MATMUL_ROW_TILE, 2);
         assert_eq!(two, one, "two weight rows per pass changed the result");
         assert_eq!(matmul_q5_0_dispatch(&w, m, n, &x, rows), one);
+    }
+
+    #[test]
+    fn matmul_four_weight_rows_is_bit_identical() {
+        // PH-203t: four weight rows run two pairs over the same activation quad, so the tail
+        // ladder must fall through 4 → 2 → 1 (m = 9, rows = 70) and still match the single-row
+        // path bit for bit.
+        let (m, n, rows) = (9usize, 64usize, 70usize);
+        let x: Vec<f32> = (0..rows * n)
+            .map(|i| ((i as i32 * 5 % 19) as f32) * 0.03 - 0.4)
+            .collect();
+        let w = q5_blocks(m * n / 32);
+        let one = matmul_q5_0_wrows(&w, m, n, &x, rows, MATMUL_ROW_TILE, 1);
+        let four = matmul_q5_0_wrows(&w, m, n, &x, rows, MATMUL_ROW_TILE, 4);
+        assert_eq!(four, one, "four weight rows per pass changed the result");
     }
 
     #[test]

@@ -486,8 +486,9 @@ fn main() {
             );
         }
         // PH-203r: pair two dequantized weight rows per pass so the inner block runs
-        // 2 weight + 4 activation loads for 8 FMAs (6/8) instead of 5/4.
-        let wrs = [1usize, 2];
+        // 2 weight + 4 activation loads for 8 FMAs (6/8) instead of 5/4. PH-203t adds four
+        // rows per quad (two pairs over the same activation tile → X streamed m/4 times).
+        let wrs = [1usize, 2, 4];
         let mut bw = vec![f64::INFINITY; wrs.len()];
         let mut pw = vec![f64::INFINITY; wrs.len()];
         for _ in 0..5 {
