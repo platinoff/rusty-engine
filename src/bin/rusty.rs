@@ -20,6 +20,7 @@ fn main() {
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  config <file>             read model hyperparameters (PH-305c)");
             println!("  validate <file>           check tensor names/dims vs config (PH-305e)");
+            println!("  tokenize -m <f> -p <txt>  BPE token ids, no weights      (PH-1305)");
             println!("  run -m <model> -p <text>  BPE text generation        (PH-306b)");
             println!("  run -m <model> -t <ids>   numeric-token greedy       (PH-306)");
             println!(
@@ -60,6 +61,7 @@ fn main() {
                 std::process::exit(2);
             }
         },
+        Some("tokenize") => tokenize_cmd(args),
         Some("run") => run(args),
         Some("serve") => serve_cmd(args),
         Some("heartbeat") => heartbeat_cmd(),
@@ -300,6 +302,64 @@ fn validate(path: &str) {
     }
 }
 
+/// `rusty tokenize -m <model.gguf> -p "text"` — dump BPE token ids with no weight load
+/// (the `PH-1305` pin pair against llama.cpp's `llama-tokenize`).
+fn tokenize_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
+    let mut model_path: Option<String> = None;
+    let mut prompt: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-m" | "--model" => model_path = args.next(),
+            "-p" | "--prompt" => prompt = args.next(),
+            other => {
+                eprintln!("rusty tokenize: unknown arg '{other}'");
+                std::process::exit(2);
+            }
+        }
+    }
+    let path = match model_path {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: rusty tokenize -m <model.gguf> -p \"text\"");
+            std::process::exit(2);
+        }
+    };
+    let text = match prompt {
+        Some(t) => t,
+        None => {
+            eprintln!("rusty tokenize: -p <text> is required");
+            std::process::exit(2);
+        }
+    };
+    let file = match rusty_engine::gguf::parse_file(
+        Path::new(&path),
+        rusty_engine::gguf::INSPECT_WINDOW,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("rusty tokenize {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let meta = rusty_engine::tokenizer::TokenizerMeta::from_file(&file);
+    let bpe = rusty_engine::tokenizer::Bpe::from_meta(meta);
+    let ids = match bpe.encode(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rusty tokenize: {e:?}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "{}",
+        ids.iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    std::process::exit(0);
+}
+
 /// `rusty run -m <model.gguf> (-p "text" | -t "0,1,2") [--max-tokens N]` — dense greedy
 /// generation. `-p` runs the BPE text pipeline (PH-306b); `-t` uses numeric token ids (PH-306).
 fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
@@ -307,6 +367,7 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
     let mut tokens: Vec<u32> = Vec::new();
     let mut prompt: Option<String> = None;
     let mut max_new = 8usize;
+    let mut top_k = 0usize;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-m" | "--model" => model_path = args.next(),
@@ -330,6 +391,14 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
                 max_new = args.next().map_or(8, |v| {
                     v.parse::<usize>().unwrap_or_else(|_| {
                         eprintln!("rusty run: bad --max-tokens");
+                        std::process::exit(2)
+                    })
+                })
+            }
+            "--top-k" => {
+                top_k = args.next().map_or(5, |v| {
+                    v.parse::<usize>().unwrap_or_else(|_| {
+                        eprintln!("rusty run: bad --top-k");
                         std::process::exit(2)
                     })
                 })
@@ -370,6 +439,21 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
                     std::process::exit(1);
                 }
             };
+            if top_k > 0 {
+                let steps = match tr.trace_text(&text, max_new, top_k) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("rusty run {path}: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                for (i, s) in steps.iter().enumerate() {
+                    let top: Vec<String> =
+                        s.top.iter().map(|(t, l)| format!("{t}:{l:.6}")).collect();
+                    println!("{i}\t{}\t{}", s.token, top.join(" "));
+                }
+                std::process::exit(0);
+            }
             match tr.run_text(&text, max_new) {
                 Ok(got) => println!("[{}] {}", tr.runner.n_layers, got),
                 Err(e) => {

@@ -112,7 +112,8 @@ impl Q35Kv {
 }
 
 /// The one gate convention `PH-1305` pins against the oracle: the attention output gate
-/// is the sigmoid of the second half of the q projection (Qwen3-Next `attention_output_gate`).
+/// is the **sigmoid** of the per-head interleaved gate rows of `attn_q` (Qwen3-Next
+/// `attention_output_gate`; silu there was the rejected candidate — `qwen35.cpp:329-335`).
 fn gate_act(z: f32) -> f32 {
     1.0 / (1.0 + (-z).exp())
 }
@@ -158,7 +159,9 @@ fn attend_row(q_head: &[f32], kv: &Q35Kv, g: &Q35Geom, h: usize, pos: usize, dst
 }
 
 /// Project + norm + rotate one row's q/k/v and append the K/V rows to the cache.
-/// Returns the normed+rotated q (width `2·q_dim`: q rows then the raw gate rows).
+/// `attn_q` rows are **per-head interleaved `[q | gate]`** (stride `2·hd`, gate at `+hd`
+/// inside each head — the oracle views, `qwen35.cpp:275-299`); the returned width
+/// `2·q_dim` vector stays in block layout: normed+rotated q rows, then the raw gate rows.
 fn project_rope_append(
     w: &Q35Weights<'_>,
     g: &Q35Geom,
@@ -172,10 +175,10 @@ fn project_rope_append(
     let qd = g.q_dim();
     let mut out = vec![0.0f32; 2 * qd];
     let mut buf = vec![0.0f32; g.hd];
-    // The gate half is copied raw (post-attention it feeds `gate_act`).
-    out[qd..2 * qd].copy_from_slice(&qg[qd..2 * qd]);
     for h in 0..g.n_heads {
-        head_norm(&qg[h * g.hd..(h + 1) * g.hd], w.q_norm, g.eps, &mut buf);
+        let src = h * 2 * g.hd;
+        out[qd + h * g.hd..qd + (h + 1) * g.hd].copy_from_slice(&qg[src + g.hd..src + 2 * g.hd]);
+        head_norm(&qg[src..src + g.hd], w.q_norm, g.eps, &mut buf);
         rope_partial_inplace(&mut buf, pos, g);
         out[h * g.hd..(h + 1) * g.hd].copy_from_slice(&buf);
     }

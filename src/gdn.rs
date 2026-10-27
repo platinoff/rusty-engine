@@ -14,7 +14,8 @@
 //! prefill and a step-by-step decode land on bit-identical states (unit-tested).
 //!
 //! Constants follow fla/Qwen3-Next Gated DeltaNet: L2-normalized q/k heads, query scale
-//! `dk^-0.5`, per-group log-decay `g = -exp(A_log)·softplus(a + dt_bias)`, `beta =
+//! `dk^-0.5`, per-group log-decay `g = ssm_a·softplus(a + dt_bias)` (the stored `ssm_a`
+//! is already `-exp(A_log)`), `beta =
 //! sigmoid(b)`, and a **gated** head RMSNorm `rmsnorm(o)·weight·swish(z)` before
 //! `ssm_out`. `PH-1305` pins every constant against the llama.cpp-omni oracle; where a
 //! convention could differ (swish vs sigmoid gate), the code says so in ONE place.
@@ -78,7 +79,9 @@ pub struct GdnWeights<'a> {
     pub beta: &'a QMat,
     /// `blk.N.ssm_out.weight` — output projection, `[d_model, inner]`.
     pub out: &'a QMat,
-    /// `blk.N.ssm_a` — `A_log`, `[groups]`.
+    /// `blk.N.ssm_a` — stored **already negated-and-exponentiated** as `-exp(A_log)`
+    /// (OpenBMB converter `conversion/qwen.py:297`); the oracle multiplies it straight
+    /// into the softplus (`qwen35.cpp:379`), so we must not re-apply `exp`, `[groups]`.
     pub a_log: &'a [f32],
     /// `blk.N.ssm_dt.bias` — `[groups]`.
     pub dt_bias: &'a [f32],
@@ -179,21 +182,25 @@ fn gate_act(z: f32) -> f32 {
 }
 
 /// Normalize a q/k head (L2) and fold the query scale `dk^-0.5` into q — fla's
-/// `use_qk_l2norm_in_kernel`.
-fn l2norm_scale(x: &mut [f32], q_scale: f32) {
-    let norm = x.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        let f = q_scale / norm;
-        for v in x.iter_mut() {
-            *v *= f;
-        }
+/// `use_qk_l2norm_in_kernel`. Matches the oracle's `build_gdn_l2_norm`
+/// (`src/models/models.h:14-18`): `ggml_scale(ggml_rms_norm(x, eps/n), 1/sqrt(n))` collapses
+/// to `x / sqrt(Σx² + eps)` — the eps sits **inside** the root (no `max(norm, 1e-6)` floor)
+/// and there is no scale of its own; the kernel applies `1/sqrt(dk)` at the readout
+/// (`ggml/src/ggml-cpu/ops.cpp`, `const float scale = 1.0f / sqrtf((float) S_v)`), which is
+/// the same product in a different order, so folding it into q here is equivalent.
+fn l2norm_scale(x: &mut [f32], scale: f32, eps: f32) {
+    let sum = x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() as f32;
+    let f = scale / (sum + eps).sqrt();
+    for v in x.iter_mut() {
+        *v *= f;
     }
 }
 
-/// Per-token, per-group scalars: log-decay `g = -exp(A_log)·softplus(a + dt_bias)` and
+/// Per-token, per-group scalars: log-decay `g = ssm_a·softplus(a + dt_bias)` (stored
+/// `ssm_a` is already `-exp(A_log)` — re-exponentiating it was the PH-1305 pin bug) and
 /// write strength `beta = sigmoid(b)` (shared by the two passes for identical bits).
 fn gates(w: &GdnWeights<'_>, a_row: &[f32], b_row: &[f32], h: usize) -> (f32, f32) {
-    let g_log = -(w.a_log[h].exp()) * softplus(a_row[h] + w.dt_bias[h]);
+    let g_log = w.a_log[h] * softplus(a_row[h] + w.dt_bias[h]);
     (g_log.exp(), 1.0 / (1.0 + (-b_row[h]).exp()))
 }
 
@@ -216,8 +223,8 @@ pub fn gdn_decode_step(w: &GdnWeights<'_>, g: &GdnGeom, x: &[f32], st: &mut GdnS
     for h in 0..g.groups {
         qh.copy_from_slice(&conv_out[h * g.dk..(h + 1) * g.dk]);
         kh.copy_from_slice(&conv_out[g.inner + h * g.dk..g.inner + (h + 1) * g.dk]);
-        l2norm_scale(&mut qh, q_scale);
-        l2norm_scale(&mut kh, 1.0);
+        l2norm_scale(&mut qh, q_scale, w.eps);
+        l2norm_scale(&mut kh, 1.0, w.eps);
         let v = &conv_out[2 * g.inner + h * g.dv..2 * g.inner + (h + 1) * g.dv];
         let (decay, beta) = gates(w, &a, &b, h);
         let s = &mut st.s[h * g.dk * g.dv..(h + 1) * g.dk * g.dv];
@@ -244,7 +251,10 @@ fn head_norm_gate(o: &[f32], weight: &[f32], eps: f32, z: &[f32], dv: usize, dst
 }
 
 /// Causal depthwise conv over the mixed qkv vector: the window (`conv-1` rows, oldest
-/// first) plus the fresh row, kernel applied in chronological order.
+/// first) plus the fresh row, kernel applied in chronological order, then **SiLU on
+/// every channel** — the oracle activates `conv_output_silu = ggml_silu(ssm_conv(...))`
+/// before the q/k/v view and L2-norm (`qwen35.cpp:397-403,432-435`); the window keeps
+/// the raw pre-conv projections.
 fn conv_row(w: &GdnWeights<'_>, g: &GdnGeom, win: &[f32], fresh: &[f32]) -> Vec<f32> {
     let c = g.qkv_dim();
     let k = g.conv;
@@ -261,7 +271,7 @@ fn conv_row(w: &GdnWeights<'_>, g: &GdnGeom, win: &[f32], fresh: &[f32]) -> Vec<
             };
             acc += w.conv_w[ch * k + j] * src;
         }
-        out[ch] = acc;
+        out[ch] = gate_act(acc);
     }
     out
 }
@@ -316,8 +326,8 @@ pub fn gdn_prefill(
             let xrow = &conv_out[i * c..(i + 1) * c];
             qh.copy_from_slice(&xrow[h * g.dk..(h + 1) * g.dk]);
             kh.copy_from_slice(&xrow[g.inner + h * g.dk..g.inner + (h + 1) * g.dk]);
-            l2norm_scale(&mut qh, q_scale);
-            l2norm_scale(&mut kh, 1.0);
+            l2norm_scale(&mut qh, q_scale, w.eps);
+            l2norm_scale(&mut kh, 1.0, w.eps);
             let v = &xrow[2 * g.inner + h * g.dv..2 * g.inner + (h + 1) * g.dv];
             let (decay, beta) = gates(
                 w,
@@ -531,7 +541,8 @@ mod tests {
             acc_row = r;
         }
         for (ch, &got) in acc_row.iter().enumerate() {
-            let want: f32 = (0..g.conv).map(|j| w.conv_w[ch * g.conv + j] * 0.2).sum();
+            let raw: f32 = (0..g.conv).map(|j| w.conv_w[ch * g.conv + j] * 0.2).sum();
+            let want = gate_act(raw);
             assert!((got - want).abs() < 1e-6, "channel {ch}");
         }
     }
@@ -544,5 +555,86 @@ mod tests {
         let mut st = GdnState::new(&g);
         let out = gdn_decode_step(&w, &g, &vec![0.0f32; dm], &mut st);
         assert_eq!(out, vec![0.0f32; dm], "v=0 ⇒ no writes ⇒ core=0 ⇒ out=0");
+    }
+
+    // ── PH-1305 convention pins (each one is a place the oracle could have differed) ──
+
+    /// The gated-norm activation is **SiLU**, not sigmoid: `build_norm_gated` multiplies by
+    /// `ggml_silu(z)` (`qwen35.cpp:255-264`). `x=2` separates them (1.7616 vs 0.8808).
+    #[test]
+    fn gate_act_is_silu_not_sigmoid() {
+        let silu2 = 2.0f32 * (1.0 / (1.0 + (-2.0f32).exp()));
+        assert!((gate_act(2.0) - silu2).abs() < 1e-6, "silu(2) = {silu2}");
+        assert!(
+            (gate_act(2.0) - 1.0 / (1.0 + (-2.0f32).exp())).abs() > 0.5,
+            "sigmoid was the rejected candidate"
+        );
+        assert_eq!(gate_act(0.0), 0.0, "silu(0) = 0");
+    }
+
+    /// `ssm_a` is stored **already negated and exponentiated** (`-exp(A_log)`, negative in
+    /// the real file: `blk.0.ssm_a = -1.2890509 …`), and the oracle multiplies it straight
+    /// into the softplus (`qwen35.cpp:379`). Re-applying `exp` — the bug this band fixed —
+    /// would turn the decay into `exp(exp(·))`.
+    #[test]
+    fn ssm_a_is_used_verbatim_never_re_exponentiated() {
+        // The real file's first two values (`blk.0.ssm_a`), both negative.
+        let real = [-1.289_050_9f32, -0.131_171_45];
+        let t = toy_weights();
+        let mut w = toy_views(&t);
+        w.a_log = &real;
+        let (a_row, b_row) = ([0.3f32, -0.2], [0.5f32, 1.0]);
+        let (decay, beta) = gates(&w, &a_row, &b_row, 0);
+        let want = (real[0] * softplus(a_row[0] + w.dt_bias[0])).exp();
+        assert_eq!(decay, want, "decay = exp(ssm_a · softplus(a + dt_bias))");
+        assert!(
+            decay < 1.0,
+            "a negative ssm_a must decay the state: {decay}"
+        );
+        // Re-exponentiating the stored value would land somewhere else entirely.
+        let re_exp = (real[0].exp() * softplus(a_row[0] + w.dt_bias[0])).exp();
+        assert!(
+            (decay - re_exp).abs() > 1e-2,
+            "decay {decay} is too close to the re-exponentiated {re_exp}"
+        );
+        assert_eq!(beta, 1.0 / (1.0 + (-b_row[0]).exp()), "beta = sigmoid(b)");
+    }
+
+    /// L2 norm with **eps inside the root** and no scale of its own — `build_gdn_l2_norm`
+    /// (`models.h:14-18`). A `max(norm, 1e-6)` floor (the rejected candidate) blows a tiny
+    /// head up to unit length instead of shrinking it.
+    #[test]
+    fn l2norm_puts_eps_inside_the_root() {
+        let mut tiny = [1e-4f32];
+        l2norm_scale(&mut tiny, 1.0, 1e-6);
+        let want = 1e-4 / (1e-8f32 + 1e-6).sqrt();
+        assert!((tiny[0] - want).abs() < 1e-9, "got {} want {want}", tiny[0]);
+        assert!(tiny[0] < 0.1, "a floored norm would give 100, not {want}");
+
+        // Unit-scale head: scale folds in linearly, and `dk^-0.5` is the only extra factor.
+        let mut head = [3.0f32, 4.0];
+        l2norm_scale(&mut head, 0.5, 0.0);
+        assert!((head[0] - 0.3).abs() < 1e-6 && (head[1] - 0.4).abs() < 1e-6);
+    }
+
+    /// The conv carries **raw** projections in its window and applies SiLU once, on the
+    /// output (`conv_output_silu = ggml_silu(ssm_conv(...))`, `qwen35.cpp:397-403`).
+    /// Pre-activating the window would make the second token see `silu(x)` instead of `x`.
+    #[test]
+    fn conv_window_holds_raw_rows_and_silu_is_applied_once() {
+        let (g, _dm) = toy();
+        let t = toy_weights();
+        let w = toy_views(&t);
+        let c = g.qkv_dim();
+        let fresh = vec![0.4f32; c];
+        let mut win = vec![0.0f32; (g.conv - 1) * c];
+        let _ = conv_row(&w, &g, &win, &fresh);
+        push_conv_window(&g, &mut win, &fresh);
+        let last = &win[win.len() - c..];
+        assert_eq!(last, &fresh[..], "the window keeps the pre-conv projection");
+        assert!(
+            (last[0] - gate_act(0.4)).abs() > 1e-3,
+            "the window must not be pre-activated"
+        );
     }
 }

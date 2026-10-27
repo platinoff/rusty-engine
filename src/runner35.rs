@@ -18,7 +18,7 @@
 
 use crate::core::{EngineError, Result};
 use crate::gdn::{gdn_decode_step, GdnGeom, GdnState, GdnWeights};
-use crate::infer::{argmax, rmsnorm};
+use crate::infer::{argmax, rmsnorm, top_k};
 use crate::loader::MmapModel;
 use crate::model::{LayerKind, ModelConfig};
 use crate::moe::swiglu;
@@ -292,6 +292,16 @@ pub struct Q35Decoder<'a> {
     seq_len: usize,
 }
 
+/// One step of a greedy trace: the token argmax picked plus the `k` best logits that
+/// produced it (the `PH-1305` numeric fingerprint — see [`crate::infer::top_k`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceStep {
+    /// Token emitted at this step.
+    pub token: u32,
+    /// Descending `(token, logit)` pairs for the step's logit vector.
+    pub top: Vec<(usize, f32)>,
+}
+
 impl<'a> Q35Decoder<'a> {
     pub fn new(runner: &'a Q35Runner) -> Self {
         Self {
@@ -341,5 +351,30 @@ impl<'a> Q35Decoder<'a> {
             }
         }
         seq
+    }
+
+    /// Greedy generate **with** the per-step top-`k` logits: same token stream as
+    /// [`Self::generate_incremental`] (one argmax per step), but every step also keeps
+    /// the ranking around the argmax — the `PH-1305` parity fingerprint against
+    /// llama.cpp's `logprobs` response.
+    pub fn generate_trace(&mut self, prompt: &[u32], max_new: usize, k: usize) -> Vec<TraceStep> {
+        assert!(!prompt.is_empty(), "q35 trace: empty prompt");
+        let mut logits = self.prefill(prompt);
+        let mut steps = Vec::with_capacity(max_new);
+        for _ in 0..max_new {
+            let tok = match argmax(&logits) {
+                Some(t) => t as u32,
+                None => break,
+            };
+            steps.push(TraceStep {
+                token: tok,
+                top: top_k(&logits, k),
+            });
+            if Some(tok) == self.runner.eos_token_id {
+                break;
+            }
+            logits = self.step(tok);
+        }
+        steps
     }
 }

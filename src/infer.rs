@@ -222,6 +222,21 @@ pub fn argmax(logits: &[f32]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// The `k` largest `(token, logit)` pairs, descending — the `PH-1305` numeric
+/// fingerprint (orderings survive what argmax ties hide). Stable on equal logits:
+/// ties keep the lower token id, so a dump is byte-reproducible.
+pub fn top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &b| {
+        logits[b]
+            .partial_cmp(&logits[a])
+            .unwrap_or(Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    idx.truncate(k.min(idx.len()));
+    idx.into_iter().map(|i| (i, logits[i])).collect()
+}
+
 /// Softmax temperature scaling (`temp<=0` is a no-op; greedy handled by [`argmax`]).
 pub fn apply_temperature(logits: &[f32], temp: f32) -> Vec<f32> {
     if temp <= 0.0 {

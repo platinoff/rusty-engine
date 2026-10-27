@@ -13,7 +13,7 @@ use crate::core::{EngineError, Result};
 use crate::loader::MmapModel;
 use crate::model::ModelConfig;
 use crate::runner::{DenseDecoder, DenseRunner};
-use crate::runner35::{Q35Decoder, Q35Runner};
+use crate::runner35::{Q35Decoder, Q35Runner, TraceStep};
 use crate::tokenizer::{Bpe, TokenizerMeta};
 
 /// A dense runner paired with the model's byte-level BPE, for text in / text out.
@@ -140,6 +140,19 @@ impl TextRunner35 {
     /// Encode + echo token ids.
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
         self.bpe.encode(text)
+    }
+
+    /// Encode, then greedy-generate **keeping** the top-`k` logits of every step — the
+    /// `PH-1305` numeric fingerprint (llama.cpp `logprobs` gives the same quantity).
+    pub fn trace_text(&self, prompt: &str, max_new: usize, k: usize) -> Result<Vec<TraceStep>> {
+        let ids = self.bpe.encode(prompt)?;
+        if ids.is_empty() {
+            return Err(EngineError {
+                message: "textgen35: prompt tokenized to empty".to_string(),
+            });
+        }
+        let mut dec = Q35Decoder::new(&self.runner);
+        Ok(dec.generate_trace(&ids, max_new, k))
     }
 }
 

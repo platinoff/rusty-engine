@@ -1,9 +1,10 @@
 # NEXT_SESSION_PROMPT — rusty-engine
 
-## Сталий стан (2026-10-24) — почати звідси
+## Сталий стан (2026-10-27) — почати звідси
 
 - **Owner product pick: `rusty-engine`** (не автоматично: Step 0 питає продукт; тут — вже обраний).
-- HEAD = `origin/main` (PH-203s/PH-203t rejections + **PH-1201 spike + PH-1301..1304 (qwen35: config, GDN, full-attn, runner35)**, §research/minicpm-v-4.7.md; код forward/ядра = PH-203r), clean; гейт fmt/clippy-0/**244** тести (+7 ignored) зелений.
+- **PH-1305 WIP у дереві:** `rusty tokenize` + gate pin-пара правки (`gdn`/`q35`/`runner35`/`textgen`) + `tests/qwen35_parity.rs` + `tests/data/qwen35_oracle/` (5 fixture pairs). Unit/fixture green; 3 `#[ignore]` parity/fingerprint чекають real MiniCPM-V GGUF у release. Keep-live **rusty heartbeat down** на хабі — підняти serve перед Omni. Гейт fmt/clippy-0 / lib+tests green.
+- HEAD = previous `7afad27` + this commit (PH-203s/PH-203t rejections + **PH-1201 spike + PH-1301..1304**, §research/minicpm-v-4.7.md; код forward/ядра = PH-203r).
 - Перф-серія prefill: 961 tok **190.9 s → 5.3–6.4 s** (розкид = фонове навантаження боксу); matmul 4.1–4.7 s (77 %), attention 0.74–0.78 s (13.9 %), down `896×4864` **64–69 GMAC/s** (було 36–42), gate/up **81–92**, swiglu 122–132 ms, rope 32–35 ms, other **2.4–3 %** (див. `docs/STATUS.md`).
 - **`PH-203s` закрито виміром (2026-10-24):** онлайн-softmax блоками по KV + exp-таблиця
   реалізовані й прогнані в `benches/attn.rs` (min-of-5, один процес): **+8–15 % проти
