@@ -151,8 +151,9 @@ Desktop `rusty-engine(moe)` → неіснуючий шлях `CoreBoard_Labs_sh
 (ENOENT/Aborted у лозі), а не помилка коду. Додано проєктний `opencode.json` (kit-skills →
 GSV `.agents/skills`, hub-MCP stdio `target/live/gsv-mcp.exe`, instructions GSV+local+NEXT);
 ендпоінти підтверджив: hub omni `:9999/api/omni/v1` 200+SSE, llama-rs `:8080/:8082` 200;
-OmniRoute `:20128` policy-down. Owner-згодою створено **private** GitHub-remote
-`platinoff/rusty-engine` і запушено цей fix-comit; MIT-публікація коду — далі за B11.
+OmniRoute `:20128` policy-down. Owner-згодою створено GitHub-remote
+`platinoff/rusty-engine` (спочатку private; з 2026-10-29 public, MIT).
+CHANGELOG і third-party notices — далі за B11.
 Деталі — `NEXT_SESSION_PROMPT.md` § «Session wire».
 
 **Worker/APK роль + `build-matrix --build` (2026-10-16):** за owner-директивою

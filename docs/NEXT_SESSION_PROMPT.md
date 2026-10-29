@@ -284,10 +284,9 @@ Owner-обсяг цього drain: **билд (exe/bin/apk) + runtime-worker р�
   hub), авто-перемикання local↔cloud у `GET /api/omni/route`, SSE-стрімінг. Тест-чат чіпає
   `rusty/*` так само, як нині `gsv/lama-*`. Код хаба — окремий зріз у `S:/rust/GSV`
   (`src/boxes/omni/catalog.rs`), код двигуна — у `S:/rust/rusty-engine`.
-- **Push-згода owner (2026-10-15, оновлено 2026-10-21):** GitHub-remote `platinoff/rusty-engine` —
-  **private**. 2026-10-21 власник зняв B11-обмеження: сесію закрито **push-ом** (`origin/main` =
-  `ef0378a`, 35 комітів). Далі — звичайний контур: один коміт на зріз + `git push` у кінці сесії;
-  MIT-публікація/license/CHANGELOG лишаються за B11 (`PH-1105`).
+- **Push-згода owner (2026-10-15, оновлено 2026-10-29):** GitHub-remote `platinoff/rusty-engine` —
+  **public** (MIT). Ключі хаба лишаються в середовищі, не в дереві. 2026-10-21 власник зняв
+  B11-обмеження на push. CHANGELOG і `THIRD-PARTY-NOTICES` лишаються за B11 (`PH-1105`).
 
 ## Стан
 

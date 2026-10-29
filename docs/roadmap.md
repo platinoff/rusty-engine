@@ -272,7 +272,7 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-1102 | portable distribs: tar.gz/zip/apk per target + checksums (`xtask dist`) | `[ ]` | `xtask/dist.rs` |
 | PH-1103 | update-channel + binary-vs-source mtime (gsv_update-модель) | `[ ]` | xtask |
 | PH-1104 | MIT-compliance: third-party attribution scan → `THIRD-PARTY-NOTICES.md` | `[ ]` | `xtask/notice.rs` |
-| PH-1105 | GitHub publish (private→MIT) `github.com/platinoff/rusty-engine` (згода owner, push тільки тут) | `[ ]` | remote `origin` |
+| PH-1105 | GitHub publish (private→MIT) `github.com/platinoff/rusty-engine` (згода owner, push тільки тут). Видимість public з 2026-10-29; лишились CHANGELOG і THIRD-PARTY-NOTICES | `[ ]` | remote `origin` |
 | PH-1106 | ratio/LOC-gate + docs final sync (`xtask record-speed`/`record-rust`/`sync`) | `[ ]` | `docs/vision/*.json` |
 
 ---

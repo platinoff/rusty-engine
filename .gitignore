@@ -1,6 +1,12 @@
 /target
 data/*
 !data/.gitkeep
+# Operator secrets stay on the machine. Each hub brings its own.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
 *.exe
 *.dll
 *.so

@@ -35,6 +35,13 @@ cargo run --bin rusty -- --version
 cargo run --bin rusty -- --help
 ```
 
+## Secrets
+
+This tree is safe to publish because it does not carry hub credentials.
+`GSV_EDGE_TOKEN` and any `.env` live only on the machine that runs `rusty`.
+Someone else using the GSV ecosystem creates those on their own hub and
+exports them in the environment. Do not commit them.
+
 ## Status (verified 2026-10-22, PH-203r)
 
 **103 commits · 224 tests (+5 ignored parity) · clippy `-D` clean · Rust ratio 98.9 % (14605 LOC).**
