@@ -25,7 +25,7 @@ pub struct TextRunner {
 /// PH-1306: engine shape the OpenAI serve path dispatches over. Dense
 /// ([`TextRunner`]) and qwen35 hybrid ([`TextRunner35`]) both satisfy it, so one
 /// `rusty serve` wire carries the whole family (B5 chat contract, B13 geometry).
-pub trait Completes {
+pub trait Completes: Sync {
     /// One chat completion: extract `messages[].content`, encode, greedy-generate
     /// (`max_new`), decode only the **new** tokens back to text.
     fn complete(&self, messages_json: &str, max_new: usize) -> Result<String>;

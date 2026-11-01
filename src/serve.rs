@@ -124,7 +124,7 @@ fn accept_loop(
 ) -> std::io::Result<()> {
     let live_dir = std::path::Path::new("target/live");
     let start = std::time::Instant::now();
-    let mut metrics = crate::hub::Metrics::zero();
+    let metrics = crate::hub::Metrics::zero();
     let _ = crate::hub::write_heartbeat(
         live_dir,
         &crate::hub::Heartbeat::new(start.elapsed().as_secs()),
@@ -142,12 +142,18 @@ fn accept_loop(
         );
     });
     for stream in listener.incoming() {
-        match stream {
-            Ok(mut s) => {
-                let _ = handle_conn(&mut s, &mut metrics, model);
-            }
-            Err(_) => continue,
-        }
+        let Ok(mut st) = stream else {
+            continue;
+        };
+        // EN-7 (adaptation): staging layer — thread-per-connection so a slow prefill on one
+        // client never blocks the accept loop (nginx/Airflow-style layer separation; the
+        // engine stays single-model, per-connection delta-state decoders make this safe).
+        let mut metrics = metrics;
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                let _ = handle_conn(&mut st, &mut metrics, model);
+            });
+        });
     }
     Ok(())
 }
