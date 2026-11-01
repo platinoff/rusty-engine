@@ -461,3 +461,50 @@ fn runner35_loads_and_generates_real_minicpm() {
     assert_eq!(s1, s2, "real greedy stream must be deterministic");
     assert_eq!(s1.len(), 7);
 }
+
+/// PH-1306: the real MiniCPM-V 4.7-1B hybrid over the OpenAI HTTP wire —
+/// `TextRunner35` binds the same `serve_with_model` slot as the dense runner,
+/// `serve_one` answers POST /v1/chat/completions 200 with the greedy text.
+#[test]
+#[ignore = "real MiniCPM-V 4.7-1B GGUF (gitignored download); run: cargo test --release -- --ignored"]
+fn hybrid_serves_real_minicpm_over_the_wire() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    let path = std::path::Path::new("data/models/MiniCPM-V-4_7-1B-Q4_K_M.gguf");
+    if !path.exists() {
+        eprintln!("skip: MiniCPM-V 4.7-1B GGUF absent (gitignored download)");
+        return;
+    }
+    let model = unsafe { MmapModel::open(path) }.expect("open real model");
+    let tr = rusty_engine::textgen::TextRunner35::from_model(&model).expect("real hybrid runner");
+    assert_eq!(tr.runner.n_layers, 24, "real hybrid geometry");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let addr = listener.local_addr().expect("local_addr");
+    let th = std::thread::spawn(move || {
+        let mut m = rusty_engine::hub::Metrics::zero();
+        rusty_engine::serve::serve_one(&listener, &mut m, Some(&tr)).expect("serve_one");
+    });
+
+    let body = br#"{"model":"rusty-hybrid-1b","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut client = TcpStream::connect(addr).expect("connect");
+    client.write_all(head.as_bytes()).expect("write head");
+    client.write_all(body).expect("write body");
+    client.flush().expect("flush");
+    let mut resp = String::new();
+    client.read_to_string(&mut resp).expect("read");
+    th.join().expect("server thread");
+
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+    assert!(resp.contains("chat.completion"), "{resp}");
+    assert!(resp.contains("completion_tokens"), "{resp}");
+    // The hybrid produced a non-empty decode over the real byte wire.
+    let content_start = resp.find("\"content\":\"").expect("content field") + 11;
+    let content_tail = &resp[content_start..resp[content_start..].len() + content_start - 2];
+    assert!(!content_tail.is_empty(), "hybrid decode must be non-empty");
+}

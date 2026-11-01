@@ -22,6 +22,50 @@ pub struct TextRunner {
     pub bpe: Bpe,
 }
 
+/// PH-1306: engine shape the OpenAI serve path dispatches over. Dense
+/// ([`TextRunner`]) and qwen35 hybrid ([`TextRunner35`]) both satisfy it, so one
+/// `rusty serve` wire carries the whole family (B5 chat contract, B13 geometry).
+pub trait Completes {
+    /// One chat completion: extract `messages[].content`, encode, greedy-generate
+    /// (`max_new`), decode only the **new** tokens back to text.
+    fn complete(&self, messages_json: &str, max_new: usize) -> Result<String>;
+    /// BPE token count used for the `usage` block (0 encodes as max(1) upstairs).
+    fn token_len(&self, text: &str) -> usize;
+}
+
+impl Completes for TextRunner {
+    fn complete(&self, messages_json: &str, max_new: usize) -> Result<String> {
+        TextRunner::complete(self, messages_json, max_new)
+    }
+    fn token_len(&self, text: &str) -> usize {
+        self.bpe.encode(text).map(|v| v.len()).unwrap_or(0)
+    }
+}
+
+impl Completes for TextRunner35 {
+    fn complete(&self, messages_json: &str, max_new: usize) -> Result<String> {
+        let prompt = extract_message_content(messages_json);
+        if prompt.trim().is_empty() {
+            return Err(EngineError {
+                message: "textgen35: prompt has no message content".to_string(),
+            });
+        }
+        let ids = self.bpe.encode(&prompt)?;
+        if ids.is_empty() {
+            return Err(EngineError {
+                message: "textgen35: prompt tokens empty".to_string(),
+            });
+        }
+        let mut dec = Q35Decoder::new(&self.runner);
+        let out = dec.generate_incremental(&ids, max_new);
+        let new = &out[ids.len().min(out.len())..];
+        Ok(self.bpe.decode(new))
+    }
+    fn token_len(&self, text: &str) -> usize {
+        self.bpe.encode(text).map(|v| v.len()).unwrap_or(0)
+    }
+}
+
 impl TextRunner {
     /// Build from a mapped GGUF: parse config + tokenizer metadata, validate geometry,
     /// load weights, and wire the BPE codec.
@@ -220,18 +264,14 @@ pub struct ChatOutcome {
 /// HTTP chat handler (PH-501b). `json_body` is the raw request body (messages JSON);
 /// returns the full OpenAI-shaped HTTP response for POST /v1/chat/completions plus the
 /// decode stats (PH-505).
-pub fn chat_response(runner: &TextRunner, json_body: &str, max_new: usize) -> ChatOutcome {
+pub fn chat_response(runner: &dyn Completes, json_body: &str, max_new: usize) -> ChatOutcome {
     let started = std::time::Instant::now();
     match runner.complete(json_body, max_new) {
         Ok(text) => {
             let decode_secs = started.elapsed().as_secs_f64();
             let escaped = escape_json_text(&text);
-            let prompt_len = runner
-                .bpe
-                .encode(&extract_message_content(json_body))
-                .unwrap_or_default()
-                .len();
-            let generated = (runner.bpe.encode(&text).map(|v| v.len()).unwrap_or(0)).max(1);
+            let prompt_len = runner.token_len(&extract_message_content(json_body));
+            let generated = runner.token_len(&text).max(1);
             let json = chat_completion_body(&escaped, prompt_len, generated);
             ChatOutcome {
                 response: crate::http::Response::json(200, json),
@@ -268,13 +308,17 @@ pub fn chat_completion_body(content: &str, prompt_len: usize, generated: usize) 
 /// `chat.completion.chunk` delta event plus the terminating `[DONE]`, the same
 /// minimal streaming contract `llama_serve` (bunke-rock) exposes. The hub can
 /// hold `text/event-stream` against the engine without a client-visible gap.
-pub fn chat_stream_response(runner: &TextRunner, json_body: &str, max_new: usize) -> ChatOutcome {
+pub fn chat_stream_response(
+    runner: &dyn Completes,
+    json_body: &str,
+    max_new: usize,
+) -> ChatOutcome {
     let started = std::time::Instant::now();
     match runner.complete(json_body, max_new) {
         Ok(text) => {
             let decode_secs = started.elapsed().as_secs_f64();
             let escaped = escape_json_text(&text);
-            let generated = (runner.bpe.encode(&text).map(|v| v.len()).unwrap_or(0)).max(1);
+            let generated = runner.token_len(&text).max(1);
             let body = crate::http::sse_body("cmpl-0", "rusty-engine", &[&escaped]);
             ChatOutcome {
                 response: crate::http::Response {

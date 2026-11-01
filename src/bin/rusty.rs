@@ -566,18 +566,38 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
         rusty_engine::banner()
     );
     // With a model, wire real BPE→generate→decode (PH-501b); else the stub route.
+    // PH-1306: `qwen35` arches bind the hybrid [`TextRunner35`] on the same serve wire —
+    // MiniCPM-V 4.7-1B runs OpenAI-shaped chat through one `rusty serve` command.
     let result = match &model_path {
         Some(p) => match unsafe { rusty_engine::loader::MmapModel::open(Path::new(p)) } {
-            Ok(m) => match rusty_engine::textgen::TextRunner::from_model(&m) {
-                Ok(tr) => {
-                    println!("  model: {p} ({} layers)", tr.runner.n_layers);
-                    rusty_engine::serve::serve_with_model(&addr, &tr)
+            Ok(m) => {
+                let hybrid = rusty_engine::model::ModelConfig::from_file(m.header())
+                    .map(|c| c.arch == "qwen35")
+                    .unwrap_or(false);
+                if hybrid {
+                    match rusty_engine::textgen::TextRunner35::from_model(&m) {
+                        Ok(tr) => {
+                            println!("  model: {p} ({} layers, hybrid)", tr.runner.n_layers);
+                            rusty_engine::serve::serve_with_model(&addr, &tr)
+                        }
+                        Err(e) => {
+                            eprintln!("rusty serve: model load: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    match rusty_engine::textgen::TextRunner::from_model(&m) {
+                        Ok(tr) => {
+                            println!("  model: {p} ({} layers)", tr.runner.n_layers);
+                            rusty_engine::serve::serve_with_model(&addr, &tr)
+                        }
+                        Err(e) => {
+                            eprintln!("rusty serve: model load: {e}");
+                            std::process::exit(1);
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("rusty serve: model load: {e}");
-                    std::process::exit(1);
-                }
-            },
+            }
             Err(e) => {
                 eprintln!("rusty serve: open {p}: {e}");
                 std::process::exit(1);

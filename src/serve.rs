@@ -22,10 +22,11 @@ const MAX_NEW_CAP: usize = 512;
 
 /// Accept, serve and close exactly one connection — the unit `serve` loops over. `metrics`
 /// accumulates across the process lifetime (PH-505 counters); `model` wires real generation.
+/// PH-1306: any [`crate::textgen::Completes`] engine (dense or qwen35 hybrid) fits the slot.
 pub fn serve_one(
     listener: &TcpListener,
     metrics: &mut crate::hub::Metrics,
-    model: Option<&crate::textgen::TextRunner>,
+    model: Option<&dyn crate::textgen::Completes>,
 ) -> std::io::Result<()> {
     let (mut stream, _peer) = listener.accept()?;
     handle_conn(&mut stream, metrics, model)
@@ -37,7 +38,7 @@ pub fn serve_one(
 pub fn handle_conn(
     stream: &mut TcpStream,
     metrics: &mut crate::hub::Metrics,
-    model: Option<&crate::textgen::TextRunner>,
+    model: Option<&dyn crate::textgen::Completes>,
 ) -> std::io::Result<()> {
     let mut buf = vec![0u8; READ_CHUNK];
     let mut filled = 0usize;
@@ -107,8 +108,10 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
 }
 
 /// PH-501b: serve with a real [`crate::textgen::TextRunner`] bound — POST /v1/chat/completions
-/// runs BPE→generate→decode over the loaded GGUF instead of the empty stub.
-pub fn serve_with_model(addr: &str, model: &crate::textgen::TextRunner) -> std::io::Result<()> {
+/// runs BPE→generate→decode over the loaded GGUF instead of the empty stub. PH-1306: the
+/// same slot accepts a [`crate::textgen::TextRunner35`] (qwen35 hybrid / MiniCPM-V), so
+/// callers can bind either engine without a serve-side branch.
+pub fn serve_with_model(addr: &str, model: &dyn crate::textgen::Completes) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     accept_loop(&listener, Some(model))
 }
@@ -117,7 +120,7 @@ pub fn serve_with_model(addr: &str, model: &crate::textgen::TextRunner) -> std::
 /// PH-501b model). Fail-open per connection so a broken client never kills the loop.
 fn accept_loop(
     listener: &TcpListener,
-    model: Option<&crate::textgen::TextRunner>,
+    model: Option<&dyn crate::textgen::Completes>,
 ) -> std::io::Result<()> {
     let live_dir = std::path::Path::new("target/live");
     let start = std::time::Instant::now();
@@ -152,6 +155,7 @@ fn accept_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::EngineError;
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -203,6 +207,50 @@ mod tests {
     fn routes_are_openai_shaped() {
         assert_eq!(PATH_MODELS, "/v1/models");
         assert_eq!(PATH_CHAT_COMPLETIONS, "/v1/chat/completions");
+    }
+
+    /// PH-1306: any `Completes` engine fills the serve slot — a stub engine satisfies the
+    /// trait object and the wire stays OpenAI-shaped, same as the dense runner.
+    struct StubEngine {
+        reply: &'static str,
+    }
+
+    impl crate::textgen::Completes for StubEngine {
+        fn complete(&self, _messages_json: &str, _max_new: usize) -> Result<String, EngineError> {
+            Ok(self.reply.to_string())
+        }
+        fn token_len(&self, text: &str) -> usize {
+            text.split_whitespace().count()
+        }
+    }
+
+    #[test]
+    fn serve_one_dispatches_a_custom_completes_engine_over_the_wire() {
+        let engine = StubEngine { reply: "hybrid ok" };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local_addr");
+        let th = std::thread::spawn(move || {
+            let mut m = crate::hub::Metrics::zero();
+            serve_one(&listener, &mut m, Some(&engine)).expect("serve_one");
+        });
+        let body = br#"{"model":"rusty-hybrid-1b","messages":[{"role":"user","content":"hi"}]}"#;
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+            PATH_CHAT_COMPLETIONS,
+            body.len()
+        );
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client.write_all(head.as_bytes()).expect("write head");
+        client.write_all(body).expect("write body");
+        client.flush().expect("flush");
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).expect("read");
+        th.join().expect("server thread");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+        assert!(resp.contains("application/json"), "{resp}");
+        assert!(resp.contains("hybrid ok"), "{resp}");
+        // The usage block works through the trait's token_len, not a hardwired BPE.
+        assert!(resp.contains("completion_tokens"), "{resp}");
     }
 
     #[test]
