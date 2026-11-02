@@ -240,11 +240,26 @@ pub fn print_report_once(total_ns: u64, label: &str) {
 mod tests {
     use super::*;
 
+    /// The stage registry is process-global, and Rust runs tests in parallel, so the
+    /// share/percentage assertions must serialize the whole add→report window
+    /// (`EN-8` port pass discovered this flake: matmul adds landed mid-report).
+    static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Zero the registry and run `f` while holding the guard, leaving nothing behind.
+    fn isolated<T>(f: impl FnOnce() -> T) -> T {
+        let _g = TEST_GUARD.lock().unwrap();
+        for i in 0..N_STAGES {
+            NS[i].store(0, Ordering::Relaxed);
+            CALLS[i].store(0, Ordering::Relaxed);
+        }
+        f()
+    }
+
     #[test]
     fn disabled_by_default_in_tests_and_timed_still_runs() {
         // The suite runs without RUSTY_PROFILE, so the counters stay at zero but the
         // closure must still run and return its value.
-        let got = timed(Stage::Matvec, || 41 + 1);
+        let got = isolated(|| timed(Stage::Matvec, || 41 + 1));
         assert_eq!(got, 42);
         assert!(!enabled());
         assert_eq!(report(1_000_000, "test"), report(1_000_000, "test"));
@@ -254,9 +269,11 @@ mod tests {
     fn report_splits_pool_and_serial_stages() {
         // PH-203p: the serial stages (norm..embed) get their own subtotal, so the share of
         // the "other" bucket is a number instead of a guess.
-        add(Stage::Norm, 2_000_000);
-        add(Stage::Rope, 1_000_000);
-        let s = report(10_000_000, "unit");
+        let s = isolated(|| {
+            add(Stage::Norm, 2_000_000);
+            add(Stage::Rope, 1_000_000);
+            report(10_000_000, "unit")
+        });
         assert!(s.contains("norm"), "{s}");
         assert!(s.contains("rope"), "{s}");
         assert!(s.contains("30.0%"), "{s}");
@@ -266,13 +283,17 @@ mod tests {
 
     #[test]
     fn report_accounts_calls_and_share() {
-        add(Stage::Matmul, 3_000_000);
-        add(Stage::Matmul, 1_000_000);
-        let s = report(10_000_000, "unit");
+        let s = isolated(|| {
+            add(Stage::Matmul, 3_000_000);
+            add(Stage::Matmul, 1_000_000);
+            report(10_000_000, "unit")
+        });
         assert!(s.contains("matmul"), "{s}");
         assert!(s.contains("2 calls"), "{s}");
         assert!(s.contains("40.0%"), "{s}");
-        // Accounting is consumed by the report.
-        assert!(report(10_000_000, "unit").contains("0 calls"));
+        isolated(|| {
+            // Accounting is consumed by the report.
+            assert!(report(10_000_000, "unit").contains("0 calls"));
+        });
     }
 }

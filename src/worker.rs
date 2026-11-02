@@ -33,7 +33,7 @@ pub struct WorkerConfig {
     pub hub: String,
     /// GSV edge token (header `x-gsv-edge-token`); never echoed.
     pub token: String,
-    /// Local `rusty serve` base, e.g. `http://192.168.2.238:8090`.
+    /// Local `rusty serve` base, e.g. `http://192.168.2.238:8092`.
     pub serve_url: String,
     /// Model id advertised to the hub.
     pub model: String,
@@ -49,7 +49,7 @@ impl WorkerConfig {
             peer_id: peer_id.into(),
             hub: format!("http://{addr}:9999/api/edge"),
             token: token.into(),
-            serve_url: format!("http://{addr}:8090"),
+            serve_url: format!("http://{addr}:8092"),
             model: "rusty-05".to_string(),
             max_memory_mb: 0,
             cpu_cores: std::thread::available_parallelism()
@@ -819,7 +819,7 @@ mod tests {
             peer_id: "rusty-01".into(),
             hub: "http://127.0.0.1:9999/api/edge".into(),
             token: "super-secret-edge-token".into(),
-            serve_url: "http://127.0.0.1:8090".into(),
+            serve_url: "http://127.0.0.1:8092".into(),
             model: "rusty-05".into(),
             max_memory_mb: 4096,
             cpu_cores: 8,
@@ -928,7 +928,7 @@ mod tests {
         let out = execute("rusty_chat", &payload, &cfg(), false);
         match out {
             Outcome::Completed(d) => assert!(
-                d.starts_with("dry-run: would POST http://127.0.0.1:8090/v1/chat/completions")
+                d.starts_with("dry-run: would POST http://127.0.0.1:8092/v1/chat/completions")
             ),
             other => panic!("expected dry-run completion, got {other:?}"),
         }

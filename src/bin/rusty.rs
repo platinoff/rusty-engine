@@ -24,7 +24,7 @@ fn main() {
             println!("  run -m <model> -p <text>  BPE text generation        (PH-306b)");
             println!("  run -m <model> -t <ids>   numeric-token greedy       (PH-306)");
             println!(
-                "  serve [--port N] [--host H]  OpenAI-compat HTTP, LAN-first :8090 (PH-501a/507)"
+                "  serve [--port N] [--host H]  OpenAI-compat HTTP, LAN-first :8092 (PH-501a/507, EN-8; :8090 is rebook view)"
             );
             println!("  heartbeat                 stamp GSV keep-live file   (PH-504)");
             println!("  node                      Wi-Fi slave runtime        (band B7)");
@@ -539,13 +539,15 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
 /// `--host 127.0.0.1` keeps the old loopback-only posture. Serves one connection
 /// per request.
 fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
-    let mut port = 8090u16;
+    // EN-8: default moved 8090 → 8092 — loopback :8090 permanently belongs to rebook
+    // (RB-5 axum `rust_book view`); the dense lane must never fight it again.
+    let mut port = 8092u16;
     let mut host = "0.0.0.0".to_string();
     let mut model_path: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" | "-p" => {
-                port = args.next().map_or(8090, |v| {
+                port = args.next().map_or(8092, |v| {
                     v.parse::<u16>().unwrap_or_else(|_| {
                         eprintln!("rusty serve: bad --port");
                         std::process::exit(2)
