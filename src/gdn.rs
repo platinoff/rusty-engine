@@ -111,6 +111,18 @@ impl GdnState {
             s: vec![0.0f32; g.groups * g.dk * g.dv],
         }
     }
+
+    /// EN-7b: borrow the raw carried state for a snapshot (`conv_win`, `s`).
+    pub(crate) fn to_parts(&self) -> (&[f32], &[f32]) {
+        (&self.conv_win, &self.s)
+    }
+
+    /// EN-7b: rebuild a state from snapshot parts. Shapes must come from the same
+    /// [`GdnGeom`] (`groups · dk · dv` rows plus the conv window) — the restore path
+    /// validates lengths before calling this.
+    pub(crate) fn from_parts(conv_win: Vec<f32>, s: Vec<f32>) -> Self {
+        Self { conv_win, s }
+    }
 }
 
 /// Stable `softplus(x) = ln(1 + eˣ)` in f32 (fla's `F.softplus` cut-off is the same

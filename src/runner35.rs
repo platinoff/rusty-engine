@@ -14,7 +14,9 @@
 //! Decode is greedy, per-token, state-carrying: GDN blocks advance their 1 MiB delta
 //! state, full blocks append to their KV cache — one fixed cost per token regardless
 //! of context length. Prefill steps token-by-token for now (the batched kernels exist;
-//! fusing them into this loop is `PH-1305` perf work).
+//! fusing them into this loop is `PH-1305` perf work). `EN-7b`: the carried state is
+//! freezable to a [`Q35Snapshot`], which the SSD state cache persists so a repeated
+//! prompt skips its prefill entirely.
 
 use crate::core::{EngineError, Result};
 use crate::gdn::{gdn_decode_step, GdnGeom, GdnState, GdnWeights};
@@ -292,6 +294,135 @@ pub struct Q35Decoder<'a> {
     seq_len: usize,
 }
 
+/// `EN-7b`: frozen delta-state of a [`Q35Decoder`] at one sequence position — the GDN
+/// windows, the full-block KV caches, the sequence length, **and** the next-token
+/// logits that ended the prefill. Owns its data so it can live past the decoder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Q35Snapshot {
+    pub seq_len: usize,
+    /// Next-token logits at the snapshot point (n_vocab wide).
+    pub logits: Vec<f32>,
+    /// One `GdnState` per layer (recurrent layers carry real state, full layers zero).
+    pub gdn: Vec<GdnState>,
+    /// One `Q35Kv` per layer (full layers carry the cache, recurrent layers empty).
+    pub kv: Vec<Q35Kv>,
+}
+
+impl Q35Snapshot {
+    const MAGIC: [u8; 6] = *b"RQ35ST";
+    const VERSION: u32 = 1;
+
+    /// Serialize LE: magic + version + u32 entry widths (usize → u32/64) + slices.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&Self::MAGIC);
+        b.extend_from_slice(&Self::VERSION.to_le_bytes());
+        b.extend_from_slice(&(self.seq_len as u64).to_le_bytes());
+        let put = |b: &mut Vec<u8>, v: &[f32]| {
+            b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            for f in v {
+                b.extend_from_slice(&f.to_le_bytes());
+            }
+        };
+        b.extend_from_slice(&(self.gdn.len() as u64).to_le_bytes());
+        for g in &self.gdn {
+            let (conv, s) = g.to_parts();
+            put(&mut b, conv);
+            put(&mut b, s);
+        }
+        b.extend_from_slice(&(self.kv.len() as u64).to_le_bytes());
+        for c in &self.kv {
+            put(&mut b, &c.k);
+            put(&mut b, &c.v);
+        }
+        put(&mut b, &self.logits);
+        b
+    }
+
+    /// Parse [`Self::to_bytes`] output; rejects magic/shape/length drift with an error
+    /// (a corrupt or foreign snapshot must fall back to a prefill, never decode wrong).
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = data;
+        if take(&mut r, 6, "magic")? != Self::MAGIC {
+            return Err(EngineError {
+                message: "q35 snapshot: bad magic".to_string(),
+            });
+        }
+        let ver = {
+            let b: [u8; 4] = take(&mut r, 4, "version")?
+                .try_into()
+                .map_err(|_| EngineError {
+                    message: "q35 snapshot: bad version".to_string(),
+                })?;
+            u32::from_le_bytes(b)
+        };
+        if ver != Self::VERSION {
+            return Err(EngineError {
+                message: format!("q35 snapshot: unsupported version {ver}"),
+            });
+        }
+        let seq_len = snap_u64(&mut r, "header")? as usize;
+        let n_gdn = snap_u64(&mut r, "gdn count")? as usize;
+        let mut gdn = Vec::with_capacity(n_gdn);
+        for i in 0..n_gdn {
+            gdn.push(GdnState::from_parts(
+                snap_f32v(&mut r, &format!("gdn{i} conv"))?,
+                snap_f32v(&mut r, &format!("gdn{i} state"))?,
+            ));
+        }
+        let n_kv = snap_u64(&mut r, "kv count")? as usize;
+        let mut kv = Vec::with_capacity(n_kv);
+        for i in 0..n_kv {
+            kv.push(Q35Kv {
+                k: snap_f32v(&mut r, &format!("kv{i} k"))?,
+                v: snap_f32v(&mut r, &format!("kv{i} v"))?,
+            });
+        }
+        let logits = snap_f32v(&mut r, "logits")?;
+        if !r.is_empty() {
+            return Err(EngineError {
+                message: "q35 snapshot: trailing bytes after logits".to_string(),
+            });
+        }
+        Ok(Self {
+            seq_len,
+            logits,
+            gdn,
+            kv,
+        })
+    }
+}
+
+/// `EN-7b` snapshot cursor helpers. `take<'x>` ties the returned slice to the input
+/// borrow, so the parse consumes `data` in exact order (a big-endian or torn file
+/// errors out; it can never decode wrong floats).
+fn take<'x>(r: &mut &'x [u8], n: usize, what: &str) -> Result<&'x [u8]> {
+    if r.len() < n {
+        return Err(EngineError {
+            message: format!("q35 snapshot: truncated {what}"),
+        });
+    }
+    let (a, rest) = r.split_at(n);
+    *r = rest;
+    Ok(a)
+}
+
+fn snap_u64(r: &mut &[u8], what: &str) -> Result<u64> {
+    let b: [u8; 8] = take(r, 8, what)?.try_into().map_err(|_| EngineError {
+        message: format!("q35 snapshot: bad {what}"),
+    })?;
+    Ok(u64::from_le_bytes(b))
+}
+
+fn snap_f32v(r: &mut &[u8], what: &str) -> Result<Vec<f32>> {
+    let n = snap_u64(r, what)?.min(1 << 28) as usize;
+    let raw = take(r, n * 4, what)?;
+    Ok(raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect())
+}
+
 /// One step of a greedy trace: the token argmax picked plus the `k` best logits that
 /// produced it (the `PH-1305` numeric fingerprint — see [`crate::infer::top_k`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -338,8 +469,20 @@ impl<'a> Q35Decoder<'a> {
     /// Greedy generate: prefill, then argmax-append up to `max_new` (EOS stops).
     pub fn generate_incremental(&mut self, prompt: &[u32], max_new: usize) -> Vec<u32> {
         assert!(!prompt.is_empty(), "q35 generate: empty prompt");
-        let mut seq: Vec<u32> = prompt.to_vec();
-        let mut logits = self.prefill(prompt);
+        let seq: Vec<u32> = prompt.to_vec();
+        let logits = self.prefill(prompt);
+        self.greedy_continue(seq, logits, max_new)
+    }
+
+    /// Shared greedy tail: append argmax tokens (EOS stops). `EN-7b`: both the fresh
+    /// prefill path and the snapshot-restore path funnel through this one loop, so a
+    /// cache hit produces the identical token stream as a full re-prefill.
+    fn greedy_continue(
+        &mut self,
+        mut seq: Vec<u32>,
+        mut logits: Vec<f32>,
+        max_new: usize,
+    ) -> Vec<u32> {
         for _ in 0..max_new {
             match argmax(&logits) {
                 Some(t) if Some(t as u32) == self.runner.eos_token_id => break,
@@ -351,6 +494,12 @@ impl<'a> Q35Decoder<'a> {
             }
         }
         seq
+    }
+
+    /// `EN-7b` cache-hit path: greedy generate from already-restored state + the
+    /// snapshot's prefill-point logits, without stepping the prompt again.
+    pub fn generate_after(&mut self, prompt: &[u32], logits: Vec<f32>, max_new: usize) -> Vec<u32> {
+        self.greedy_continue(prompt.to_vec(), logits, max_new)
     }
 
     /// Greedy generate **with** the per-step top-`k` logits: same token stream as
@@ -376,5 +525,83 @@ impl<'a> Q35Decoder<'a> {
             logits = self.step(tok);
         }
         steps
+    }
+
+    /// `EN-7b`: freeze the whole delta-state (GDN windows, full-block KV caches,
+    /// sequence length) plus the next-token logits taken after a prefill. Restoring
+    /// this snapshot is bit-equivalent to re-running the same prompt's tokens, which
+    /// is exactly what the SSD state cache exploits to skip the prefill entirely.
+    pub fn capture(&self, logits: &[f32]) -> Q35Snapshot {
+        Q35Snapshot {
+            seq_len: self.seq_len,
+            logits: logits.to_vec(),
+            gdn: self.gdn.to_vec(),
+            kv: self.kv.to_vec(),
+        }
+    }
+
+    /// `EN-7b`: load a snapshot captured off the same geometry. Any shape mismatch
+    /// (wrong model, drifted geometry, truncated file before validation) is a hard
+    /// error — the caller falls back to a normal prefill, never to silent corruption.
+    pub fn restore_from(&mut self, snap: &Q35Snapshot) -> Result<()> {
+        if snap.gdn.len() != self.runner.n_layers || snap.kv.len() != self.runner.n_layers {
+            return Err(EngineError {
+                message: format!(
+                    "q35 snapshot: layer count {} gdn / {} kv != {}",
+                    snap.gdn.len(),
+                    snap.kv.len(),
+                    self.runner.n_layers
+                ),
+            });
+        }
+        if snap.logits.len() != self.runner.n_vocab {
+            return Err(EngineError {
+                message: format!(
+                    "q35 snapshot: logits {} != vocab {}",
+                    snap.logits.len(),
+                    self.runner.n_vocab
+                ),
+            });
+        }
+        let g = &self.runner.gdn_geom;
+        let conv_len = g.conv.saturating_sub(1) * g.qkv_dim();
+        let s_len = g.groups * g.dk * g.dv;
+        let kv_dim = self.runner.q35_geom.kv_dim();
+        for (i, st) in self.gdn.iter_mut().enumerate() {
+            let (conv, s) = snap.gdn[i].to_parts();
+            if conv.len() != conv_len || s.len() != s_len {
+                return Err(EngineError {
+                    message: format!(
+                        "q35 snapshot: gdn layer {i} shape {} + {} != {} + {}",
+                        conv.len(),
+                        s.len(),
+                        conv_len,
+                        s_len
+                    ),
+                });
+            }
+            *st = GdnState::from_parts(conv.to_vec(), s.to_vec());
+        }
+        for (i, kv) in self.kv.iter_mut().enumerate() {
+            if snap.kv[i].k.len() % kv_dim != 0 || snap.kv[i].v.len() != snap.kv[i].k.len() {
+                return Err(EngineError {
+                    message: format!("q35 snapshot: kv layer {} cache shape mismatch", i),
+                });
+            }
+            *kv = snap.kv[i].clone();
+        }
+        if let Some(last) = self.kv.iter().rfind(|c| !c.is_empty()) {
+            let cached = last.k.len() / kv_dim;
+            if cached != snap.seq_len {
+                return Err(EngineError {
+                    message: format!(
+                        "q35 snapshot: kv tokens {} != seq_len {}",
+                        cached, snap.seq_len
+                    ),
+                });
+            }
+        }
+        self.seq_len = snap.seq_len;
+        Ok(())
     }
 }

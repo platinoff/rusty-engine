@@ -56,10 +56,7 @@ impl Completes for TextRunner35 {
                 message: "textgen35: prompt tokens empty".to_string(),
             });
         }
-        let mut dec = Q35Decoder::new(&self.runner);
-        let out = dec.generate_incremental(&ids, max_new);
-        let new = &out[ids.len().min(out.len())..];
-        Ok(self.bpe.decode(new))
+        self.generate_cached(&ids, max_new)
     }
     fn token_len(&self, text: &str) -> usize {
         self.bpe.encode(text).map(|v| v.len()).unwrap_or(0)
@@ -142,6 +139,10 @@ impl TextRunner {
 pub struct TextRunner35 {
     pub runner: Q35Runner,
     pub bpe: Bpe,
+    /// `EN-7b` SSD delta-state cache (None when disabled): repeated prompts restore
+    /// their GDN/KV state from a snapshot file and skip the prefill. Sync — safe
+    /// under the thread-per-connection staging lane.
+    pub state_cache: Option<crate::statecache::StateCache>,
 }
 
 impl TextRunner35 {
@@ -163,7 +164,40 @@ impl TextRunner35 {
         }
         let runner = Q35Runner::from_model(model, &cfg)?;
         let bpe = Bpe::from_meta(meta);
-        Ok(Self { runner, bpe })
+        Ok(Self {
+            runner,
+            bpe,
+            state_cache: crate::statecache::StateCache::open_default(),
+        })
+    }
+
+    /// Shared `EN-7b` path: load-or-prefill the prompt state, then greedy-generate.
+    /// Misses at the restore step rebuild a virgin decoder so a corrupt snapshot can
+    /// never poison a prefill; stores are best-effort (a busy disk stays a miss).
+    fn generate_cached(&self, ids: &[u32], max_new: usize) -> Result<String> {
+        let cache = self.state_cache.as_ref();
+        let key = cache.map(|_| crate::statecache::prompt_key(ids));
+        let mut dec = Q35Decoder::new(&self.runner);
+        let (logits, hit) = match key.and_then(|k| cache.unwrap().load(k)) {
+            Some(snap) => match dec.restore_from(&snap) {
+                Ok(()) => (snap.logits, true),
+                Err(_) => {
+                    // Torn/foreign file: virgin decoder, ordinary prefill.
+                    dec = Q35Decoder::new(&self.runner);
+                    (dec.prefill(ids), false)
+                }
+            },
+            None => (dec.prefill(ids), false),
+        };
+        if !hit {
+            if let (Some(c), Some(k)) = (cache, key) {
+                let snap = dec.capture(&logits);
+                c.store(k, &snap).ok();
+            }
+        }
+        let out = dec.generate_after(ids, logits, max_new);
+        let new = &out[ids.len().min(out.len())..];
+        Ok(self.bpe.decode(new))
     }
 
     /// Encode, greedily generate up to `max_new` tokens (EOS stops), decode the new
@@ -175,10 +209,7 @@ impl TextRunner35 {
                 message: "textgen35: prompt tokenized to empty".to_string(),
             });
         }
-        let mut dec = Q35Decoder::new(&self.runner);
-        let out = dec.generate_incremental(&ids, max_new);
-        let new = &out[ids.len().min(out.len())..];
-        Ok(self.bpe.decode(new))
+        self.generate_cached(&ids, max_new)
     }
 
     /// Encode + echo token ids.
