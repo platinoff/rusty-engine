@@ -32,9 +32,10 @@
 //! (attention gate + RoPE).
 
 use std::path::Path;
+use std::time::Instant;
 
 use rusty_engine::loader::MmapModel;
-use rusty_engine::runner35::TraceStep;
+use rusty_engine::runner35::{Q35Decoder, TraceStep};
 use rusty_engine::textgen::TextRunner35;
 
 const MODEL: &str = "data/models/MiniCPM-V-4_7-1B-Q4_K_M.gguf";
@@ -354,5 +355,82 @@ fn greedy_fingerprint_matches_golden() {
     println!(
         "PH-1305 fingerprint: {} prompts match the golden",
         CASES.len()
+    );
+}
+
+/// Argmax over raw logits (greedy decode head, no sampling).
+fn argmax(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// `PH-1305` perf slice: batched-prefill wall + O(1) decode-step wall on the real
+/// model (12-thread pool, fresh process — run alone with
+/// `cargo test --release --test qwen35_parity perf_slice -- --ignored --nocapture`).
+/// Prints tok/s; no hard threshold yet (the `llama.cpp-omni` oracle wall is the
+/// reference; expectations recorded in the HANDOFF, not asserted).
+#[test]
+#[ignore = "perf slice: real MiniCPM-V 4.7-1B GGUF (release build)"]
+fn perf_slice_prefill_decode_12t() {
+    let Some(tr) = open_runner() else { return };
+
+    // Grow the pinned prompt into the batched-prefill regime (~256 tokens of real
+    // prose, so the tokenizer splits it like a live request, not a synthetic dump).
+    let mut text = String::from("The capital of France is");
+    let fill = " and the broader history of Europe is long: rivers, cities, wars, treaties, \
+                and trade routes shaped every border we know today, while merchants and \
+                scholars carried ideas across the sea faster than any army could. ";
+    while tr.tokenize(&text).map(|n| n.len()).unwrap_or(0) < 256 {
+        text.push_str(fill);
+    }
+    let ids = tr.tokenize(&text).expect("tokenize perf prompt");
+    assert!(ids.len() >= 256, "prompt must reach the prefill regime");
+
+    // Prefill: batched scan, 3 cold passes (fresh decoder each; median reported).
+    let mut prefill_ns = Vec::new();
+    for _ in 0..3 {
+        let mut dec = Q35Decoder::new(&tr.runner);
+        let t = Instant::now();
+        let logits = dec.prefill(&ids);
+        prefill_ns.push(t.elapsed().as_nanos());
+        assert_eq!(logits.len(), tr.runner.n_vocab, "prefill logits width");
+    }
+    prefill_ns.sort_unstable();
+    let prefill_med = prefill_ns[prefill_ns.len() / 2];
+    let prefill_tok_s = ids.len() as f64 * 1e9 / prefill_med as f64;
+
+    // Decode: O(1) GDN/full step per token, GEN steps off the prefill state.
+    let mut dec = Q35Decoder::new(&tr.runner);
+    let logits = dec.prefill(&ids);
+    let mut tok = argmax(&logits);
+    let mut step_ns = Vec::new();
+    for _ in 0..GEN {
+        let t = Instant::now();
+        let l = dec.step(tok);
+        step_ns.push(t.elapsed().as_nanos());
+        tok = argmax(&l);
+    }
+    step_ns.sort_unstable();
+    let step_med = step_ns[step_ns.len() / 2];
+    let decode_tok_s = 1e9 / step_med as f64;
+
+    println!(
+        "PH-1305 perf slice (threads={}): prefill {} tok = {} ms -> {:.1} tok/s; \
+         decode step median {} us -> {:.1} tok/s",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        ids.len(),
+        prefill_med / 1_000_000,
+        prefill_tok_s,
+        step_med / 1_000,
+        decode_tok_s,
     );
 }

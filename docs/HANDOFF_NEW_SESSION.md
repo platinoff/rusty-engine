@@ -1090,3 +1090,36 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
   (GDN swish vs sigmoid; attention σ), pre-split, softplus-плато; golden-файкстури
   `tests/data/qwen35_*.txt`; batched-prefill perf (GDN-скан по групах на пулі).
 
+
+### Продовження 33 — 2026-11-11: PH-1305 — qwen35 E2E паритет проти llama.cpp-омні-оракула + perf-зріз ✅
+
+- **Оракул:** llama.cpp build `b11906`, той самий gitignored
+  `MiniCPM-V-4_7-1B-Q4_K_M.gguf`; сирі `/completion` відповіді (temperature=0,
+  top_k=1, logprobs=5) закомічені байт-у-байт як `tests/data/qwen35_oracle/<slug>.{json,ids}`
+  — 5 пін-промпів × 10 greedy-кроків, нічого не переписано руками.
+- **Три offline-гейти в `tests/qwen35_parity.rs`** (усі `#[ignore]`, release):
+  (1) токенізатор байт-у-байт проти `llama-tokenize` — **5/5**;
+  (2) числовий gate як *profile* (наші f32 логіти vs топ-5 logprob оракула,
+  `LOGIT_TOL 0.75` нат; argmax лише де оракул вирішальний, `TIE_FLOOR 0.5`) —
+  **36/36 кроків збігаються**, 2 tie-розбіжності (margin < 0.5), найгірше
+  відхилення профілю **0.677 нат** (fox step 0) — це резидуал `q8_K`
+  активаційного квантування ggml, не зсув двигуна;
+  (3) наш власний golden-fingerprint `tests/data/qwen35_golden.txt`
+  (RUSTY_CAPTURE_GOLDEN=1) — **5/5** збігається на контрольному прогоні.
+- **Конвенції запінено** в коді біля місцяguarded: `src/gdn.rs` (ssm_a/conv/L2/gate),
+  `src/q35.rs` (attention-gate + RoPE), `src/tokenizer.rs` (pre-split, specials).
+- **Perf-зріз** (`perf_slice_prefill_decode_12t`, свіжий процес, 12 потоків):
+  prefill 263 tok = **12.27 s → 21.4 tok/s**; decode step медіана **47.8 ms →
+  20.9 tok/s**. Decode O(1) **перевищує паритет** (llama-rs floor oracle 0.497
+  tok/s на 27B GDN; rusty qwen2-шлях 10.9 tok/s). Prefill — наступний важіль, не
+  дефект: GDN delta-rule скан послідовний per-group; пул-розклад (layer, group) /
+  чанк-скан — окремий наступний бенд.
+- **Метод + числа:** `docs/research/qwen35-parity.md` (новий, на нього посилається
+  шапка тесту). Real-smoke `runner35_gen` — 2/2 (реальний MiniCPM по wire).
+- **Гейт:** fmt ok · clippy `-D` 0 · повний `cargo test` (244 + ignored green) ·
+  бенчі не чіпані. Real-гейти: `cargo test --release --test qwen35_parity --
+  --ignored --test-threads=1 --nocapture` (16.9 s) і `perf_slice_prefill_decode_12t`
+  (52 s) — окремо, свіжим процесом.
+- **Далі:** **`PH-1306`** — serve на qwen35-core (text-only provider row
+  `rusty-mcp-v47` у GSV-каталозі) → розблоковує B12 `PH-1204` image-prefix.
+  Наступний perf-бенд: пул-розклад GDN-скану по (layer, group).

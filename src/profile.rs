@@ -149,7 +149,7 @@ fn take_shapes() -> Vec<ShapeRow> {
         Err(p) => p.into_inner(),
     };
     let mut v: Vec<ShapeRow> = std::mem::take(&mut *g);
-    v.sort_by(|a, b| b.ns.cmp(&a.ns));
+    v.sort_by_key(|a| std::cmp::Reverse(a.ns));
     v
 }
 
