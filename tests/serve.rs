@@ -8,6 +8,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 
 /// Bind an ephemeral loopback port, serve exactly one connection with the stub path
 /// (no model), and return `(addr, join handle)`.
@@ -171,4 +172,92 @@ fn error_paths_400_404_405_over_the_wire() {
     assert!(del.starts_with("HTTP/1.1 405 "), "{del}");
     let garbage = round_trip("garbage\r\n\r\n");
     assert!(garbage.starts_with("HTTP/1.1 400 "), "{garbage}");
+}
+
+/// Bind an ephemeral loopback port with the **qwen35 hybrid** engine bound
+/// (`TextRunner35` over the real gitignored MiniCPM-V 4.7-1B) and return
+/// `(addr, join handle)`. Same `serve_one` slot the dense lane uses — the
+/// PH-1306 claim "one serve wire, either engine".
+fn serve_once_hybrid(
+    tr: rusty_engine::textgen::TextRunner35,
+) -> (SocketAddr, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let addr = listener.local_addr().expect("local_addr");
+    let th = std::thread::spawn(move || {
+        let mut m = rusty_engine::hub::Metrics::zero();
+        rusty_engine::serve::serve_one(&listener, &mut m, Some(&tr)).expect("serve_one (hybrid)");
+    });
+    (addr, th)
+}
+
+/// Open the real hybrid model over the `Completes` slot (skip when absent).
+fn open_hybrid() -> Option<rusty_engine::textgen::TextRunner35> {
+    const MODEL: &str = "data/models/MiniCPM-V-4_7-1B-Q4_K_M.gguf";
+    if !Path::new(MODEL).exists() {
+        eprintln!("skip: {MODEL} absent (gitignored download)");
+        return None;
+    }
+    let model = unsafe { rusty_engine::loader::MmapModel::open(Path::new(MODEL)) }
+        .expect("open real hybrid model");
+    let tr = rusty_engine::textgen::TextRunner35::from_model(&model).expect("TextRunner35");
+    Some(tr)
+}
+
+/// `PH-1306` hybrid serve gate: the qwen35 engine answers OpenAI-shaped
+/// `/v1/chat/completions` over the same wire the dense lane uses — valid JSON with
+/// a non-empty assistant content, strict-parsed with `worker::parse_json` like the
+/// stub gates above. `#[ignore]`: real 672 MB model, release build for wall clock
+/// (`cargo test --release --test serve -- --ignored`).
+#[test]
+#[ignore = "hybrid serve: real MiniCPM-V 4.7-1B GGUF (release build)"]
+fn hybrid_serves_chat_over_the_wire() {
+    let Some(tr) = open_hybrid() else { return };
+    let (addr, th) = serve_once_hybrid(tr);
+    let body = r#"{"model":"rusty-mcp-v47","messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":6}"#;
+    let resp = request(
+        addr,
+        &format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    th.join().expect("server thread");
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+    assert!(header(&resp, "content-type").is_some_and(|v| v.contains("application/json")));
+    let json = body_of(&resp);
+    let parsed = rusty_engine::worker::parse_json(json).expect("hybrid chat body is valid JSON");
+    let content = parsed
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        !content.trim().is_empty(),
+        "hybrid chat must generate non-empty content, got {json}"
+    );
+}
+
+/// `PH-1306` SSE gate: `stream:true` over the hybrid wire stays event-framed
+/// (`data: …` lines) and ends with the `[DONE]` sentinel, matching the dense lane.
+#[test]
+#[ignore = "hybrid serve stream: real MiniCPM-V 4.7-1B GGUF (release build)"]
+fn hybrid_streams_sse_over_the_wire() {
+    let Some(tr) = open_hybrid() else { return };
+    let (addr, th) = serve_once_hybrid(tr);
+    let body = r#"{"model":"rusty-mcp-v47","stream":true,"messages":[{"role":"user","content":"Once upon a time"}],"max_tokens":6}"#;
+    let resp = request(
+        addr,
+        &format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    th.join().expect("server thread");
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+    assert!(header(&resp, "content-type").is_some_and(|v| v.contains("text/event-stream")));
+    assert!(resp.contains("data: "), "SSE frames present: {resp}");
+    assert!(resp.contains("[DONE]"), "SSE sentinel present: {resp}");
 }
