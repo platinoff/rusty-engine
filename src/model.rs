@@ -106,7 +106,9 @@ impl ModelConfig {
         }
     }
 
-    /// Mixed GDN projection width: q/k/v stacked (`blk.i.attn_qkv`, 3 × inner).
+    /// Mixed GDN projection width: q/k/v stacked (`blk.i.attn_qkv`).
+    /// Default: 3 × inner (qwen35-1B); some qwen35moe files stack only q+v (2 × inner).
+    /// Helper tries the well-known multiples instead of failing outright.
     pub fn gdn_qkv_dim(&self) -> usize {
         3 * self.ssm_inner_size
     }
@@ -155,7 +157,24 @@ impl ModelConfig {
         let n_heads = req("attention.head_count")?;
         let d_model = req("embedding_length")?;
         let n_layers = req("block_count")?;
-        let d_ff = req("feed_forward_length")?;
+        // GGUF convention differs by architecture: Mixtral/Qwen3-MoE/MiniCPM-V report
+        // `[arch].expert_feed_forward_length`; dense arches report `feed_forward_length`.
+        // Try both before erroring out (PH: qwen35moe config support).
+        let d_ff = u32_of(
+            file,
+            &[
+                &format!("{arch}.feed_forward_length"),
+                "general.feed_forward_length",
+                &format!("{arch}.expert_feed_forward_length"),
+                "general.expert_feed_forward_length",
+            ],
+        )
+        .map(|v| v as usize)
+        .ok_or_else(|| EngineError {
+            message: format!(
+                "missing required key '{arch}.feed_forward_length' or '{arch}.expert_feed_forward_length'"
+            ),
+        })?;
         let n_kv_heads = opt_usize("attention.head_count_kv", n_heads);
         let n_vocab = opt_usize(
             "vocab_size",
@@ -283,11 +302,24 @@ impl ModelConfig {
             // qwen35 (`PH-1301`): the layer's tensor set depends on its kind. The full
             // layers fold a q-gate into `attn_q` (2·q columns) and carry per-head QK-norm;
             // the recurrent layers replace q/k/v/out with the mixed GDN stack.
-            let (q, gdn_qkv, r) = (
-                self.full_q_dim(),
-                self.gdn_qkv_dim(),
-                self.ssm_time_step_rank.max(1),
-            );
+            let (q, r) = (self.full_q_dim(), self.ssm_time_step_rank.max(1));
+            // GDN qkv width varies by arch variant (qwen35-1B: 3×inner; qwen35moe:
+            // 2×inner) — infer from the file instead of trusting a hardcoded formula.
+            let gdn_qkv = file
+                .tensors
+                .iter()
+                .find(|t| t.name == "blk.0.attn_qkv.weight")
+                .map(|t| t.dims.get(1).copied().unwrap_or(0))
+                .unwrap_or_else(|| self.gdn_qkv_dim());
+            let gdn_qkv_ok = gdn_qkv == 3 * self.ssm_inner_size
+                || gdn_qkv == 2 * self.ssm_inner_size
+                || gdn_qkv == self.ssm_inner_size;
+            if !gdn_qkv_ok {
+                errs.push(format!(
+                    "blk.*.attn_qkv: cols {} not a known gdn multiple of ssm_inner ({})",
+                    gdn_qkv, self.ssm_inner_size
+                ));
+            }
             for i in 0..self.n_layers {
                 let p = format!("blk.{i}.");
                 // The real MiniCPM-V 4.7 file has NO `ffn_norm` — qwen35 reuses
@@ -331,9 +363,37 @@ impl ModelConfig {
                         req(&format!("{p}attn_k_norm.weight"), &[hd], &mut errs);
                     }
                 }
-                req(&format!("{p}ffn_gate.weight"), &[dm, ff], &mut errs);
-                req(&format!("{p}ffn_up.weight"), &[dm, ff], &mut errs);
-                req(&format!("{p}ffn_down.weight"), &[ff, dm], &mut errs);
+                if self.is_moe() {
+                    // qwen35moe (PH: MiniCPM-V 4.7-35B-A3B): router + stacked experts +
+                    // optional shared expert; no dense `ffn_{gate,up,down}` weights.
+                    req(
+                        &format!("{p}ffn_gate_inp.weight"),
+                        &[dm, self.n_experts],
+                        &mut errs,
+                    );
+                    req(
+                        &format!("{p}ffn_gate_exps.weight"),
+                        &[dm, ff, self.n_experts],
+                        &mut errs,
+                    );
+                    req(
+                        &format!("{p}ffn_up_exps.weight"),
+                        &[dm, ff, self.n_experts],
+                        &mut errs,
+                    );
+                    req(
+                        &format!("{p}ffn_down_exps.weight"),
+                        &[ff, dm, self.n_experts],
+                        &mut errs,
+                    );
+                    opt(&format!("{p}ffn_gate_shexp.weight"), &[dm, ff], &mut errs);
+                    opt(&format!("{p}ffn_up_shexp.weight"), &[dm, ff], &mut errs);
+                    opt(&format!("{p}ffn_down_shexp.weight"), &[ff, dm], &mut errs);
+                } else {
+                    req(&format!("{p}ffn_gate.weight"), &[dm, ff], &mut errs);
+                    req(&format!("{p}ffn_up.weight"), &[dm, ff], &mut errs);
+                    req(&format!("{p}ffn_down.weight"), &[ff, dm], &mut errs);
+                }
             }
             return errs;
         }
