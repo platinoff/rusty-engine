@@ -47,7 +47,8 @@ fn contraction(cs: &[char], i: usize) -> usize {
     }
     let mut low = String::new();
     let mut j = i + 1;
-    while j < cs.len() && low.len() < 2 {
+    // char count, not byte count — a multibyte prefix char must not truncate early
+    while j < cs.len() && low.chars().count() < 2 {
         let c = cs[j];
         if c.is_alphabetic() {
             low.extend(c.to_lowercase());
@@ -56,10 +57,12 @@ fn contraction(cs: &[char], i: usize) -> usize {
             break;
         }
     }
-    let mut best = 0usize;
+    let mut best = 0usize; // in chars
+    let low_chars: Vec<char> = low.chars().collect();
     for k in CONTRACTIONS {
-        if k.len() <= low.len() && low[..k.len()] == *k && k.len() > best {
-            best = k.len();
+        let kc: Vec<char> = k.chars().collect();
+        if low_chars.len() >= kc.len() && low_chars[..kc.len()] == kc[..] && kc.len() > best {
+            best = kc.len();
         }
     }
     if best == 0 {
@@ -190,6 +193,19 @@ fn pre_split(text: &str, digit_max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multibyte_contraction_tail_does_not_panic() {
+        // Regression: slicing a multibyte-first-char accumulator at byte offsets
+        // panicked ("end byte index 1 is not a char boundary").
+        assert_eq!(qwen2_pre_split("витягти").join(""), "витягти");
+        assert_eq!(qwen2_pre_split("don'я").join(""), "don'я");
+        assert_eq!(
+            qwen2_pre_split("Яка ймовірність витягти червону?").join(""),
+            "Яка ймовірність витягти червону?"
+        );
+        assert_eq!(qwen2_pre_split("ə's curve")[0], "ə");
+    }
 
     #[test]
     fn hello_world_matches_gpt2() {
