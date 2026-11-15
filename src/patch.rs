@@ -124,9 +124,238 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 // ─────────────────────────── Patch wire types ───────────────────────────
 
+/// One staged replacement region inside the raw model file (byte range + new bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Region {
+    pub start: usize,
+    pub span: usize,
+    pub replacement: Vec<u8>,
+}
+
+/// Parse a trivial text wsp pack (no JSON dependency):
+/// ```text
+/// # wsp-pack v1                 (optional comment line)
+/// blk.0.ffn_down.weight 17 <hex bytes> <base_hash_sha256_hex>\n
+/// blk.0.ffn_down.weight 18 <hex bytes> <base_hash_sha256_hex>\n
+/// ```
+pub fn parse_wsp(data: &str) -> PatchResult<PatchPack> {
+    let mut pack = PatchPack::new("wsp");
+    for (lineno, raw) in data.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let tensor = parts.next().ok_or_else(|| {
+            PatchError::Dequant(format!("wsp line {}: missing tensor", lineno + 1))
+        })?;
+        let block_idx: u32 = parts.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+            PatchError::Dequant(format!("wsp line {}: bad block_idx", lineno + 1))
+        })?;
+        let bits_hex = parts.next().ok_or_else(|| {
+            PatchError::Dequant(format!("wsp line {}: missing bits hex", lineno + 1))
+        })?;
+        let base_hash = parts
+            .next()
+            .ok_or_else(|| {
+                PatchError::Dequant(format!("wsp line {}: missing base_hash", lineno + 1))
+            })?
+            .to_string();
+        let bits = hex_decode(bits_hex)
+            .ok_or_else(|| PatchError::Dequant(format!("wsp line {}: bad bits hex", lineno + 1)))?;
+        pack.entries.push(PatchEntry {
+            tensor: tensor.into(),
+            block_idx,
+            new_block_bits: bits,
+            base_hash,
+        });
+    }
+    Ok(pack)
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    for pair in b.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)? as u8;
+        let lo = (pair[1] as char).to_digit(16)? as u8;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+/// Splice `regions` into a fresh copy of `src_bytes` (verifying each region's
+/// content with the caller-resolved slices). Pure, byte-level, unit-testable.
+pub fn apply_regions(src_bytes: &[u8], regions: &[Region]) -> PatchResult<Vec<u8>> {
+    let mut regions: Vec<Region> = regions.to_vec();
+    regions.sort_by_key(|r| r.start);
+    let mut out = src_bytes.to_vec();
+    let mut cur = 0usize;
+    for r in &regions {
+        if r.start < cur {
+            return Err(PatchError::OverlappingPatch {
+                tensor: String::new(),
+                block_idx: 0,
+            });
+        }
+        if r.start + r.span > out.len() {
+            return Err(PatchError::BlockOutOfRange {
+                tensor: String::new(),
+                block_idx: 0,
+                total: out.len() as u32,
+            });
+        }
+        out[r.start..r.start + r.span].copy_from_slice(&r.replacement);
+        cur = r.start + r.span;
+    }
+    Ok(out)
+}
+
+/// Copy `src` → `dst` with regions spliced in (streaming, ~8 MB buffer, no full
+/// file in RAM). Every region already had its base_hash verified by the caller.
+pub fn stage_regions_on_file(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    regions: &[Region],
+) -> Result<usize> {
+    use std::io::{Read, Seek, Write};
+    let mut regions: Vec<Region> = regions.to_vec();
+    regions.sort_by_key(|r| r.start);
+    let mut src_f = std::fs::File::open(src).map_err(|e| EngineError {
+        message: format!("patch stage: open {src:?}: {e}"),
+    })?;
+    let mut dst_f = std::fs::File::create(dst).map_err(|e| EngineError {
+        message: format!("patch stage: create {dst:?}: {e}"),
+    })?;
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    let mut cur: u64 = 0;
+    let mut patched = 0usize;
+    for r in regions {
+        // copy everything before this region
+        let mut remaining = r.start as u64 - cur;
+        while remaining > 0 {
+            let take = remaining.min(buf.len() as u64) as usize;
+            let n = src_f.read(&mut buf[..take]).map_err(|e| EngineError {
+                message: format!("patch stage: read {src:?}: {e}"),
+            })?;
+            if n == 0 {
+                break;
+            }
+            dst_f.write_all(&buf[..n]).map_err(|e| EngineError {
+                message: format!("patch stage: write {dst:?}: {e}"),
+            })?;
+            remaining -= n as u64;
+        }
+        // splice the replacement, skip the original region
+        dst_f.write_all(&r.replacement).map_err(|e| EngineError {
+            message: format!("patch stage: write {dst:?}: {e}"),
+        })?;
+        src_f
+            .seek(std::io::SeekFrom::Start(r.start as u64 + r.span as u64))
+            .map_err(|e| EngineError {
+                message: format!("patch stage: seek {src:?}: {e}"),
+            })?;
+        cur = r.start as u64 + r.span as u64;
+        patched += 1;
+    }
+    // tail
+    loop {
+        let n = src_f.read(&mut buf).map_err(|e| EngineError {
+            message: format!("patch stage: read {src:?}: {e}"),
+        })?;
+        if n == 0 {
+            break;
+        }
+        dst_f.write_all(&buf[..n]).map_err(|e| EngineError {
+            message: format!("patch stage: write {dst:?}: {e}"),
+        })?;
+    }
+    Ok(patched)
+}
+
 /// One block-level patch: replace block `block_idx` of `tensor` with
 /// `new_block_bits` — valid only if the current block bytes hash to
 /// `base_hash` (content-addressed against the base model, ECO-9.2 guard #3).
+/// Stage a **patched copy** of `src` into `dst` — fail-closed full-pack validation
+/// happens BEFORE the destination is created (hash check per block against the
+/// base mmap). The patched file is a complete model (mmap-ready); the caller
+/// opens it with [`crate::loader::MmapModel::open`] as usual.
+pub fn stage_patch(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    pack: &PatchPack,
+) -> Result<usize> {
+    let model = unsafe { crate::loader::MmapModel::open(src) }.map_err(|e| EngineError {
+        message: format!("patch stage: open {src:?}: {e}"),
+    })?;
+    let data_start = model.data_start();
+    let header = model.header();
+    let mut regions: Vec<Region> = Vec::with_capacity(pack.entries.len());
+    for entry in &pack.entries {
+        let te = header
+            .tensors
+            .iter()
+            .find(|t| t.name == entry.tensor)
+            .ok_or_else(|| EngineError {
+                message: format!("patch stage: tensor '{}' not found", entry.tensor),
+            })?;
+        let block_bytes = patch_block_bytes(te.ggml_type).ok_or_else(|| EngineError {
+            message: format!(
+                "patch stage: tensor '{}' ggml_type {} unsupported",
+                entry.tensor, te.ggml_type
+            ),
+        })?;
+        let bytes = model
+            .tensor_bytes(&entry.tensor)
+            .ok_or_else(|| EngineError {
+                message: format!(
+                    "patch stage: tensor '{}' out of bounds or unsized",
+                    entry.tensor
+                ),
+            })?;
+        let total = bytes.len() / block_bytes;
+        if entry.block_idx as usize >= total {
+            return Err(EngineError {
+                message: format!(
+                    "patch stage: tensor '{}' block {} out of range (total {})",
+                    entry.tensor, entry.block_idx, total
+                ),
+            });
+        }
+        if entry.new_block_bits.len() != block_bytes {
+            return Err(EngineError {
+                message: format!(
+                    "patch stage: tensor '{}' block {} needs {} bytes, got {}",
+                    entry.tensor,
+                    entry.block_idx,
+                    block_bytes,
+                    entry.new_block_bits.len()
+                ),
+            });
+        }
+        let block_off = entry.block_idx as usize * block_bytes;
+        let actual = sha256_hex(&bytes[block_off..block_off + block_bytes]);
+        if actual != entry.base_hash.to_lowercase() {
+            return Err(EngineError {
+                message: format!(
+                    "patch stage: tensor '{}' block {} base_hash mismatch (base model differs)",
+                    entry.tensor, entry.block_idx
+                ),
+            });
+        }
+        let abs_start = data_start + te.offset as usize + block_off;
+        regions.push(Region {
+            start: abs_start,
+            span: block_bytes,
+            replacement: entry.new_block_bits.clone(),
+        });
+    }
+    stage_regions_on_file(src, dst, &regions)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchEntry {
     pub tensor: String,
@@ -670,6 +899,144 @@ mod tests {
     }
 
     // ── Synthetic Q4_K / Q6_K blocks ──────────────────────────────────
+
+    // ── WSP pack parsing + stage engine (synthetic, no GGUF needed) ──
+
+    #[test]
+    fn parse_wsp_roundtrip() {
+        let data = "# wsp-pack v1\n\
+                    blk.0.ffn_down.weight 7 0102 00ff\n\
+                    blk.1.ffn_up.weight 0 030405 abcd\n";
+        let pack = parse_wsp(data).expect("parse");
+        assert_eq!(pack.entries.len(), 2);
+        assert_eq!(pack.entries[0].tensor, "blk.0.ffn_down.weight");
+        assert_eq!(pack.entries[0].block_idx, 7);
+        assert_eq!(pack.entries[0].new_block_bits, vec![1, 2]);
+        assert_eq!(pack.entries[1].new_block_bits, vec![3, 4, 5]);
+        assert_eq!(pack.entries[0].base_hash, "00ff");
+    }
+
+    #[test]
+    fn parse_wsp_rejects_garbage() {
+        assert!(parse_wsp("blk.0 x y z\n").is_err());
+        assert!(parse_wsp("blk.0 3 zz 00ff\n").is_err());
+        assert_eq!(
+            parse_wsp("# only comments\n").expect("parse").entries.len(),
+            0
+        );
+    }
+
+    #[test]
+    fn apply_regions_splices_and_preserves_rest() {
+        let src = (0u8..=255).cycle().take(4096).collect::<Vec<u8>>();
+        let regions = vec![
+            Region {
+                start: 100,
+                span: 8,
+                replacement: vec![0xAA; 8],
+            },
+            Region {
+                start: 3000,
+                span: 4,
+                replacement: vec![0xBB; 4],
+            },
+        ];
+        let out = apply_regions(&src, &regions).expect("apply");
+        assert_eq!(out.len(), src.len());
+        assert_eq!(&out[100..108], &[0xAA; 8]);
+        assert_eq!(&out[3000..3004], &[0xBB; 4]);
+        assert_eq!(&out[..100], &src[..100]);
+        assert_eq!(&out[108..3000], &src[108..3000]);
+        assert_eq!(&out[3004..], &src[3004..]);
+    }
+
+    #[test]
+    fn apply_regions_rejects_overlap() {
+        let src = vec![0u8; 100];
+        let regions = vec![
+            Region {
+                start: 10,
+                span: 20,
+                replacement: vec![0; 20],
+            },
+            Region {
+                start: 15,
+                span: 4,
+                replacement: vec![0; 4],
+            },
+        ];
+        assert!(apply_regions(&src, &regions).is_err());
+    }
+
+    #[test]
+    fn stage_regions_on_file_end_to_end() {
+        let dir = std::path::PathBuf::from("target/live");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let src = dir.join("wsp_stage_src.bin");
+        let dst = dir.join("wsp_stage_dst.bin");
+        let src_bytes: Vec<u8> = (0u8..255).cycle().take(2048).collect();
+        std::fs::write(&src, &src_bytes).expect("write src");
+        let regions = vec![
+            Region {
+                start: 100,
+                span: 16,
+                replacement: vec![0x5A; 16],
+            },
+            Region {
+                start: 1900,
+                span: 16,
+                replacement: vec![0xC3; 16],
+            },
+        ];
+        let patched = stage_regions_on_file(&src, &dst, &regions).expect("stage");
+        assert_eq!(patched, 2);
+        let got = std::fs::read(&dst).expect("read dst");
+        assert_eq!(got.len(), src_bytes.len());
+        assert_eq!(&got[100..116], &[0x5A; 16]);
+        assert_eq!(&got[1900..1916], &[0xC3; 16]);
+        assert_eq!(&got[..100], &src_bytes[..100]);
+        assert_eq!(&got[116..1900], &src_bytes[116..1900]);
+        assert_eq!(&got[1916..], &src_bytes[1916..]);
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    #[ignore = "~1 GiB file copy; run explicitly with --ignored"]
+    fn stage_patch_identity_smoke() {
+        let path = std::env::var("RUSTY_MINICPM_GGUF").unwrap_or_else(|_| {
+            "S:/rust/rusty-engine/data/models/MiniCPM-V-4_7-1B-Q4_K_M.gguf".to_string()
+        });
+        let model = unsafe { crate::loader::MmapModel::open(std::path::Path::new(&path)) }
+            .unwrap_or_else(|e| panic!("open {path}: {e}"));
+        let name = "blk.0.ffn_down.weight";
+        let entry = model
+            .header()
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .expect("ffn_down entry");
+        let block_bytes = quant::block_info(entry.ggml_type)
+            .expect("patchable type")
+            .bytes;
+        let block0 = model.tensor_bytes(name).expect("bytes")[..block_bytes].to_vec();
+        let pack = PatchPack::new("id").with_entry(PatchEntry::new(
+            name,
+            0,
+            block0,
+            sha256_hex(model.tensor_bytes(name).expect("bytes")[..block_bytes].as_ref()),
+        ));
+        let dst = std::path::Path::new("target/live/wsp_smoke.gguf");
+        let patched = stage_patch(std::path::Path::new(&path), dst, &pack).expect("stage");
+        assert_eq!(patched, 1);
+        let staged = unsafe { crate::loader::MmapModel::open(dst) }.expect("open staged");
+        assert_eq!(
+            staged.tensor_bytes(name).expect("staged bytes"),
+            model.tensor_bytes(name).expect("base bytes"),
+            "identity patch must not alter tensor bytes"
+        );
+        let _ = std::fs::remove_file(dst);
+    }
 
     // ── Real-model smoke (ignored by default: needs MiniCPM-V 4.7-1B on disk) ──
 
