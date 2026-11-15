@@ -234,48 +234,52 @@ impl TextRunner35 {
 /// Extract a bare `messages[].content` string by scanning a JSON body (no serde dep).
 /// Finds each `"content"`, reads the following quoted string (with `\n`/`\t`/`\"`/`\\`
 /// unescape), and concatenates the values with a space. Returns "" when none present.
+///
+/// UTF-8-safe rewrite (PH: Uk-golden gate): the previous byte scanner pushed
+/// `jb[v] as char`, decoding every byte as Latin-1 — ANY non-ASCII content
+/// (Cyrillic…) reached the model double-encoded. This version walks `chars`,
+/// which is exact for the valid-UTF-8 slices a JSON string can legally hold.
 pub fn extract_message_content(json: &str) -> String {
-    let jb = json.as_bytes();
     let mut parts: Vec<String> = Vec::new();
-    let mut i = 0;
-    while let Some(rel) = json[i..].find("\"content\"") {
-        let mut j = i + rel + "\"content\"".len();
-        while j < jb.len() && (jb[j] as char).is_whitespace() {
-            j += 1;
-        }
-        if j >= jb.len() || jb[j] != b':' {
+    let mut rest: &str = json;
+    while let Some(rel) = rest.find("\"content\"") {
+        let after_key = rest[rel + "\"content\"".len()..].trim_start();
+        let Some(after_colon) = after_key.strip_prefix(':') else {
             break;
-        }
-        let mut v = j + 1;
-        while v < jb.len() && (jb[v] as char).is_whitespace() {
-            v += 1;
-        }
-        if v >= jb.len() || jb[v] != b'"' {
+        };
+        let after_colon = after_colon.trim_start();
+        if !after_colon.starts_with('"') {
             break; // non-string content (number/null/object) — stop
         }
-        v += 1;
+        let s = &after_colon[1..];
         let mut val = String::new();
-        while v < jb.len() {
-            match jb[v] {
-                b'"' => break,
-                b'\\' if v + 1 < jb.len() => {
-                    v += 1;
-                    match jb[v] {
-                        b'n' => val.push('\n'),
-                        b't' => val.push('\t'),
-                        b'\\' => val.push('\\'),
-                        b'"' => val.push('"'),
-                        c => val.push(c as char),
+        let mut consumed = 0usize; // bytes of `s` consumed (incl. closing quote)
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            consumed += c.len_utf8();
+            match c {
+                '"' => break,
+                '\\' => match chars.next() {
+                    Some(e) => {
+                        consumed += e.len_utf8();
+                        match e {
+                            'n' => val.push('\n'),
+                            't' => val.push('\t'),
+                            'r' => val.push('\r'),
+                            '\\' => val.push('\\'),
+                            '"' => val.push('"'),
+                            other => val.push(other),
+                        }
                     }
-                }
-                _ => val.push(jb[v] as char),
+                    None => break,
+                },
+                c => val.push(c),
             }
-            v += 1;
         }
         if !val.is_empty() {
             parts.push(val);
         }
-        i = v + 1;
+        rest = &s[consumed..];
     }
     parts.join(" ")
 }
@@ -402,6 +406,27 @@ mod tests {
         assert!(extract_message_content(j).starts_with('a'));
         assert_eq!(extract_message_content("{}"), "");
         assert_eq!(extract_message_content(r#"{"max_tokens":8}"#), "");
+    }
+
+    #[test]
+    fn extract_preserves_utf8_cyrillic() {
+        let j = r#"{"messages":[{"role":"user","content":"Яка столиця України?"}]}"#;
+        assert_eq!(extract_message_content(j), "Яка столиця України?");
+    }
+
+    #[test]
+    fn extract_preserves_utf8_mixed_escapes() {
+        let j = r#"{"messages":[{"role":"user","content":"Привіт\nяк справи"}]}"#;
+        assert_eq!(extract_message_content(j), "Привіт\nяк справи");
+    }
+
+    #[test]
+    fn extract_utf8_concatenates_turns() {
+        let j = r#"{"messages":[{"role":"system","content":"Ти україномовний"},{"role":"user","content":"Хто написав Кобзар?"}]}"#;
+        assert_eq!(
+            extract_message_content(j),
+            "Ти україномовний Хто написав Кобзар?"
+        );
     }
 
     #[test]
