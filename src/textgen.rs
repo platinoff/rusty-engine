@@ -171,6 +171,21 @@ impl TextRunner35 {
         })
     }
 
+    /// `ActivationAudit` capture (ECO-9.2 phase 9.3a): per-(token, layer) stats
+    /// over the prompt's prefill. Returns one [`crate::runner35::AuditEntry`]
+    /// per (prompt token, layer). No state persisted; the decoder is fresh.
+    pub fn audit(&mut self, prompt: &str) -> Result<Vec<crate::runner35::AuditEntry>> {
+        let ids = self.bpe.encode(prompt)?;
+        if ids.is_empty() {
+            return Err(EngineError {
+                message: "textgen35: audit prompt tokenized to empty".to_string(),
+            });
+        }
+        let mut dec = crate::runner35::Q35Decoder::new(&self.runner);
+        let (_logits, audit) = dec.prefill_with_audit(&ids);
+        Ok(audit)
+    }
+
     /// Shared `EN-7b` path: load-or-prefill the prompt state, then greedy-generate.
     /// Misses at the restore step rebuild a virgin decoder so a corrupt snapshot can
     /// never poison a prefill; stores are best-effort (a busy disk stays a miss).

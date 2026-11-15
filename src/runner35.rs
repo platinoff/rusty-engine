@@ -294,6 +294,40 @@ pub struct Q35Decoder<'a> {
     seq_len: usize,
 }
 
+/// One per-block activation stat — the raw material of `ActivationAudit`
+/// (ECO-9.2 sketch, phase 9.3a; WSP candidate-block selection for MiniCPM).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditEntry {
+    /// Position of the prompt/decode token this record belongs to.
+    pub token_idx: usize,
+    pub layer: usize,
+    /// `"recurrent"` (GDN hybrid blocks) or `"full"` (full-attention blocks).
+    pub kind: &'static str,
+    /// RMS of the residual stream entering the block.
+    pub entry_rms: f32,
+    /// RMS of the residual-stream change this block applied.
+    pub delta_rms: f32,
+}
+
+fn rms_abs(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn rms_abs_basics() {
+        assert_eq!(rms_abs(&[]), 0.0);
+        assert!((rms_abs(&[3.0, 4.0]) - (25.0f32 / 2.0f32).sqrt()).abs() < 1e-6);
+        assert_eq!(rms_abs(&[0.0, 0.0]), 0.0);
+    }
+}
+
 /// `EN-7b`: frozen delta-state of a [`Q35Decoder`] at one sequence position — the GDN
 /// windows, the full-block KV caches, the sequence length, **and** the next-token
 /// logits that ended the prefill. Owns its data so it can live past the decoder.
@@ -455,6 +489,49 @@ impl<'a> Q35Decoder<'a> {
         self.seq_len += 1;
         let normed = rmsnorm(&hidden, &self.runner.output_norm, self.runner.eps);
         self.runner.output.matvec(&normed)
+    }
+
+    /// Same math as [`Self::step`] but also records one [`AuditEntry`] per
+    /// (token, layer): RMS of the block's input and RMS of the block's delta.
+    /// This is the capture half of `ActivationAudit` (ECO-9.2 phase 9.3a).
+    pub fn step_with_audit(
+        &mut self,
+        tok: u32,
+        token_idx: usize,
+        audit: &mut Vec<AuditEntry>,
+    ) -> Vec<f32> {
+        let pos = self.seq_len;
+        let mut hidden = self.runner.embed_row(tok).to_vec();
+        for i in 0..self.runner.n_layers {
+            let kind = match self.runner.blocks[i].kind {
+                LayerKind::Recurrent => "recurrent",
+                LayerKind::Full => "full",
+            };
+            let entry_rms = rms_abs(&hidden);
+            let pre = hidden.clone();
+            hidden = self.runner.block_row(i, &hidden, pos, self);
+            let delta: Vec<f32> = hidden.iter().zip(&pre).map(|(a, b)| a - b).collect();
+            audit.push(AuditEntry {
+                token_idx,
+                layer: i,
+                kind,
+                entry_rms,
+                delta_rms: rms_abs(&delta),
+            });
+        }
+        self.seq_len += 1;
+        let normed = rmsnorm(&hidden, &self.runner.output_norm, self.runner.eps);
+        self.runner.output.matvec(&normed)
+    }
+
+    /// Prefill with the audit capture — returns (logits, per-(token,layer) stats).
+    pub fn prefill_with_audit(&mut self, prompt: &[u32]) -> (Vec<f32>, Vec<AuditEntry>) {
+        let mut logits = Vec::new();
+        let mut audit = Vec::with_capacity(prompt.len() * self.runner.n_layers);
+        for (idx, &t) in prompt.iter().enumerate() {
+            logits = self.step_with_audit(t, idx, &mut audit);
+        }
+        (logits, audit)
     }
 
     /// Prefill = stepping the prompt (bit-exact base path; batched fusion is `PH-1305`).

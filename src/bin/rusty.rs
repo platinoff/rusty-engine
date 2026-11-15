@@ -24,6 +24,7 @@ fn main() {
             println!("  tokenize -m <f> -p <txt>  BPE token ids, no weights      (PH-1305)");
             println!("  run -m <model> -p <text>  BPE text generation        (PH-306b)");
             println!("  run -m <model> -t <ids>   numeric-token greedy       (PH-306)");
+            println!("  audit -m <model> -p <txt> ActivationAudit stats (json) (ECO-9.2 9.3a)");
             println!(
                 "  serve [--port N] [--host H]  OpenAI-compat HTTP, LAN-first :8092 (PH-501a/507, EN-8; :8090 is rebook view)"
             );
@@ -71,6 +72,7 @@ fn main() {
         },
         Some("tokenize") => tokenize_cmd(args),
         Some("run") => run(args),
+        Some("audit") => audit_cmd(args),
         Some("serve") => serve_cmd(args),
         Some("heartbeat") => heartbeat_cmd(),
         Some("worker") => worker_cmd(args),
@@ -428,6 +430,101 @@ fn tokenize_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
 
 /// `rusty run -m <model.gguf> (-p "text" | -t "0,1,2") [--max-tokens N]` — dense greedy
 /// generation. `-p` runs the BPE text pipeline (PH-306b); `-t` uses numeric token ids (PH-306).
+/// JSON-escape a string for embedding in a hand-rolled JSON object.
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// `rusty audit -m <model.gguf> -p "text"` — ActivationAudit stats dump (ECO-9.2 phase 9.3a).
+/// Runs the prompt's prefill and emits one JSON object: mean/max per layer of the
+/// residual-stream RMS (block entry) and of the block's delta.
+fn audit_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
+    let mut model_path: Option<String> = None;
+    let mut prompt: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-m" | "--model" => model_path = args.next(),
+            "-p" | "--prompt" => prompt = args.next(),
+            other => {
+                eprintln!("rusty audit: unknown arg '{other}'");
+                std::process::exit(2);
+            }
+        }
+    }
+    let (path, text) = match (model_path, prompt) {
+        (Some(p), Some(t)) if !p.is_empty() && !t.is_empty() => (p, t),
+        _ => {
+            eprintln!("usage: rusty audit -m <model.gguf> -p \"text\"");
+            std::process::exit(2);
+        }
+    };
+    let model = match unsafe { rusty_engine::loader::MmapModel::open(Path::new(&path)) } {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("rusty audit {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut tr = match rusty_engine::textgen::TextRunner35::from_model(&model) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("rusty audit {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let audit = match tr.audit(&text) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("rusty audit {text}: {e}");
+            std::process::exit(1);
+        }
+    };
+    use std::collections::BTreeMap;
+    #[derive(Default)]
+    struct Agg {
+        kind: &'static str,
+        sum_entry: f64,
+        sum_delta: f64,
+        max_delta: f32,
+        n: usize,
+    }
+    let mut by_layer: BTreeMap<usize, Agg> = BTreeMap::new();
+    for e in &audit {
+        let a = by_layer.entry(e.layer).or_insert_with(|| Agg {
+            kind: e.kind,
+            ..Agg::default()
+        });
+        a.sum_entry += e.entry_rms as f64;
+        a.sum_delta += e.delta_rms as f64;
+        a.max_delta = a.max_delta.max(e.delta_rms);
+        a.n += 1;
+    }
+    let mut out = format!(
+        "{{\"model\":\"{}\",\"prompt\":\"{}\",\"prompt_tokens\":{},\"layers\":[",
+        json_escape(&path),
+        json_escape(&text),
+        audit.iter().map(|e| e.token_idx).max().map_or(0, |m| m + 1)
+    );
+    for (i, (layer, a)) in by_layer.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"layer\":{},\"kind\":\"{}\",\"entry_rms_mean\":{:.4},\"delta_rms_mean\":{:.4},\"delta_rms_max\":{:.4}}}",
+            layer,
+            a.kind,
+            a.sum_entry / a.n as f64,
+            a.sum_delta / a.n as f64,
+            a.max_delta
+        ));
+    }
+    out.push_str("]}");
+    println!("{out}");
+    std::process::exit(0);
+}
+
 fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
     let mut model_path: Option<String> = None;
     let mut tokens: Vec<u32> = Vec::new();
