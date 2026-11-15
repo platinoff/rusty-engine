@@ -25,7 +25,7 @@ fn main() {
             println!("  run -m <model> -p <text>  BPE text generation        (PH-306b)");
             println!("  run -m <model> -t <ids>   numeric-token greedy       (PH-306)");
             println!("  audit -m <model> -p <txt> ActivationAudit stats (json) (ECO-9.2 9.3a)");
-            println!("  pack-mint -m <model> -t <tensor> -b <idx> [--zero]  WSP pack line (stdout) (ECO-9.2 9.3b)");
+            println!("  pack-mint -m <model> -t <tensor> -b <idx>|--all [--zero]  WSP pack lines (stdout) (ECO-9.2 9.3b)");
             println!(
                 "  serve [--port N] [--host H] [--patch <wsp>]  OpenAI-compat HTTP, LAN-first :8092 (PH-501a/507, EN-8; :8090 is rebook view)"
             );
@@ -527,15 +527,18 @@ fn audit_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
     std::process::exit(0);
 }
 
-/// `rusty pack-mint -m <model.gguf> -t <tensor> -b <block_idx> [--zero]` — mint one
-/// wsp-pack line for a block. Default mode: identity (same bits, true base_hash) —
-/// useful for validating the serve `--patch` pipeline. `--zero`: replacement is an
-/// all-zero block (ablation probe). Output line is valid input for `rusty serve --patch`.
+/// `rusty pack-mint -m <model.gguf> -t <tensor> [--zero] (-b <block_idx> | --all)`
+/// — mint one wsp-pack line for a block or for every block of a tensor.
+/// Default mode: identity receipt (same bits, true base_hash) — useful for
+/// validating the serve `--patch` pipeline. `--zero`: replacement is an
+/// all-zero block (ablation probes for MC-6). Output lines are valid input
+/// for `rusty serve --patch`.
 fn pack_mint_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
     let mut model_path: Option<String> = None;
     let mut tensor: Option<String> = None;
     let mut block_idx: Option<u32> = None;
     let mut zero = false;
+    let mut all = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-m" | "--model" => model_path = args.next(),
@@ -544,16 +547,19 @@ fn pack_mint_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
                 block_idx = args.next().and_then(|v| v.parse::<u32>().ok());
             }
             "--zero" => zero = true,
+            "--all" => all = true,
             other => {
                 eprintln!("rusty pack-mint: unknown arg '{other}'");
                 std::process::exit(2);
             }
         }
     }
-    let (path, name, blk) = match (model_path, tensor, block_idx) {
-        (Some(p), Some(t), Some(b)) if !p.is_empty() && !t.is_empty() => (p, t, b),
+    let (path, name) = match (model_path, tensor) {
+        (Some(p), Some(t)) if !p.is_empty() && !t.is_empty() => (p, t),
         _ => {
-            eprintln!("usage: rusty pack-mint -m <model.gguf> -t <tensor> -b <idx> [--zero]");
+            eprintln!(
+                "usage: rusty pack-mint -m <model.gguf> -t <tensor> (-b <idx> | --all) [--zero]"
+            );
             std::process::exit(2);
         }
     };
@@ -589,19 +595,41 @@ fn pack_mint_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
         }
     };
     let total = bytes.len() / block_bytes;
-    if blk as usize >= total {
+    let emit = |blk: usize| {
+        let start = blk * block_bytes;
+        let block = &bytes[start..start + block_bytes];
+        let base = rusty_engine::patch::sha256_hex(block);
+        let bits: String = if zero {
+            "00".repeat(block_bytes)
+        } else {
+            block.iter().map(|b| format!("{b:02x}")).collect()
+        };
+        println!("{name} {blk} {bits} {base}");
+    };
+    if all {
+        if block_idx.is_some() {
+            eprintln!("rusty pack-mint: -b/--block and --all are mutually exclusive");
+            std::process::exit(2);
+        }
+        for blk in 0..total {
+            emit(blk);
+        }
+        std::process::exit(0);
+    }
+    let blk = match block_idx {
+        Some(b) => b as usize,
+        None => {
+            eprintln!(
+                "usage: rusty pack-mint -m <model.gguf> -t <tensor> (-b <idx> | --all) [--zero]"
+            );
+            std::process::exit(2);
+        }
+    };
+    if blk >= total {
         eprintln!("rusty pack-mint: block {blk} out of range (total {total})");
         std::process::exit(1);
     }
-    let start = blk as usize * block_bytes;
-    let block = &bytes[start..start + block_bytes];
-    let base = rusty_engine::patch::sha256_hex(block);
-    let bits: String = if zero {
-        "00".repeat(block_bytes)
-    } else {
-        block.iter().map(|b| format!("{b:02x}")).collect()
-    };
-    println!("{name} {blk} {bits} {base}");
+    emit(blk);
     std::process::exit(0);
 }
 
