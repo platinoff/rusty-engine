@@ -18,6 +18,7 @@ fn main() {
             println!("  --help, -h      print this banner");
             println!("  inspect <file> [N]        GGUF metadata summary      (PH-107)");
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
+            println!("  dump-f32 <file> <name> <out.bin>  raw LE f32 bytes of one tensor   (MC-2)");
             println!("  config <file>             read model hyperparameters (PH-305c)");
             println!("  validate <file>           check tensor names/dims vs config (PH-305e)");
             println!("  tokenize -m <f> -p <txt>  BPE token ids, no weights      (PH-1305)");
@@ -37,6 +38,13 @@ fn main() {
             Some(path) => inspect(&path, args.next().as_deref()),
             None => {
                 eprintln!("usage: rusty inspect <model.gguf>");
+                std::process::exit(2);
+            }
+        },
+        Some("dump-f32") => match (args.next(), args.next(), args.next()) {
+            (Some(path), Some(name), Some(out)) => dump_f32(&path, &name, &out),
+            _ => {
+                eprintln!("usage: rusty dump-f32 <model.gguf> <tensor.name> <out.bin>");
                 std::process::exit(2);
             }
         },
@@ -232,6 +240,64 @@ fn tensor(path: &str, name: &str) {
 }
 
 /// Read model hyperparameters (PH-305c) from a GGUF header.
+/// Dump one tensor as raw little-endian f32 bytes (LE copy for F32, dequant for
+/// quantized). Used to stage MiniCPM weights for the GSV-WGPU mesh (MC-2): peers
+/// verify chunk sha256 and compute matvecs on-device without any synthetic weights.
+fn dump_f32(path: &str, name: &str, out: &str) {
+    let model = match unsafe { rusty_engine::loader::MmapModel::open(Path::new(path)) } {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("rusty dump-f32 {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let entry = match model.header().tensors.iter().find(|t| t.name == name) {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "rusty dump-f32: tensor '{name}' not found in {} tensors",
+                model.header().tensors.len()
+            );
+            std::process::exit(1);
+        }
+    };
+    let numel = entry.numel();
+    let floats: Vec<f32> = if entry.ggml_type == 0 {
+        match model.tensor_bytes(name) {
+            Some(b) => b
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            None => {
+                eprintln!("rusty dump-f32: tensor '{name}' F32 bounds-check failed");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match model.dequant(name) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("rusty dump-f32: dequant '{name}': {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+    let mut bytes = Vec::with_capacity(floats.len() * 4);
+    for v in &floats {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    if let Err(e) = std::fs::write(out, &bytes) {
+        eprintln!("rusty dump-f32: write '{out}': {e}");
+        std::process::exit(1);
+    }
+    println!(
+        "'{name}' dims={:?} ggml={} numel={numel} -> '{out}' ({} bytes LE f32)",
+        entry.dims,
+        entry.ggml_type,
+        bytes.len()
+    );
+}
+
 fn config(path: &str) {
     match rusty_engine::gguf::parse_file(Path::new(path), rusty_engine::gguf::INSPECT_WINDOW) {
         Ok(f) => match rusty_engine::model::ModelConfig::from_file(&f) {
