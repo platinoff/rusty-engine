@@ -35,6 +35,7 @@
 
 pub mod backend;
 pub mod cache;
+pub mod chatml;
 pub mod core;
 pub mod forward;
 pub mod gdn;

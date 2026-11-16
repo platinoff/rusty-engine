@@ -9,13 +9,13 @@
 //! whole text stack is unit-testable without a downloaded model; numeric/parity against a
 //! reference is the separate `PH-405` gate.
 
+use crate::chatml;
 use crate::core::{EngineError, Result};
 use crate::loader::MmapModel;
 use crate::model::ModelConfig;
 use crate::runner::{DenseDecoder, DenseRunner};
 use crate::runner35::{Q35Decoder, Q35Runner, TraceStep};
 use crate::tokenizer::{Bpe, TokenizerMeta};
-
 /// A dense runner paired with the model's byte-level BPE, for text in / text out.
 pub struct TextRunner {
     pub runner: DenseRunner,
@@ -44,7 +44,7 @@ impl Completes for TextRunner {
 
 impl Completes for TextRunner35 {
     fn complete(&self, messages_json: &str, max_new: usize) -> Result<String> {
-        let prompt = extract_message_content(messages_json);
+        let prompt = chat_prompt(messages_json).prompt;
         if prompt.trim().is_empty() {
             return Err(EngineError {
                 message: "textgen35: prompt has no message content".to_string(),
@@ -108,11 +108,12 @@ impl TextRunner {
         self.bpe.encode(text)
     }
 
-    /// PH-501b: run one chat completion. Concatenates `messages[].content`, encodes via
-    /// BPE, generates greedily (`max_new`), then decodes only the **new** tokens and
-    /// returns the assistant text. Errors when prompt is empty or has no text content.
+    /// PH-501b: run one chat completion. Applies the model's ChatML template
+    /// server-side then encodes via BPE, generates greedily (`max_new`), and
+    /// decodes only the **new** tokens back to text. `RUSTY_CHAT_TEMPLATE=raw`
+    /// reverts to the pre-template wire for Uk-golden baseline comparisons.
     pub fn complete(&self, messages_json: &str, max_new: usize) -> Result<String> {
-        let prompt = extract_message_content(messages_json);
+        let prompt = chat_prompt(messages_json).prompt;
         if prompt.trim().is_empty() {
             return Err(EngineError {
                 message: "textgen: prompt has no message content".to_string(),
@@ -254,6 +255,31 @@ impl TextRunner35 {
 /// `jb[v] as char`, decoding every byte as Latin-1 — ANY non-ASCII content
 /// (Cyrillic…) reached the model double-encoded. This version walks `chars`,
 /// which is exact for the valid-UTF-8 slices a JSON string can legally hold.
+pub struct ChatPrompt {
+    pub prompt: String,
+}
+
+/// Resolve the wire prompt for a chat completion. Priority: ChatML template
+/// (default, matches the model's `<|im_start|>` framing) unless the caller
+/// explicitly sets `RUSTY_CHAT_TEMPLATE=raw` (keeps the pre-PH-1306 raw-concat
+/// path available for audits against the old baseline).
+pub fn chat_prompt(json: &str) -> ChatPrompt {
+    match std::env::var_os("RUSTY_CHAT_TEMPLATE")
+        .map(|v| v.to_string_lossy().into_owned())
+        .as_deref()
+    {
+        Some("raw") => ChatPrompt {
+            prompt: extract_message_content(json),
+        },
+        _ => match chatml::apply_chatml_template(json) {
+            Ok(prompt) => ChatPrompt { prompt },
+            Err(_) => ChatPrompt {
+                prompt: extract_message_content(json),
+            },
+        },
+    }
+}
+
 pub fn extract_message_content(json: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut rest: &str = json;
