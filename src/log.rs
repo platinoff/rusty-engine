@@ -47,7 +47,11 @@ fn rolling_open() -> Option<std::fs::File> {
             roll(&dir, &active);
         }
     }
-    OpenOptions::new().create(true).append(true).open(&active).ok()
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&active)
+        .ok()
 }
 
 fn stamp() -> String {

@@ -876,7 +876,13 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
         }
     }
     let addr = format!("{host}:{port}");
-    rusty_engine::log::log_line("serve", &format!("bind http://{addr} model={}", model_path.as_deref().unwrap_or("<stub>")));
+    rusty_engine::log::log_line(
+        "serve",
+        &format!(
+            "bind http://{addr} model={}",
+            model_path.as_deref().unwrap_or("<stub>")
+        ),
+    );
     println!(
         "{} — serving on http://{addr} (Ctrl-C to stop)",
         rusty_engine::banner()
@@ -904,12 +910,18 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
                 if hybrid {
                     match rusty_engine::textgen::TextRunner35::from_model(&m) {
                         Ok(tr) => {
-                            rusty_engine::log::log_line("model", &format!("{p} qwen35 hybrid {} layers", tr.runner.n_layers));
+                            rusty_engine::log::log_line(
+                                "model",
+                                &format!("{p} qwen35 hybrid {} layers", tr.runner.n_layers),
+                            );
                             println!("  model: {p} ({} layers, hybrid)", tr.runner.n_layers);
                             rusty_engine::serve::serve_with_model(&addr, &tr)
                         }
                         Err(e) => {
-                            rusty_engine::log::log_line("model", &format!("{p} hybrid load failed: {e}"));
+                            rusty_engine::log::log_line(
+                                "model",
+                                &format!("{p} hybrid load failed: {e}"),
+                            );
                             eprintln!("rusty serve: model load: {e}");
                             std::process::exit(1);
                         }
@@ -917,7 +929,10 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
                 } else {
                     match rusty_engine::textgen::TextRunner::from_model(&m) {
                         Ok(tr) => {
-                            rusty_engine::log::log_line("model", &format!("{p} dense {} layers", tr.runner.n_layers));
+                            rusty_engine::log::log_line(
+                                "model",
+                                &format!("{p} dense {} layers", tr.runner.n_layers),
+                            );
                             println!("  model: {p} ({} layers)", tr.runner.n_layers);
                             rusty_engine::serve::serve_with_model(&addr, &tr)
                         }
