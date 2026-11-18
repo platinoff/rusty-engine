@@ -9,7 +9,7 @@ llama-rs, which delegates MoE to llama.cpp's C++ path), so the same engine ships
 Windows/Linux hosts and Android slaves over local Wi-Fi/LAN.
 
 - **License:** MIT — `Copyright (c) 2026 platinoff / Madevinc`.
-- **Toolchain:** pinned `1.92.0-x86_64-pc-windows-gnu`; MSYS2 bash (never PowerShell).
+- **Toolchain:** pinned `1.100.0-x86_64-pc-windows-gnu`; MSYS2 bash (never PowerShell).
 - **Ratio target:** Rust 95–100% (UI is thin glue; Rust renders the pages).
 
 ## Docs

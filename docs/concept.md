@@ -64,7 +64,7 @@ leases → expert-паралелізм.
 
 ## 6. Технічні специфікації
 
-- **6.1** rust-toolchain pin `1.92.0-x86_64-pc-windows-gnu`; MSYS2 bash; shell ≠ PowerShell.
+- **6.1** rust-toolchain pin `1.100.0-x86_64-pc-windows-gnu`; MSYS2 bash; shell ≠ PowerShell.
 - **6.2** Ratio: Rust **95–100%**; `ui/` — тонкий glue; plugin-гейт тестами (LOC-ratchet +
   UI-інваріанти + scaffold-contracts).
 - **6.3** Мережевий код (docker/orchestrator) — dry-run за замовчуванням, `--live` за

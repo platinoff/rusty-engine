@@ -45,7 +45,7 @@ MoE-двигун** (GGUF-first), MIT, під GSV-хабом. Рішення owne
 
 - `Cargo.toml` — workspace (`members=["xtask"]`) + root pkg `rusty-engine` (lib
   `rusty_engine`, bin `rusty`), MIT metadata, `authors=["platinoff"]`, `repository`
-  `github.com/platinoff/rusty-engine`. `rust-toolchain.toml` pin `1.92.0-x86_64-pc-windows-gnu`.
+  `github.com/platinoff/rusty-engine`. `rust-toolchain.toml` pin `1.100.0-x86_64-pc-windows-gnu`.
 - `src/lib.rs` — модуль-карта (`core/gguf/moe/infer/serve/node/hub`), `CRATE_NAME`/`VERSION`/`banner()`.
 - `src/core.rs` — `DType`(F32/F16/Q4_0..Q8_0/I8), `TensorInfo.numel()`, `EngineError`/`Result` — 2 unit.
 - `src/gguf.rs` — `GGUF_MAGIC` + `matches_magic()` — 2 unit.

@@ -31,7 +31,7 @@ of llama-rs/poolAI. GSV is the **mother hub / master**. Canon сесії:
 - UI-рендер — **Rust** (`src/ui.rs`: `/page/{name}` + `GET /api/ui/card/{name}`); дії —
   GET/POST-форми. `ui/js/app.js` — лише chrome (тема, сайдбар, хоткеї `d m i k f s o l`,
   панель `?`). Ніколи не повертати рендер у JS, не послаблювати рашет нижче 0.95.
-- Toolchain: `rust-toolchain.toml` pin `1.92.0-x86_64-pc-windows-gnu` (той самий, що GSV). Shell — MSYS2 bash.
+- Toolchain: `rust-toolchain.toml` pin `1.100.0-x86_64-pc-windows-gnu` (той самий, що GSV). Shell — MSYS2 bash.
 
 ## Domain rules (local)
 
