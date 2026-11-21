@@ -1064,7 +1064,7 @@ mod tests {
             kv: vec![("general.name".into(), Value::Str("gasv-test".into()))],
         };
         let (b1, r1) = build_skeleton(&spec).expect("build1");
-        let (b2, r2) = build_skeleton(&spec).expect("build2");
+        let (b2, _r2) = build_skeleton(&spec).expect("build2");
         assert_eq!(b1, b2, "same seed/spec must be deterministic");
         assert_eq!(r1.n_tensors, 2);
         let f = parse(&b1).expect("parse");
@@ -1074,5 +1074,41 @@ mod tests {
             Some(&Value::Str("splitmix64-f32-v1".into()))
         );
         assert_eq!(f.tensors.len(), 2);
+    }
+
+    #[test]
+    fn skeleton_smoke_validate_parse_manifest_load_dequant() {
+        let spec = SkeletonSpec {
+            arch: "gasvtest".into(),
+            seed: 7,
+            alignment: 32,
+            context_length: 128,
+            tensors: vec![SkeletonTensorSpec {
+                name: "tok.weight".into(),
+                dims: vec![4, 8],
+                ggml_type: 0,
+            }],
+            kv: vec![],
+        };
+        let (bytes, report) = build_skeleton(&spec).expect("build");
+        assert_eq!(report.n_tensors, 1);
+        // parse header
+        let f = parse(&bytes).expect("parse");
+        assert_eq!(
+            f.get("general.architecture"),
+            Some(&Value::Str("gasvtest".into()))
+        );
+        // write/read file + inspect-style parse_file
+        std::fs::create_dir_all("target").unwrap();
+        let path = std::path::Path::new("target/gasv_skeleton_smoke.gguf");
+        std::fs::write(path, &bytes).unwrap();
+        let f2 = parse_file(path, INSPECT_WINDOW).expect("parse_file");
+        assert_eq!(f2.tensors[0].name, "tok.weight");
+        // smoke load/dequant via MmapModel
+        let model = unsafe { crate::loader::MmapModel::open(path) }.expect("open");
+        let vals = model.dequant("tok.weight").expect("dequant");
+        assert_eq!(vals.len(), 32);
+        assert!(vals.iter().all(|v| v.is_finite()));
+        let _ = std::fs::remove_file(path);
     }
 }
