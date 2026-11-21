@@ -1483,7 +1483,7 @@ mod tests {
         let (bytes, report) = w.write_to_vec().expect("write");
         let prov = GasvExportProvenance {
             schema: "gasv.export-provenance.v1".into(),
-            artifact: "gasv-versus-ai.gguf".into(),
+            artifact: "gsv-versus-ai.gguf".into(),
             source_gguf: Some("source.gguf".into()),
             source_manifest: Some("gasv.transplant-manifest.v1".into()),
             arch: Some("gasvtest".into()),

@@ -3,7 +3,7 @@
 **Date:** 2026-11-21  
 **Ticket:** `t-1795270403090130500` (rusty-engine, in_progress)  
 **Scope:** research/docs only. No GGUF writes, no weights.  
-**Plan:** `S:\rust\GSV\docs\superpowers/plans/2026-11-21-gasv-versus-ai-wgpu-cluster-skeleton.md`
+**Plan:** `S:\rust\GSV\docs\superpowers/plans/2026-11-21-gsv-versus-ai-wgpu-cluster-skeleton.md`
 
 ## 1. Current state (rusty-engine)
 
@@ -129,7 +129,7 @@ Notes:
 - **GASV-C2:** deterministic random-init skeleton from `SkeletonSpec`; no claims of model quality.
 - **GASV-D1:** compatible tensor transplant using `TensorBytes::Raw` with manifest + checksum.
 - **GASV-D3:** Q4_K_M export only after quant encoder parity gate.
-- **Artifact:** `gasv-versus-ai.gguf` emitted outside git (`L:\gsv_mirror\models\gasv-versus-ai\` or owner-approved path) with SHA256 + manifest.
+- **Artifact:** `gsv-versus-ai.gguf` emitted outside git (`L:\gsv_mirror\models\gsv-versus-ai\` or owner-approved path) with SHA256 + manifest.
 
 ## 7. Risks / non-goals
 
