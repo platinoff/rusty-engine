@@ -20,6 +20,8 @@ fn main() {
             println!("  manifest <file> [--sha256] GGUF JSON manifest (read-only, GASV)");
             println!("  skeleton <spec.json> <out.gguf>  deterministic GGUF skeleton (GASV-C2)");
             println!("  transplant-mirror <skeleton.gguf> <tensors.json> <chunks_dir> <out.gguf>  direct-copy mirror tensors into skeleton (GASV-D1)");
+            println!("  quantize-export <in.gguf> <out.gguf> <q4_0|q8_0> [--report <path>]  quantize F32 GGUF (GASV-D3/F2)");
+            println!("  artifact-report <file.gguf> [--kind K] [--runnable true|false] [--source S] [--coverage C] [--transplant-report-sha256 H]  GASV artifact contract (F1)");
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  dump-f32 <file> <name> <out.bin>  raw LE f32 bytes of one tensor   (MC-2)");
             println!("  config <file>             read model hyperparameters (PH-305c)");
@@ -83,6 +85,59 @@ fn main() {
                 std::process::exit(2);
             }
         },
+        Some("quantize-export") => {
+            let inp = args.next();
+            let out = args.next();
+            let q = args.next();
+            let mut report: Option<String> = None;
+            while let Some(a) = args.next() {
+                if a == "--report" {
+                    report = args.next();
+                }
+            }
+            match (inp, out, q) {
+                (Some(i), Some(o), Some(qt)) => quantize_export(&i, &o, &qt, report.as_deref()),
+                _ => {
+                    eprintln!("usage: rusty quantize-export <in.gguf> <out.gguf> <q4_0|q8_0> [--report <path>]");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("artifact-report") => {
+            let path = match args.next() {
+                Some(p) => p,
+                None => {
+                    eprintln!("usage: rusty artifact-report <file.gguf> [--kind K] [--runnable true|false] [--source S] [--coverage C] [--transplant-report-sha256 H]");
+                    std::process::exit(2);
+                }
+            };
+            let mut kind = "partial-shexp-pack".to_string();
+            let mut runnable = false;
+            let mut source = String::new();
+            let mut coverage = String::new();
+            let mut transplant_sha = String::new();
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--kind" => {
+                        kind = args.next().unwrap_or(kind);
+                    }
+                    "--runnable" => {
+                        runnable = args.next().as_deref() == Some("true");
+                    }
+                    "--source" => {
+                        source = args.next().unwrap_or_default();
+                    }
+                    "--coverage" => {
+                        coverage = args.next().unwrap_or_default();
+                    }
+                    "--transplant-report-sha256" => {
+                        transplant_sha = args.next().unwrap_or_default();
+                    }
+                    _ => {}
+                }
+            }
+            artifact_report(&path, &kind, runnable, &source, &coverage, &transplant_sha);
+        }
         Some("dump-f32") => match (args.next(), args.next(), args.next()) {
             (Some(path), Some(name), Some(out)) => dump_f32(&path, &name, &out),
             _ => {
@@ -1418,6 +1473,232 @@ fn transplant_mirror(skel_path: &str, tensors_json: &str, chunks_dir: &str, out_
         }
         Err(e) => {
             eprintln!("rusty transplant-mirror: write {out_path}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn artifact_report(
+    path: &str,
+    kind: &str,
+    runnable: bool,
+    source: &str,
+    coverage: &str,
+    transplant_sha: &str,
+) {
+    use rusty_engine::gguf::{parse_file, INSPECT_WINDOW};
+    let p = std::path::Path::new(path);
+    let g = match parse_file(p, INSPECT_WINDOW) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("rusty artifact-report: open {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let bytes = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let sha256 = std::fs::read(p)
+        .ok()
+        .map(|b| rusty_engine::patch::sha256_hex(&b))
+        .unwrap_or_default();
+    let arch = g
+        .get("general.architecture")
+        .and_then(|v| match v {
+            rusty_engine::gguf::Value::Str(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .unwrap_or("unknown");
+    let seed = g
+        .get("gsv.seed")
+        .and_then(|v| match v {
+            rusty_engine::gguf::Value::U64(x) => Some(*x),
+            rusty_engine::gguf::Value::U32(x) => Some(*x as u64),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let ctx = g
+        .get("gsv.context_length")
+        .and_then(|v| match v {
+            rusty_engine::gguf::Value::U32(x) => Some(*x),
+            rusty_engine::gguf::Value::U64(x) => Some(*x as u32),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let mut dtypes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for t in &g.tensors {
+        dtypes.insert(format!("{}", t.ggml_type));
+    }
+    let report = serde_json::json!({
+        "schema": "gasv.artifact-manifest.v1",
+        "kind": kind,
+        "runnable": runnable,
+        "artifact": path,
+        "arch": arch,
+        "seed": seed,
+        "context_length": ctx,
+        "tensor_count": g.tensors.len(),
+        "bytes": bytes,
+        "sha256": sha256,
+        "ggml_types": dtypes.into_iter().collect::<Vec<_>>(),
+        "source": source,
+        "coverage": coverage,
+        "transplant_report_sha256": transplant_sha,
+        "nanojev_role": "eval-oracle-only",
+        "no_quality_parity_claim": true,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+    );
+}
+
+fn quantize_export(inp: &str, out_path: &str, quant: &str, report_path: Option<&str>) {
+    use rusty_engine::gguf::{
+        parse_file, read_tensor_bytes, GgufWriter, TensorData, TensorWrite, INSPECT_WINDOW,
+    };
+    use rusty_engine::quant::{bytes_for_numel, dequant, quantize};
+    let target_type: u32 = match quant {
+        "q4_0" | "Q4_0" => 2,
+        "q8_0" | "Q8_0" => 8,
+        _ => {
+            eprintln!("rusty quantize-export: unsupported quant '{quant}' (supported: q4_0, q8_0)");
+            std::process::exit(2);
+        }
+    };
+    let inp_p = std::path::Path::new(inp);
+    let src = match parse_file(inp_p, INSPECT_WINDOW) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rusty quantize-export: open {inp}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut w = GgufWriter::new_v3().with_alignment(src.alignment());
+    for (k, v) in &src.metadata {
+        w.add_kv(k.clone(), v.clone());
+    }
+    let mut report_rows: Vec<serde_json::Value> = Vec::new();
+    let mut total_src_bytes: usize = 0;
+    let mut total_out_bytes: usize = 0;
+    for t in &src.tensors {
+        let raw = match read_tensor_bytes(inp_p, &src, &t.name) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("rusty quantize-export: read tensor {}: {e}", t.name);
+                std::process::exit(1);
+            }
+        };
+        total_src_bytes += raw.len();
+        if t.ggml_type != 0 {
+            eprintln!("rusty quantize-export: tensor {} is ggml_type {} (only F32 source supported in F2)", t.name, t.ggml_type);
+            std::process::exit(1);
+        }
+        let numel: usize = t.dims.iter().product::<usize>();
+        let mut f32s: Vec<f32> = Vec::with_capacity(numel);
+        for c in raw.chunks_exact(4) {
+            f32s.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
+        let qbytes = match quantize(target_type, &f32s) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("rusty quantize-export: quantize {}: {}", t.name, e.message);
+                std::process::exit(1);
+            }
+        };
+        let expected = match bytes_for_numel(target_type, numel) {
+            Some(n) => n,
+            None => {
+                eprintln!(
+                    "rusty quantize-export: cannot size {} numel={numel} type={target_type}",
+                    t.name
+                );
+                std::process::exit(1);
+            }
+        };
+        if qbytes.len() != expected {
+            eprintln!(
+                "rusty quantize-export: {} quantized bytes {} != expected {}",
+                t.name,
+                qbytes.len(),
+                expected
+            );
+            std::process::exit(1);
+        }
+        let back = match dequant(target_type, &qbytes) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "rusty quantize-export: dequant check {}: {}",
+                    t.name, e.message
+                );
+                std::process::exit(1);
+            }
+        };
+        let mut max_abs: f32 = 0.0;
+        let mut sum_abs: f64 = 0.0;
+        let ncmp = f32s.len().min(back.len());
+        for i in 0..ncmp {
+            let d = (f32s[i] - back[i]).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+            sum_abs += d as f64;
+        }
+        let mean_abs = if ncmp > 0 { sum_abs / ncmp as f64 } else { 0.0 };
+        total_out_bytes += qbytes.len();
+        report_rows.push(serde_json::json!({
+            "tensor": t.name,
+            "dims": t.dims,
+            "numel": numel,
+            "src_ggml_type": 0,
+            "dst_ggml_type": target_type,
+            "src_bytes": raw.len(),
+            "dst_bytes": qbytes.len(),
+            "max_abs_err": max_abs,
+            "mean_abs_err": mean_abs,
+        }));
+        w.add_tensor(TensorWrite {
+            name: t.name.clone(),
+            dims: t.dims.clone(),
+            ggml_type: target_type,
+            data: TensorData::Raw(qbytes),
+        });
+    }
+    match w.write_to_file(std::path::Path::new(out_path)) {
+        Ok(wr) => {
+            let out_sha = std::fs::read(out_path)
+                .ok()
+                .map(|b| rusty_engine::patch::sha256_hex(&b))
+                .unwrap_or_default();
+            let report = serde_json::json!({
+                "schema": "gasv.quant-export-report.v1",
+                "input": inp,
+                "output": out_path,
+                "quant": quant,
+                "target_ggml_type": target_type,
+                "n_tensors": wr.n_tensors,
+                "bytes_written": wr.bytes_written,
+                "sha256": out_sha,
+                "total_src_bytes": total_src_bytes,
+                "total_out_bytes": total_out_bytes,
+                "compression_ratio": if total_out_bytes > 0 { total_src_bytes as f64 / total_out_bytes as f64 } else { 0.0 },
+                "tensors": report_rows,
+            });
+            if let Some(rp) = report_path {
+                if let Err(e) = std::fs::write(
+                    rp,
+                    serde_json::to_string_pretty(&report).unwrap_or_default(),
+                ) {
+                    eprintln!("rusty quantize-export: write report {rp}: {e}");
+                    std::process::exit(1);
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+            );
+        }
+        Err(e) => {
+            eprintln!("rusty quantize-export: write {out_path}: {e}");
             std::process::exit(1);
         }
     }
