@@ -19,6 +19,7 @@ fn main() {
             println!("  inspect <file> [N]        GGUF metadata summary      (PH-107)");
             println!("  manifest <file> [--sha256] GGUF JSON manifest (read-only, GASV)");
             println!("  skeleton <spec.json> <out.gguf>  deterministic GGUF skeleton (GASV-C2)");
+            println!("  transplant-mirror <skeleton.gguf> <tensors.json> <chunks_dir> <out.gguf>  direct-copy mirror tensors into skeleton (GASV-D1)");
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  dump-f32 <file> <name> <out.bin>  raw LE f32 bytes of one tensor   (MC-2)");
             println!("  config <file>             read model hyperparameters (PH-305c)");
@@ -70,6 +71,15 @@ fn main() {
             (Some(spec), Some(out)) => skeleton(&spec, &out),
             _ => {
                 eprintln!("usage: rusty skeleton <spec.json> <out.gguf>");
+                std::process::exit(2);
+            }
+        },
+        Some("transplant-mirror") => match (args.next(), args.next(), args.next(), args.next()) {
+            (Some(skel), Some(tj), Some(chunks), Some(out)) => {
+                transplant_mirror(&skel, &tj, &chunks, &out)
+            }
+            _ => {
+                eprintln!("usage: rusty transplant-mirror <skeleton.gguf> <tensors.json> <chunks_dir> <out.gguf>");
                 std::process::exit(2);
             }
         },
@@ -1252,6 +1262,164 @@ fn worker_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
         std::thread::sleep(std::time::Duration::from_secs(
             rusty_engine::worker::POLL_SECS,
         ));
+    }
+}
+
+fn transplant_mirror(skel_path: &str, tensors_json: &str, chunks_dir: &str, out_path: &str) {
+    use rusty_engine::gguf::{
+        parse_file, read_tensor_bytes, GgufWriter, TensorData, TensorWrite, INSPECT_WINDOW,
+    };
+    let skel_path_p = std::path::Path::new(skel_path);
+    let skel = match parse_file(skel_path_p, INSPECT_WINDOW) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rusty transplant-mirror: open skeleton {skel_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let tj_bytes = match std::fs::read(tensors_json) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("rusty transplant-mirror: read {tensors_json}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let tj: serde_json::Value = match serde_json::from_slice(&tj_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rusty transplant-mirror: parse {tensors_json}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let arr = match tj.as_array() {
+        Some(a) => a,
+        None => {
+            eprintln!("rusty transplant-mirror: {tensors_json} must be a JSON array");
+            std::process::exit(2);
+        }
+    };
+    let mut map: std::collections::BTreeMap<String, (Vec<usize>, u32, usize, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    for item in arr {
+        let name = item.get("tensor").and_then(|x| x.as_str()).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let dims: Vec<usize> = item
+            .get("dims")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|u| u as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let numel: usize = item.get("numel").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        let ggml = if item.get("dtype").and_then(|x| x.as_str()) == Some("f32") {
+            0u32
+        } else {
+            0u32
+        };
+        let chunks: Vec<String> = item
+            .get("chunks")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        map.insert(name.to_string(), (dims, ggml, numel, chunks));
+    }
+
+    let mut w = GgufWriter::new_v3().with_alignment(skel.alignment());
+    for (k, v) in &skel.metadata {
+        w.add_kv(k.clone(), v.clone());
+    }
+    let mut replaced = 0usize;
+    let mut kept = 0usize;
+    let mut report: Vec<serde_json::Value> = Vec::new();
+    for t in &skel.tensors {
+        let mut did = false;
+        if let Some((dims, ggml, numel, chunks)) = map.get(&t.name) {
+            if &t.dims == dims && t.ggml_type == *ggml && !chunks.is_empty() {
+                let mut bytes: Vec<u8> = Vec::with_capacity(numel * 4);
+                let mut ok = true;
+                for ch in chunks {
+                    let p = std::path::Path::new(chunks_dir).join(format!("{ch}.bin"));
+                    match std::fs::read(&p) {
+                        Ok(b) => bytes.extend_from_slice(&b),
+                        Err(e) => {
+                            eprintln!("rusty transplant-mirror: read chunk {p:?}: {e}");
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                let expected = numel * 4;
+                if ok && bytes.len() == expected {
+                    w.add_tensor(TensorWrite {
+                        name: t.name.clone(),
+                        dims: t.dims.clone(),
+                        ggml_type: t.ggml_type,
+                        data: TensorData::Raw(bytes.clone()),
+                    });
+                    report.push(serde_json::json!({"tensor":t.name,"status":"transplanted","bytes":bytes.len(),"chunks":chunks.len()}));
+                    replaced += 1;
+                    did = true;
+                } else if ok {
+                    eprintln!(
+                        "rusty transplant-mirror: {} byte mismatch got {} expected {}",
+                        t.name,
+                        bytes.len(),
+                        expected
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        if !did {
+            // keep skeleton tensor bytes
+            let bytes = match read_tensor_bytes(skel_path_p, &skel, &t.name) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "rusty transplant-mirror: read skeleton tensor {}: {e}",
+                        t.name
+                    );
+                    std::process::exit(1);
+                }
+            };
+            w.add_tensor(TensorWrite {
+                name: t.name.clone(),
+                dims: t.dims.clone(),
+                ggml_type: t.ggml_type,
+                data: TensorData::Raw(bytes),
+            });
+            report.push(serde_json::json!({"tensor":t.name,"status":"kept_skeleton"}));
+            kept += 1;
+        }
+    }
+    match w.write_to_file(std::path::Path::new(out_path)) {
+        Ok(wr) => {
+            let out = serde_json::json!({
+                "schema":"gasv.transplant-mirror.v1",
+                "out":out_path,
+                "replaced":replaced,
+                "kept_skeleton":kept,
+                "n_tensors":wr.n_tensors,
+                "bytes_written":wr.bytes_written,
+                "report":report
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".into())
+            );
+        }
+        Err(e) => {
+            eprintln!("rusty transplant-mirror: write {out_path}: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
