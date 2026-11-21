@@ -18,6 +18,7 @@ fn main() {
             println!("  --help, -h      print this banner");
             println!("  inspect <file> [N]        GGUF metadata summary      (PH-107)");
             println!("  manifest <file> [--sha256] GGUF JSON manifest (read-only, GASV)");
+            println!("  skeleton <spec.json> <out.gguf>  deterministic GGUF skeleton (GASV-C2)");
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  dump-f32 <file> <name> <out.bin>  raw LE f32 bytes of one tensor   (MC-2)");
             println!("  config <file>             read model hyperparameters (PH-305c)");
@@ -65,6 +66,13 @@ fn main() {
                 }
             }
         }
+        Some("skeleton") => match (args.next(), args.next()) {
+            (Some(spec), Some(out)) => skeleton(&spec, &out),
+            _ => {
+                eprintln!("usage: rusty skeleton <spec.json> <out.gguf>");
+                std::process::exit(2);
+            }
+        },
         Some("dump-f32") => match (args.next(), args.next(), args.next()) {
             (Some(path), Some(name), Some(out)) => dump_f32(&path, &name, &out),
             _ => {
@@ -257,6 +265,124 @@ fn manifest(path: &str, with_sha256: bool) {
         }
         Err(e) => {
             eprintln!("rusty manifest {path}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn skeleton(spec_path: &str, out_path: &str) {
+    let spec_bytes = match std::fs::read(spec_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("rusty skeleton: read {spec_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&spec_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rusty skeleton: parse spec {spec_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let arch = v
+        .get("arch")
+        .and_then(|x| x.as_str())
+        .unwrap_or("gasv")
+        .to_string();
+    let seed = v.get("seed").and_then(|x| x.as_u64()).unwrap_or(0);
+    let alignment = v.get("alignment").and_then(|x| x.as_u64()).unwrap_or(32);
+    let context_length = v
+        .get("context_length")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(4096) as u32;
+    let mut kv = Vec::new();
+    if let Some(arr) = v.get("kv").and_then(|x| x.as_array()) {
+        for item in arr {
+            let k = item.get("key").and_then(|x| x.as_str()).unwrap_or("");
+            if k.is_empty() {
+                continue;
+            }
+            let val = match item.get("value") {
+                Some(serde_json::Value::String(s)) => rusty_engine::gguf::Value::Str(s.clone()),
+                Some(serde_json::Value::Bool(b)) => rusty_engine::gguf::Value::Bool(*b),
+                Some(serde_json::Value::Number(n)) => {
+                    if let Some(u) = n.as_u64() {
+                        rusty_engine::gguf::Value::U64(u)
+                    } else if let Some(i) = n.as_i64() {
+                        rusty_engine::gguf::Value::I64(i)
+                    } else if let Some(f) = n.as_f64() {
+                        rusty_engine::gguf::Value::F64(f)
+                    } else {
+                        continue;
+                    }
+                }
+                _ => continue,
+            };
+            kv.push((k.to_string(), val));
+        }
+    }
+    let mut tensors = Vec::new();
+    if let Some(arr) = v.get("tensors").and_then(|x| x.as_array()) {
+        for item in arr {
+            let name = item
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ggml_type = item.get("ggml_type").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let dims: Vec<usize> = item
+                .get("dims")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|d| d.as_u64().map(|u| u as usize))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if name.is_empty() || dims.is_empty() {
+                eprintln!("rusty skeleton: invalid tensor entry in spec");
+                std::process::exit(2);
+            }
+            tensors.push(rusty_engine::gguf::SkeletonTensorSpec {
+                name,
+                dims,
+                ggml_type,
+            });
+        }
+    }
+    let spec = rusty_engine::gguf::SkeletonSpec {
+        arch,
+        seed,
+        alignment,
+        context_length,
+        tensors,
+        kv,
+    };
+    match rusty_engine::gguf::build_skeleton(&spec) {
+        Ok((bytes, report)) => {
+            if let Err(e) = std::fs::write(out_path, &bytes) {
+                eprintln!("rusty skeleton: write {out_path}: {e}");
+                std::process::exit(1);
+            }
+            let sha256 = rusty_engine::patch::sha256_hex(&bytes);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema": "gasv.skeleton-build.v1",
+                    "spec": spec_path,
+                    "out": out_path,
+                    "bytes": report.bytes_written,
+                    "n_tensors": report.n_tensors,
+                    "n_kv": report.n_kv,
+                    "seed": spec.seed,
+                    "arch": spec.arch,
+                    "sha256": sha256,
+                })
+            );
+        }
+        Err(e) => {
+            eprintln!("rusty skeleton: {e}");
             std::process::exit(1);
         }
     }
