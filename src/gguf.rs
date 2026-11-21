@@ -687,6 +687,105 @@ fn write_value_payload(out: &mut Vec<u8>, v: &Value) -> GgufResult<()> {
     Ok(())
 }
 
+// ───────────────────── GASV-C2 skeleton (deterministic) ─────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkeletonTensorSpec {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub ggml_type: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkeletonSpec {
+    pub arch: String,
+    pub seed: u64,
+    pub alignment: u64,
+    pub context_length: u32,
+    pub tensors: Vec<SkeletonTensorSpec>,
+    pub kv: Vec<(String, Value)>,
+}
+
+#[derive(Clone)]
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+    fn next_f32(&mut self) -> f32 {
+        // Deterministic in [-1,1), avoid NaN/Inf.
+        let bits = (self.next_u64() >> 40) as u32; // 24-bit mantissa
+        let v = (bits as f32) / ((1u32 << 24) as f32); // [0,1)
+        v * 2.0 - 1.0
+    }
+}
+
+pub fn build_skeleton(spec: &SkeletonSpec) -> GgufResult<(Vec<u8>, WriteReport)> {
+    let mut w = GgufWriter::new_v3().with_alignment(spec.alignment.max(1));
+    w.add_kv("general.architecture", Value::Str(spec.arch.clone()));
+    w.add_kv(
+        "general.alignment",
+        Value::U32(spec.alignment.max(1) as u32),
+    );
+    w.add_kv(
+        format!("{}.context_length", spec.arch),
+        Value::U32(spec.context_length),
+    );
+    w.add_kv("gasv.skeleton.seed", Value::U64(spec.seed));
+    w.add_kv("gasv.skeleton.prng", Value::Str("splitmix64-f32-v1".into()));
+    for (k, v) in &spec.kv {
+        w.add_kv(k.clone(), v.clone());
+    }
+    let mut rng = SplitMix64::new(spec.seed);
+    for t in &spec.tensors {
+        let numel: usize = t.dims.iter().product();
+        let data = match t.ggml_type {
+            0 => {
+                let mut v = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    v.push(rng.next_f32());
+                }
+                TensorData::F32(v)
+            }
+            _ => {
+                let nbytes =
+                    crate::quant::bytes_for_numel(t.ggml_type, numel).ok_or_else(|| {
+                        ParseError {
+                            message: format!(
+                                "unsupported ggml_type {} for skeleton tensor {}",
+                                t.ggml_type, t.name
+                            ),
+                            offset: 0,
+                        }
+                    })?;
+                // Deterministic pseudo-random bytes for non-F32 skeletons (research/smoke only).
+                let mut b = vec![0u8; nbytes];
+                for byte in &mut b {
+                    *byte = (rng.next_u64() & 0xff) as u8;
+                }
+                TensorData::Raw(b)
+            }
+        };
+        w.add_tensor(TensorWrite {
+            name: t.name.clone(),
+            dims: t.dims.clone(),
+            ggml_type: t.ggml_type,
+            data,
+        });
+    }
+    w.write_to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,7 +1000,8 @@ mod tests {
         assert_eq!(f.tensors[0].name, "blk.0.attn_norm.weight");
         assert_eq!(f.tensors[0].dims, vec![4]);
         assert_eq!(f.tensors[0].ggml_type, 0);
-        let data_start = ((f.data_offset as u64 + f.alignment() - 1) / f.alignment() * f.alignment()) as usize;
+        let data_start =
+            ((f.data_offset as u64 + f.alignment() - 1) / f.alignment() * f.alignment()) as usize;
         let start = data_start + f.tensors[0].offset as usize;
         let nbytes = f.tensors[0].nbytes().unwrap();
         let mut got = Vec::with_capacity(4);
@@ -940,5 +1040,39 @@ mod tests {
         assert_eq!(f.tensors[1].offset % 64, 0);
         let s0 = data_start + f.tensors[0].offset as usize;
         assert_eq!(&bytes[s0..s0 + raw.len()], raw.as_slice());
+    }
+
+    #[test]
+    fn skeleton_is_deterministic_and_parseable() {
+        let spec = SkeletonSpec {
+            arch: "qwen35".into(),
+            seed: 42,
+            alignment: 32,
+            context_length: 4096,
+            tensors: vec![
+                SkeletonTensorSpec {
+                    name: "blk.0.attn_norm.weight".into(),
+                    dims: vec![8],
+                    ggml_type: 0,
+                },
+                SkeletonTensorSpec {
+                    name: "blk.0.ffn_gate.weight".into(),
+                    dims: vec![4, 8],
+                    ggml_type: 0,
+                },
+            ],
+            kv: vec![("general.name".into(), Value::Str("gasv-test".into()))],
+        };
+        let (b1, r1) = build_skeleton(&spec).expect("build1");
+        let (b2, r2) = build_skeleton(&spec).expect("build2");
+        assert_eq!(b1, b2, "same seed/spec must be deterministic");
+        assert_eq!(r1.n_tensors, 2);
+        let f = parse(&b1).expect("parse");
+        assert_eq!(f.get("gasv.skeleton.seed"), Some(&Value::U64(42)));
+        assert_eq!(
+            f.get("gasv.skeleton.prng"),
+            Some(&Value::Str("splitmix64-f32-v1".into()))
+        );
+        assert_eq!(f.tensors.len(), 2);
     }
 }
