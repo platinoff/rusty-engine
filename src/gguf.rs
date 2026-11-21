@@ -59,6 +59,24 @@ impl ValueKind {
             _ => return None,
         })
     }
+
+    fn code(self) -> u32 {
+        match self {
+            Self::U8 => 0,
+            Self::I8 => 1,
+            Self::U16 => 2,
+            Self::I16 => 3,
+            Self::U32 => 4,
+            Self::I32 => 5,
+            Self::F32 => 6,
+            Self::Bool => 7,
+            Self::Str => 8,
+            Self::Array => 9,
+            Self::U64 => 10,
+            Self::I64 => 11,
+            Self::F64 => 12,
+        }
+    }
 }
 
 /// A decoded KV value. `Array` keeps its element kind (may be a nested `Array`).
@@ -372,6 +390,303 @@ pub fn parse_file(path: &Path, window: usize) -> io::Result<GgufFile> {
     parse(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+// ───────────────────────── GGUF writer (GASV-C1) ─────────────────────────
+
+/// Tensor payload for GGUF writing. Bytes must already be in the correct ggml layout.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TensorData {
+    Raw(Vec<u8>),
+    F32(Vec<f32>),
+}
+
+impl TensorData {
+    pub fn as_bytes(&self) -> Vec<u8> {
+        match self {
+            TensorData::Raw(b) => b.clone(),
+            TensorData::F32(v) => {
+                let mut out = Vec::with_capacity(v.len() * 4);
+                for f in v {
+                    out.extend_from_slice(&f.to_le_bytes());
+                }
+                out
+            }
+        }
+    }
+
+    pub fn byte_len(&self) -> usize {
+        match self {
+            TensorData::Raw(b) => b.len(),
+            TensorData::F32(v) => v.len() * 4,
+        }
+    }
+}
+
+/// Tensor to be written into a GGUF file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorWrite {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub ggml_type: u32,
+    pub data: TensorData,
+}
+
+/// Minimal std-only GGUF v3 writer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GgufWriter {
+    pub version: u32,
+    pub alignment: u64,
+    pub metadata: Vec<(String, Value)>,
+    pub tensors: Vec<TensorWrite>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteReport {
+    pub bytes_written: usize,
+    pub n_tensors: usize,
+    pub n_kv: usize,
+}
+
+impl GgufWriter {
+    pub fn new_v3() -> Self {
+        Self {
+            version: 3,
+            alignment: DEFAULT_ALIGNMENT,
+            metadata: Vec::new(),
+            tensors: Vec::new(),
+        }
+    }
+
+    pub fn with_alignment(mut self, alignment: u64) -> Self {
+        self.alignment = alignment.max(1);
+        self
+    }
+
+    pub fn push_kv(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.metadata.push((key.into(), value));
+        self
+    }
+
+    pub fn push_tensor(mut self, tensor: TensorWrite) -> Self {
+        self.tensors.push(tensor);
+        self
+    }
+
+    pub fn add_kv(&mut self, key: impl Into<String>, value: Value) {
+        self.metadata.push((key.into(), value));
+    }
+
+    pub fn add_tensor(&mut self, tensor: TensorWrite) {
+        self.tensors.push(tensor);
+    }
+
+    fn effective_alignment(&self) -> u64 {
+        match self.metadata.iter().find(|(k, _)| k == "general.alignment") {
+            Some((_, Value::U32(a))) => u64::from(*a).max(1),
+            Some((_, Value::U64(a))) => (*a).max(1),
+            _ => self.alignment.max(1),
+        }
+    }
+
+    pub fn write_to_vec(&self) -> GgufResult<(Vec<u8>, WriteReport)> {
+        if !(2..=3).contains(&self.version) {
+            return Err(ParseError {
+                message: format!("unsupported GGUF write version {}", self.version),
+                offset: 0,
+            });
+        }
+        let align = self.effective_alignment();
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(GGUF_MAGIC);
+        out.extend_from_slice(&self.version.to_le_bytes());
+        if self.version >= 3 {
+            out.extend_from_slice(&(self.tensors.len() as u64).to_le_bytes());
+            out.extend_from_slice(&(self.metadata.len() as u64).to_le_bytes());
+        } else {
+            out.extend_from_slice(&(self.tensors.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(self.metadata.len() as u32).to_le_bytes());
+        }
+
+        for (k, v) in &self.metadata {
+            write_string(&mut out, k);
+            write_value(&mut out, v)?;
+        }
+
+        // Precompute tensor data offsets relative to data start.
+        let mut rel: u64 = 0;
+        let mut tensor_bytes: Vec<Vec<u8>> = Vec::with_capacity(self.tensors.len());
+        let mut offsets: Vec<u64> = Vec::with_capacity(self.tensors.len());
+        for t in &self.tensors {
+            let bytes = t.data.as_bytes();
+            let expected = crate::quant::bytes_for_numel(t.ggml_type, t.dims.iter().product());
+            if let Some(exp) = expected {
+                if exp != bytes.len() {
+                    return Err(ParseError {
+                        message: format!(
+                            "tensor {} byte size mismatch: expected {exp}, got {}",
+                            t.name,
+                            bytes.len()
+                        ),
+                        offset: out.len(),
+                    });
+                }
+            }
+            offsets.push(rel);
+            rel = rel
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| ParseError {
+                    message: "tensor offset overflow".to_string(),
+                    offset: out.len(),
+                })?;
+            rel = align_up(rel, align);
+            tensor_bytes.push(bytes);
+        }
+
+        for (t, off) in self.tensors.iter().zip(offsets.iter()) {
+            write_string(&mut out, &t.name);
+            out.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
+            for d in &t.dims {
+                out.extend_from_slice(&(*d as u64).to_le_bytes());
+            }
+            out.extend_from_slice(&t.ggml_type.to_le_bytes());
+            out.extend_from_slice(&off.to_le_bytes());
+        }
+
+        let data_start = align_up(out.len() as u64, align) as usize;
+        if data_start > out.len() {
+            out.resize(data_start, 0);
+        }
+
+        for (i, bytes) in tensor_bytes.into_iter().enumerate() {
+            let want = data_start as u64 + offsets[i];
+            if want as usize > out.len() {
+                out.resize(want as usize, 0);
+            }
+            out.extend_from_slice(&bytes);
+            if i + 1 < self.tensors.len() {
+                let next = data_start as u64 + offsets[i + 1];
+                if next as usize > out.len() {
+                    out.resize(next as usize, 0);
+                }
+            }
+        }
+        // final alignment padding optional; not required
+
+        let report = WriteReport {
+            bytes_written: out.len(),
+            n_tensors: self.tensors.len(),
+            n_kv: self.metadata.len(),
+        };
+        Ok((out, report))
+    }
+
+    pub fn write_to_file(&self, path: &Path) -> io::Result<WriteReport> {
+        let (bytes, report) = self
+            .write_to_vec()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, bytes)?;
+        Ok(report)
+    }
+}
+
+fn align_up(v: u64, align: u64) -> u64 {
+    if align <= 1 {
+        return v;
+    }
+    ((v + align - 1) / align) * align
+}
+
+fn write_string(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn write_value(out: &mut Vec<u8>, v: &Value) -> GgufResult<()> {
+    match v {
+        Value::U8(x) => {
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.push(*x);
+        }
+        Value::I8(x) => {
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.push(*x as u8);
+        }
+        Value::U16(x) => {
+            out.extend_from_slice(&2u32.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::I16(x) => {
+            out.extend_from_slice(&3u32.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::U32(x) => {
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::I32(x) => {
+            out.extend_from_slice(&5u32.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::F32(x) => {
+            out.extend_from_slice(&6u32.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::Bool(x) => {
+            out.extend_from_slice(&7u32.to_le_bytes());
+            out.push(u8::from(*x));
+        }
+        Value::Str(s) => {
+            out.extend_from_slice(&8u32.to_le_bytes());
+            write_string(out, s);
+        }
+        Value::Array(elem_kind, items) => {
+            out.extend_from_slice(&9u32.to_le_bytes());
+            out.extend_from_slice(&elem_kind.code().to_le_bytes());
+            out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            for item in items {
+                write_value_payload(out, item)?;
+            }
+        }
+        Value::U64(x) => {
+            out.extend_from_slice(&10u32.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::I64(x) => {
+            out.extend_from_slice(&11u32.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        Value::F64(x) => {
+            out.extend_from_slice(&12u32.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn write_value_payload(out: &mut Vec<u8>, v: &Value) -> GgufResult<()> {
+    match v {
+        Value::U8(x) => out.push(*x),
+        Value::I8(x) => out.push(*x as u8),
+        Value::U16(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::I16(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::U32(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::I32(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::F32(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::Bool(x) => out.push(u8::from(*x)),
+        Value::Str(s) => write_string(out, s),
+        Value::Array(elem_kind, items) => {
+            out.extend_from_slice(&elem_kind.code().to_le_bytes());
+            out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            for item in items {
+                write_value_payload(out, item)?;
+            }
+        }
+        Value::U64(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::I64(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::F64(x) => out.extend_from_slice(&x.to_le_bytes()),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,5 +873,72 @@ mod tests {
         assert_eq!(f.data_offset, bytes.len());
         assert_eq!(f.tensors[0].name, "blk.0.ffn_gate_exps.weight");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn writer_round_trip_header_and_f32_tensor() {
+        let w = GgufWriter::new_v3()
+            .push_kv("general.architecture", Value::Str("qwen35".into()))
+            .push_kv("general.alignment", Value::U32(32))
+            .push_kv("test.flag", Value::Bool(true))
+            .push_tensor(TensorWrite {
+                name: "blk.0.attn_norm.weight".into(),
+                dims: vec![4],
+                ggml_type: 0,
+                data: TensorData::F32(vec![1.0, 2.0, 3.0, 4.0]),
+            });
+        let (bytes, report) = w.write_to_vec().expect("write");
+        assert_eq!(report.n_tensors, 1);
+        assert_eq!(report.n_kv, 3);
+        let f = parse(&bytes).expect("parse written");
+        assert_eq!(f.version, 3);
+        assert_eq!(f.n_tensors, 1);
+        assert_eq!(f.n_kv(), 3);
+        assert_eq!(
+            f.get("general.architecture"),
+            Some(&Value::Str("qwen35".into()))
+        );
+        assert_eq!(f.tensors[0].name, "blk.0.attn_norm.weight");
+        assert_eq!(f.tensors[0].dims, vec![4]);
+        assert_eq!(f.tensors[0].ggml_type, 0);
+        let data_start = ((f.data_offset as u64 + f.alignment() - 1) / f.alignment() * f.alignment()) as usize;
+        let start = data_start + f.tensors[0].offset as usize;
+        let nbytes = f.tensors[0].nbytes().unwrap();
+        let mut got = Vec::with_capacity(4);
+        for chunk in bytes[start..start + nbytes].chunks_exact(4) {
+            got.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        assert_eq!(got, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn writer_round_trip_raw_bytes_and_alignment() {
+        let raw = vec![0u8; 144]; // one Q4_K block worth of bytes
+        let w = GgufWriter::new_v3()
+            .with_alignment(64)
+            .push_kv("general.alignment", Value::U32(64))
+            .push_kv("general.architecture", Value::Str("test".into()))
+            .push_tensor(TensorWrite {
+                name: "t0".into(),
+                dims: vec![256],
+                ggml_type: 12,
+                data: TensorData::Raw(raw.clone()),
+            })
+            .push_tensor(TensorWrite {
+                name: "t1".into(),
+                dims: vec![2],
+                ggml_type: 0,
+                data: TensorData::F32(vec![0.5, -0.5]),
+            });
+        let (bytes, _) = w.write_to_vec().expect("write");
+        let f = parse(&bytes).expect("parse");
+        assert_eq!(f.alignment(), 64);
+        assert_eq!(f.tensors.len(), 2);
+        let data_start = ((f.data_offset as u64 + 63) / 64 * 64) as usize;
+        assert_eq!(data_start % 64, 0);
+        assert_eq!(f.tensors[0].offset % 64, 0);
+        assert_eq!(f.tensors[1].offset % 64, 0);
+        let s0 = data_start + f.tensors[0].offset as usize;
+        assert_eq!(&bytes[s0..s0 + raw.len()], raw.as_slice());
     }
 }
