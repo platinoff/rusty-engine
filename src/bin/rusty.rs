@@ -1599,18 +1599,43 @@ fn quantize_export(inp: &str, out_path: &str, quant: &str, report_path: Option<&
         for c in raw.chunks_exact(4) {
             f32s.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
         }
-        let qbytes = match quantize(target_type, &f32s) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("rusty quantize-export: quantize {}: {}", t.name, e.message);
-                std::process::exit(1);
+        // Q4_K super-block is 256; small tensors fall back to Q8_0 (or keep F32).
+        let (actual_type, qbytes) = if target_type == 12 && numel % 256 != 0 {
+            let fb = if numel % 32 == 0 { 8u32 } else { 0u32 };
+            let b = if fb == 0 {
+                // keep F32 raw
+                let mut raw_f32 = Vec::with_capacity(numel * 4);
+                for &v in &f32s {
+                    raw_f32.extend_from_slice(&v.to_le_bytes());
+                }
+                raw_f32
+            } else {
+                match quantize(fb, &f32s) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!(
+                            "rusty quantize-export: fallback quantize {}: {}",
+                            t.name, e.message
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            };
+            (fb, b)
+        } else {
+            match quantize(target_type, &f32s) {
+                Ok(b) => (target_type, b),
+                Err(e) => {
+                    eprintln!("rusty quantize-export: quantize {}: {}", t.name, e.message);
+                    std::process::exit(1);
+                }
             }
         };
-        let expected = match bytes_for_numel(target_type, numel) {
+        let expected = match bytes_for_numel(actual_type, numel) {
             Some(n) => n,
             None => {
                 eprintln!(
-                    "rusty quantize-export: cannot size {} numel={numel} type={target_type}",
+                    "rusty quantize-export: cannot size {} numel={numel} type={actual_type}",
                     t.name
                 );
                 std::process::exit(1);
@@ -1625,7 +1650,7 @@ fn quantize_export(inp: &str, out_path: &str, quant: &str, report_path: Option<&
             );
             std::process::exit(1);
         }
-        let back = match dequant(target_type, &qbytes) {
+        let back = match dequant(actual_type, &qbytes) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!(
@@ -1652,7 +1677,9 @@ fn quantize_export(inp: &str, out_path: &str, quant: &str, report_path: Option<&
             "dims": t.dims,
             "numel": numel,
             "src_ggml_type": 0,
-            "dst_ggml_type": target_type,
+            "dst_ggml_type": actual_type,
+            "requested_ggml_type": target_type,
+            "fallback": actual_type != target_type,
             "src_bytes": raw.len(),
             "dst_bytes": qbytes.len(),
             "max_abs_err": max_abs,
@@ -1661,7 +1688,7 @@ fn quantize_export(inp: &str, out_path: &str, quant: &str, report_path: Option<&
         w.add_tensor(TensorWrite {
             name: t.name.clone(),
             dims: t.dims.clone(),
-            ggml_type: target_type,
+            ggml_type: actual_type,
             data: TensorData::Raw(qbytes),
         });
     }
