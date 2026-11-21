@@ -20,7 +20,7 @@ fn main() {
             println!("  manifest <file> [--sha256] GGUF JSON manifest (read-only, GASV)");
             println!("  skeleton <spec.json> <out.gguf>  deterministic GGUF skeleton (GASV-C2)");
             println!("  transplant-mirror <skeleton.gguf> <tensors.json> <chunks_dir> <out.gguf>  direct-copy mirror tensors into skeleton (GASV-D1)");
-            println!("  quantize-export <in.gguf> <out.gguf> <q4_0|q8_0> [--report <path>]  quantize F32 GGUF (GASV-D3/F2)");
+            println!("  quantize-export <in.gguf> <out.gguf> <q4_0|q8_0|q4_k|q4_k_m> [--report <path>]  quantize F32 GGUF (GASV-D3/F2/G6; q4_k_m=no-imatrix fallback)");
             println!("  artifact-report <file.gguf> [--kind K] [--runnable true|false] [--source S] [--coverage C] [--transplant-report-sha256 H]  GASV artifact contract (F1)");
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  dump-f32 <file> <name> <out.bin>  raw LE f32 bytes of one tensor   (MC-2)");
@@ -98,7 +98,7 @@ fn main() {
             match (inp, out, q) {
                 (Some(i), Some(o), Some(qt)) => quantize_export(&i, &o, &qt, report.as_deref()),
                 _ => {
-                    eprintln!("usage: rusty quantize-export <in.gguf> <out.gguf> <q4_0|q8_0> [--report <path>]");
+                    eprintln!("usage: rusty quantize-export <in.gguf> <out.gguf> <q4_0|q8_0|q4_k|q4_k_m> [--report <path>]");
                     std::process::exit(2);
                 }
             }
@@ -1370,11 +1370,7 @@ fn transplant_mirror(skel_path: &str, tensors_json: &str, chunks_dir: &str, out_
             })
             .unwrap_or_default();
         let numel: usize = item.get("numel").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-        let ggml = if item.get("dtype").and_then(|x| x.as_str()) == Some("f32") {
-            0u32
-        } else {
-            0u32
-        };
+        let ggml = 0u32; // only f32 chunks supported in this path
         let chunks: Vec<String> = item
             .get("chunks")
             .and_then(|x| x.as_array())
@@ -1556,11 +1552,17 @@ fn quantize_export(inp: &str, out_path: &str, quant: &str, report_path: Option<&
         parse_file, read_tensor_bytes, GgufWriter, TensorData, TensorWrite, INSPECT_WINDOW,
     };
     use rusty_engine::quant::{bytes_for_numel, dequant, quantize};
-    let target_type: u32 = match quant {
-        "q4_0" | "Q4_0" => 2,
-        "q8_0" | "Q8_0" => 8,
+    let (target_type, quant_policy): (u32, &str) = match quant {
+        "q4_0" | "Q4_0" => (2, "q4_0"),
+        "q8_0" | "Q8_0" => (8, "q8_0"),
+        "q4_k" | "Q4_K" => (12, "q4_k"),
+        // Q4_K_M without imatrix: fallback to Q4_K for all tensors.
+        // Full Q4_K_M mixed policy (Q6_K for selected tensors) requires Q6_K encoder + imatrix.
+        "q4_k_m" | "Q4_K_M" => (12, "q4_k_m-no-imatrix-fallback=q4_k"),
         _ => {
-            eprintln!("rusty quantize-export: unsupported quant '{quant}' (supported: q4_0, q8_0)");
+            eprintln!(
+                "rusty quantize-export: unsupported quant '{quant}' (supported: q4_0, q8_0, q4_k, q4_k_m[fallback])"
+            );
             std::process::exit(2);
         }
     };
@@ -1674,6 +1676,7 @@ fn quantize_export(inp: &str, out_path: &str, quant: &str, report_path: Option<&
                 "input": inp,
                 "output": out_path,
                 "quant": quant,
+                "quant_policy": quant_policy,
                 "target_ggml_type": target_type,
                 "n_tensors": wr.n_tensors,
                 "bytes_written": wr.bytes_written,

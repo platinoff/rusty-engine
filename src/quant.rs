@@ -228,21 +228,132 @@ pub fn quantize_q4_0(src: &[f32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Quantize f32 to a supported GGUF quant type (GASV-D3 export path).
-/// Supported now: Q8_0 (8), Q4_0 (2). Q4_K_M/Q6_K require parity-gated encoder.
+/// Quantize f32 to a supported GGUF quant type (GASV-D3/F2/G6 export path).
+/// Supported: Q8_0 (8), Q4_0 (2), Q4_K (12). Q4_K_M is exposed as Q4_K-only
+/// policy when no imatrix is provided (documented fallback; no silent coercion).
+/// Q5_K/Q6_K encoders remain parity-gated.
 pub fn quantize(ggml_type: u32, src: &[f32]) -> Result<Vec<u8>> {
     match ggml_type {
         8 => quantize_q8_0(src),
         2 => quantize_q4_0(src),
-        12 | 13 | 14 => Err(EngineError {
+        12 => quantize_q4_k(src),
+        13 | 14 => Err(EngineError {
             message: format!(
-                "quantize ggml_type {ggml_type}: Q4_K/Q5_K/Q6_K encoder not implemented; use Q4_0/Q8_0 or dequant/quant parity-gated path"
+                "quantize ggml_type {ggml_type}: Q5_K/Q6_K encoder not implemented; use Q4_0/Q8_0/Q4_K or parity-gated path"
             ),
         }),
         _ => Err(EngineError {
             message: format!("quantize ggml_type {ggml_type}: unsupported"),
         }),
     }
+}
+
+/// Inverse of `get_scale_min_k4`: pack 8 (scale,min) 6-bit pairs into 12-byte array.
+fn set_scale_min_k4(scales: &mut [u8; 12], j: usize, sc: u8, m: u8) {
+    let sc = sc & 63;
+    let m = m & 63;
+    if j < 4 {
+        scales[j] = (scales[j] & !63) | sc;
+        scales[j + 4] = (scales[j + 4] & !63) | m;
+    } else {
+        // sc bits 0-3 -> scales[j+4] low nibble, sc bits 4-5 -> scales[j-4] bits 6-7
+        // m  bits 0-3 -> scales[j+4] high nibble, m  bits 4-5 -> scales[j]   bits 6-7
+        scales[j + 4] = (sc & 0xF) | ((m & 0xF) << 4);
+        scales[j - 4] = (scales[j - 4] & 0x3F) | ((sc >> 4) << 6);
+        scales[j] = (scales[j] & 0x3F) | ((m >> 4) << 6);
+    }
+}
+
+/// Quantize f32 to Q4_K (GGML type 12), 256 elements / 144 bytes.
+/// Simple affine quantizer (no imatrix). Correct and round-trippable; quality
+/// is below llama.cpp's optimized K-quant but structurally valid for GASV export.
+/// Q4_K_M policy fallback: when no imatrix is available, use Q4_K for all tensors.
+pub fn quantize_q4_k(src: &[f32]) -> Result<Vec<u8>> {
+    if src.len() % 256 != 0 {
+        return Err(EngineError {
+            message: format!("Q4_K quantize: len {} not multiple of 256", src.len()),
+        });
+    }
+    let nblocks = src.len() / 256;
+    let mut out = Vec::with_capacity(nblocks * 144);
+    for blk in src.chunks_exact(256) {
+        // Per-subblock (32 values, 8 subblocks) affine params.
+        let mut sb_scales = [0.0f32; 8]; // actual d*sc
+        let mut sb_mins = [0.0f32; 8]; // actual dmin*m (>=0)
+        for j in 0..8 {
+            let base = j * 32;
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for &v in &blk[base..base + 32] {
+                if v < lo {
+                    lo = v;
+                }
+                if v > hi {
+                    hi = v;
+                }
+            }
+            if !lo.is_finite() || !hi.is_finite() {
+                lo = 0.0;
+                hi = 0.0;
+            }
+            // Map to q in 0..15: val = scale*q - min_off, q=0->lo, q=15->hi
+            // Q4_K format: val = d*sc*q - dmin*m, with single superblock dmin.
+            // Keep min_off >= 0 so one dmin sign fits all subblocks (simple/robust).
+            let mut lo2 = lo;
+            if lo2 > 0.0 {
+                lo2 = 0.0;
+            }
+            let mut scale = (hi - lo2) / 15.0;
+            if scale < 0.0 {
+                scale = 0.0;
+            }
+            sb_scales[j] = scale;
+            sb_mins[j] = -lo2; // >= 0
+        }
+        // Superblock d,dmin: max of subblock factors / 63 (min_off >= 0).
+        let max_sc = sb_scales.iter().cloned().fold(0.0f32, f32::max);
+        let max_m = sb_mins.iter().cloned().fold(0.0f32, f32::max);
+        let d_f16 = f32_to_f16(max_sc / 63.0);
+        let dmin_f16 = f32_to_f16(max_m / 63.0);
+        let d = f16_to_f32(d_f16);
+        let dmin = f16_to_f32(dmin_f16);
+        let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let inv_dm = if dmin > 0.0 { 1.0 / dmin } else { 0.0 };
+        let mut scales = [0u8; 12];
+        let mut sc_u8 = [0u8; 8];
+        let mut m_u8 = [0u8; 8];
+        for j in 0..8 {
+            sc_u8[j] = (sb_scales[j] * inv_d).round().clamp(0.0, 63.0) as u8;
+            // m_u8 encodes m so that dmin*m = sb_mins[j]. If dmin==0, m=0.
+            let m_f = sb_mins[j] * inv_dm;
+            m_u8[j] = m_f.round().clamp(0.0, 63.0) as u8;
+            set_scale_min_k4(&mut scales, j, sc_u8[j], m_u8[j]);
+        }
+        // Write block: d, dmin, scales[12], qs[128]
+        out.extend_from_slice(&d_f16.to_le_bytes());
+        out.extend_from_slice(&dmin_f16.to_le_bytes());
+        out.extend_from_slice(&scales);
+        // qs: 4 groups, 32 bytes each. group grp has subblocks 2*grp (lo) and 2*grp+1 (hi)
+        for grp in 0..4 {
+            let j0 = grp * 2;
+            let j1 = grp * 2 + 1;
+            // Re-quantize with final packed sc/m to be consistent.
+            let sc0 = d * sc_u8[j0] as f32;
+            let m0 = dmin * m_u8[j0] as f32;
+            let sc1 = d * sc_u8[j1] as f32;
+            let m1 = dmin * m_u8[j1] as f32;
+            let inv0 = if sc0 > 0.0 { 1.0 / sc0 } else { 0.0 };
+            let inv1 = if sc1 > 0.0 { 1.0 / sc1 } else { 0.0 };
+            for l in 0..32 {
+                let v0 = blk[j0 * 32 + l];
+                let v1 = blk[j1 * 32 + l];
+                let q0 = ((v0 + m0) * inv0).round().clamp(0.0, 15.0) as u8;
+                let q1 = ((v1 + m1) * inv1).round().clamp(0.0, 15.0) as u8;
+                out.push((q0 & 0xF) | ((q1 & 0xF) << 4));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// 6-bit scale/min extraction shared by Q4_K and Q5_K (llama.cpp `get_scale_min_k4`).
@@ -652,6 +763,75 @@ mod tests {
         assert!((out[0] - 5.0).abs() < 1e-5);
         assert!((out[31] - 5.0).abs() < 1e-5);
         assert_eq!(out[32], 0.0); // grp0 high uses sub-block1 scale = 0
+    }
+
+    #[test]
+    fn quantize_q4_k_round_trip() {
+        let src: Vec<f32> = (0..256).map(|i| ((i as f32) - 128.0) / 64.0).collect();
+        let q = quantize_q4_k(&src).expect("quantize");
+        assert_eq!(q.len(), 144);
+        let back = dequant_q4_k(&q);
+        assert_eq!(back.len(), 256);
+        let mut max_abs = 0.0f32;
+        let mut max_i = 0usize;
+        for (i, (a, b)) in src.iter().zip(back.iter()).enumerate() {
+            let e = (a - b).abs();
+            if e > max_abs {
+                max_abs = e;
+                max_i = i;
+            }
+        }
+        eprintln!(
+            "max_abs={max_abs} at {max_i} src={} back={}",
+            src[max_i], back[max_i]
+        );
+        let sb = max_i / 32;
+        eprintln!(
+            "sb={sb} src[{}..{}]={:?}",
+            sb * 32,
+            sb * 32 + 4,
+            &src[sb * 32..sb * 32 + 4]
+        );
+        eprintln!(
+            "back[{}..{}]={:?}",
+            sb * 32,
+            sb * 32 + 4,
+            &back[sb * 32..sb * 32 + 4]
+        );
+        let d = f16_to_f32(u16::from_le_bytes([q[0], q[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([q[2], q[3]]));
+        let scales = &q[4..16];
+        let (sc, m) = get_scale_min_k4(sb, scales);
+        eprintln!(
+            "d={d} dmin={dmin} sc={sc} m={m} d*sc={} dmin*m={}",
+            d * sc as f32,
+            dmin * m as f32
+        );
+        // show qs for this subblock
+        let grp = sb / 2;
+        let is_hi = sb % 2 == 1;
+        let base = 16 + grp * 32;
+        let qs: Vec<u8> = (0..4)
+            .map(|l| {
+                let b = q[base + l];
+                if is_hi {
+                    b >> 4
+                } else {
+                    b & 0xF
+                }
+            })
+            .collect();
+        eprintln!("qs[0..4]={:?}", qs);
+        assert!(max_abs < 0.25, "max_abs={max_abs}");
+    }
+
+    #[test]
+    fn quantize_dispatch_q4_k() {
+        let src: Vec<f32> = (0..256).map(|i| i as f32 * 0.01).collect();
+        let q = quantize(12, &src).expect("q4_k");
+        assert_eq!(q.len(), 144);
+        let back = dequant(12, &q).expect("dequant");
+        assert_eq!(back.len(), 256);
     }
 
     #[test]

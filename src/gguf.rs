@@ -157,7 +157,7 @@ impl GgufFile {
     /// Aligned start of tensor data blob.
     pub fn aligned_data_start(&self) -> usize {
         let a = self.alignment().max(1) as usize;
-        ((self.data_offset + a - 1) / a) * a
+        self.data_offset.div_ceil(a) * a
     }
 
     /// Byte range `[start, end)` for tensor data within the file.
@@ -629,7 +629,7 @@ fn align_up(v: u64, align: u64) -> u64 {
     if align <= 1 {
         return v;
     }
-    ((v + align - 1) / align) * align
+    v.div_ceil(align) * align
 }
 
 fn write_string(out: &mut Vec<u8>, s: &str) {
@@ -1304,7 +1304,7 @@ mod tests {
         let f = parse(&bytes).expect("parse");
         assert_eq!(f.alignment(), 64);
         assert_eq!(f.tensors.len(), 2);
-        let data_start = ((f.data_offset as u64 + 63) / 64 * 64) as usize;
+        let data_start = ((f.data_offset as u64).div_ceil(64) * 64) as usize;
         assert_eq!(data_start % 64, 0);
         assert_eq!(f.tensors[0].offset % 64, 0);
         assert_eq!(f.tensors[1].offset % 64, 0);
@@ -1415,7 +1415,7 @@ mod tests {
             .push_tensor(tw);
         let (out_bytes, _) = out_w.write_to_vec().unwrap();
         let out_h = parse(&out_bytes).unwrap();
-        let ds = ((out_h.data_offset as u64 + 31) / 32 * 32) as usize;
+        let ds = ((out_h.data_offset as u64).div_ceil(32) * 32) as usize;
         let s = ds + out_h.tensors[0].offset as usize;
         let mut got = Vec::new();
         for chunk in out_bytes[s..s + 16].chunks_exact(4) {
