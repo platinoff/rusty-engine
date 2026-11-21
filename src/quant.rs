@@ -44,6 +44,33 @@ pub fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// f32 -> IEEE-754 binary16 (round-to-nearest-even, saturates to Inf).
+pub fn f32_to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xFF) as i32;
+    let frac = b & 0x7FFFFF;
+    if exp == 0xFF {
+        // Inf/NaN
+        if frac == 0 {
+            return sign | 0x7C00;
+        }
+        return sign | 0x7E00 | ((frac >> 13) as u16);
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 0x1F {
+        return sign | 0x7C00; // Inf
+    }
+    if new_exp <= 0 {
+        if new_exp < -10 {
+            return sign;
+        }
+        let mant = (frac | 0x800000) >> (1 - new_exp + 13);
+        return sign | (mant as u16);
+    }
+    sign | (((new_exp as u32) << 10) as u16) | ((frac >> 13) as u16)
+}
+
 /// `GGML_TYPE_*` code → block geometry (`None` for formats we don't size yet).
 pub fn block_info(ggml_type: u32) -> Option<BlockInfo> {
     let (elements, bytes) = match ggml_type {
@@ -128,6 +155,38 @@ pub fn dequant_q8_0(data: &[u8]) -> Vec<f32> {
         out.extend_from_slice(&vals);
     }
     out
+}
+
+/// Quantize f32 slice to Q8_0 blocks (GASV-D3 stepping stone; parity-gated by tests).
+/// Length must be a multiple of 32.
+pub fn quantize_q8_0(src: &[f32]) -> Result<Vec<u8>> {
+    if src.len() % 32 != 0 {
+        return Err(EngineError {
+            message: format!("q8_0 quantize: len {} not multiple of 32", src.len()),
+        });
+    }
+    let mut out = Vec::with_capacity(src.len() / 32 * 34);
+    for blk in src.chunks_exact(32) {
+        let mut amax = 0.0f32;
+        for &x in blk {
+            let ax = x.abs();
+            if ax > amax {
+                amax = ax;
+            }
+        }
+        let d = amax / 127.0;
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+        out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        for &x in blk {
+            let q = if d == 0.0 {
+                0i8
+            } else {
+                (x * id).round().clamp(-127.0, 127.0) as i8
+            };
+            out.push(q as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// 6-bit scale/min extraction shared by Q4_K and Q5_K (llama.cpp `get_scale_min_k4`).
@@ -606,5 +665,21 @@ mod tests {
     fn dequant_f32_rejects_partial_word() {
         let err = dequant(0, &[0u8; 3]).expect_err("F32 length must be multiple of 4");
         assert!(err.message.contains("F32"), "{err:?}");
+    }
+
+    #[test]
+    fn quantize_q8_0_round_trip_parity() {
+        let src: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 7.0).collect();
+        let q = quantize_q8_0(&src).expect("quant");
+        assert_eq!(q.len(), 2 * 34);
+        let back = dequant_q8_0(&q);
+        assert_eq!(back.len(), src.len());
+        for (i, (a, b)) in src.iter().zip(back.iter()).enumerate() {
+            let blk = &src[(i / 32) * 32..(i / 32 + 1) * 32];
+            let amax = blk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let d = amax / 127.0;
+            let tol = d * 0.75 + 1e-6;
+            assert!((a - b).abs() <= tol, "i={i} a={a} b={b} tol={tol} d={d}");
+        }
     }
 }
