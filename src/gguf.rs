@@ -8,7 +8,7 @@
 
 use crate::core::DType;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// GGUF file magic ("GGUF" little-endian; versions 2 and 3).
@@ -152,6 +152,21 @@ impl GgufFile {
     /// Metadata pair count (== `n_kv`).
     pub fn n_kv(&self) -> usize {
         self.metadata.len()
+    }
+
+    /// Aligned start of tensor data blob.
+    pub fn aligned_data_start(&self) -> usize {
+        let a = self.alignment().max(1) as usize;
+        ((self.data_offset + a - 1) / a) * a
+    }
+
+    /// Byte range `[start, end)` for tensor data within the file.
+    pub fn tensor_data_range(&self, name: &str) -> Option<(usize, usize)> {
+        let t = self.tensors.iter().find(|t| t.name == name)?;
+        let nbytes = t.nbytes()?;
+        let start = self.aligned_data_start().checked_add(t.offset as usize)?;
+        let end = start.checked_add(nbytes)?;
+        Some((start, end))
     }
 }
 
@@ -388,6 +403,28 @@ pub fn parse_file(path: &Path, window: usize) -> io::Result<GgufFile> {
     let mut buf = Vec::with_capacity(want);
     file.take(want as u64).read_to_end(&mut buf)?;
     parse(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Read-only: extract raw tensor bytes from a GGUF file by header range.
+pub fn read_tensor_bytes(path: &Path, header: &GgufFile, tensor_name: &str) -> io::Result<Vec<u8>> {
+    let (start, end) = header.tensor_data_range(tensor_name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("tensor {tensor_name} not found or unsized"),
+        )
+    })?;
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    if end > len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("tensor {tensor_name} range {start}..{end} beyond file size {len}"),
+        ));
+    }
+    file.seek(SeekFrom::Start(start as u64))?;
+    let mut buf = vec![0u8; end - start];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 // ───────────────────────── GGUF writer (GASV-C1) ─────────────────────────
@@ -786,6 +823,118 @@ pub fn build_skeleton(spec: &SkeletonSpec) -> GgufResult<(Vec<u8>, WriteReport)>
     w.write_to_vec()
 }
 
+// ───────────────────── GASV-D1 transplant (read-only source) ─────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransplantClass {
+    DirectCopy,
+    ConvertSafe,
+    ProjectedResearch,
+    Incompatible,
+    Excluded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransplantEntry {
+    pub target_tensor: String,
+    pub class: TransplantClass,
+    pub source_tensor: String,
+    pub expected_ggml_type: Option<u32>,
+    pub expected_dims: Option<Vec<usize>>,
+    pub expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransplantReport {
+    pub target_tensor: String,
+    pub class: TransplantClass,
+    pub bytes: usize,
+    pub sha256: String,
+}
+
+/// Validate and extract a direct-copy tensor from a source GGUF.
+/// Rejects any class other than DirectCopy; verifies dims/type/sha256 when provided.
+pub fn transplant_direct_copy(
+    source_path: &Path,
+    source_header: &GgufFile,
+    entry: &TransplantEntry,
+) -> GgufResult<(TensorWrite, TransplantReport)> {
+    if entry.class != TransplantClass::DirectCopy {
+        return Err(ParseError {
+            message: format!(
+                "tensor {}: class {:?} not allowed in direct_copy path",
+                entry.target_tensor, entry.class
+            ),
+            offset: 0,
+        });
+    }
+    let src = source_header
+        .tensors
+        .iter()
+        .find(|t| t.name == entry.source_tensor)
+        .ok_or_else(|| ParseError {
+            message: format!(
+                "tensor {}: source tensor {} not found",
+                entry.target_tensor, entry.source_tensor
+            ),
+            offset: 0,
+        })?;
+    if let Some(t) = entry.expected_ggml_type {
+        if src.ggml_type != t {
+            return Err(ParseError {
+                message: format!(
+                    "tensor {}: ggml_type mismatch expected {t} got {}",
+                    entry.target_tensor, src.ggml_type
+                ),
+                offset: 0,
+            });
+        }
+    }
+    if let Some(d) = &entry.expected_dims {
+        if &src.dims != d {
+            return Err(ParseError {
+                message: format!(
+                    "tensor {}: dims mismatch expected {:?} got {:?}",
+                    entry.target_tensor, d, src.dims
+                ),
+                offset: 0,
+            });
+        }
+    }
+    let bytes =
+        read_tensor_bytes(source_path, source_header, &entry.source_tensor).map_err(|e| {
+            ParseError {
+                message: format!("tensor {}: read failed: {e}", entry.target_tensor),
+                offset: 0,
+            }
+        })?;
+    let sha256 = crate::patch::sha256_hex(&bytes);
+    if let Some(exp) = &entry.expected_sha256 {
+        if !exp.eq_ignore_ascii_case(&sha256) {
+            return Err(ParseError {
+                message: format!(
+                    "tensor {}: sha256 mismatch expected {exp} got {sha256}",
+                    entry.target_tensor
+                ),
+                offset: 0,
+            });
+        }
+    }
+    let report = TransplantReport {
+        target_tensor: entry.target_tensor.clone(),
+        class: entry.class,
+        bytes: bytes.len(),
+        sha256: sha256.clone(),
+    };
+    let tw = TensorWrite {
+        name: entry.target_tensor.clone(),
+        dims: src.dims.clone(),
+        ggml_type: src.ggml_type,
+        data: TensorData::Raw(bytes),
+    };
+    Ok((tw, report))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1110,5 +1259,53 @@ mod tests {
         assert_eq!(vals.len(), 32);
         assert!(vals.iter().all(|v| v.is_finite()));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn transplant_direct_copy_round_trip_and_rejects_bad_class() {
+        let src_w = GgufWriter::new_v3()
+            .push_kv("general.architecture", Value::Str("test".into()))
+            .push_kv("general.alignment", Value::U32(32))
+            .push_tensor(TensorWrite {
+                name: "a.weight".into(),
+                dims: vec![4],
+                ggml_type: 0,
+                data: TensorData::F32(vec![1.0, 2.0, 3.0, 4.0]),
+            });
+        let (src_bytes, _) = src_w.write_to_vec().unwrap();
+        std::fs::create_dir_all("target").unwrap();
+        let src_path = std::path::Path::new("target/gasv_transplant_src.gguf");
+        std::fs::write(src_path, &src_bytes).unwrap();
+        let src_header = parse(&src_bytes).unwrap();
+        let entry = TransplantEntry {
+            target_tensor: "b.weight".into(),
+            class: TransplantClass::DirectCopy,
+            source_tensor: "a.weight".into(),
+            expected_ggml_type: Some(0),
+            expected_dims: Some(vec![4]),
+            expected_sha256: None,
+        };
+        let (tw, report) = transplant_direct_copy(src_path, &src_header, &entry).unwrap();
+        assert_eq!(report.class, TransplantClass::DirectCopy);
+        assert_eq!(report.bytes, 16);
+        let out_w = GgufWriter::new_v3()
+            .push_kv("general.architecture", Value::Str("test".into()))
+            .push_kv("general.alignment", Value::U32(32))
+            .push_tensor(tw);
+        let (out_bytes, _) = out_w.write_to_vec().unwrap();
+        let out_h = parse(&out_bytes).unwrap();
+        let ds = ((out_h.data_offset as u64 + 31) / 32 * 32) as usize;
+        let s = ds + out_h.tensors[0].offset as usize;
+        let mut got = Vec::new();
+        for chunk in out_bytes[s..s + 16].chunks_exact(4) {
+            got.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        assert_eq!(got, vec![1.0, 2.0, 3.0, 4.0]);
+        let bad = TransplantEntry {
+            class: TransplantClass::Incompatible,
+            ..entry
+        };
+        assert!(transplant_direct_copy(src_path, &src_header, &bad).is_err());
+        let _ = std::fs::remove_file(src_path);
     }
 }
