@@ -21,6 +21,7 @@ fn main() {
             println!("  skeleton <spec.json> <out.gguf>  deterministic GGUF skeleton (GASV-C2)");
             println!("  transplant-mirror <skeleton.gguf> <tensors.json> <chunks_dir> <out.gguf>  direct-copy mirror tensors into skeleton (GASV-D1)");
             println!("  quantize-export <in.gguf> <out.gguf> <q4_0|q8_0|q4_k|q4_k_m> [--report <path>]  quantize F32 GGUF (GASV-D3/F2/G6; q4_k_m=no-imatrix fallback)");
+            println!("  assemble-copy <src.gguf> <out.gguf> [--report <path>] [--kv k=v]...  stream-copy all tensors + metadata (GASV-G9 Strategy C)");
             println!("  artifact-report <file.gguf> [--kind K] [--runnable true|false] [--source S] [--coverage C] [--transplant-report-sha256 H]  GASV artifact contract (F1)");
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  dump-f32 <file> <name> <out.bin>  raw LE f32 bytes of one tensor   (MC-2)");
@@ -99,6 +100,32 @@ fn main() {
                 (Some(i), Some(o), Some(qt)) => quantize_export(&i, &o, &qt, report.as_deref()),
                 _ => {
                     eprintln!("usage: rusty quantize-export <in.gguf> <out.gguf> <q4_0|q8_0|q4_k|q4_k_m> [--report <path>]");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("assemble-copy") => {
+            let inp = args.next();
+            let out = args.next();
+            let mut report: Option<String> = None;
+            let mut add_kv: Vec<(String, String)> = Vec::new();
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--report" => report = args.next(),
+                    "--kv" => {
+                        if let Some(kv) = args.next() {
+                            if let Some((k, v)) = kv.split_once('=') {
+                                add_kv.push((k.to_string(), v.to_string()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match (inp, out) {
+                (Some(i), Some(o)) => assemble_copy(&i, &o, report.as_deref(), &add_kv),
+                _ => {
+                    eprintln!("usage: rusty assemble-copy <src.gguf> <out.gguf> [--report <path>] [--kv key=value]...");
                     std::process::exit(2);
                 }
             }
@@ -1729,6 +1756,111 @@ fn quantize_export(inp: &str, out_path: &str, quant: &str, report_path: Option<&
         }
         Err(e) => {
             eprintln!("rusty quantize-export: write {out_path}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn assemble_copy(
+    inp: &str,
+    out_path: &str,
+    report_path: Option<&str>,
+    add_kv: &[(String, String)],
+) {
+    use rusty_engine::gguf::{
+        parse_file, read_tensor_bytes, GgufWriter, TensorData, TensorWrite, Value, INSPECT_WINDOW,
+    };
+    let inp_p = std::path::Path::new(inp);
+    let src = match parse_file(inp_p, INSPECT_WINDOW) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rusty assemble-copy: open {inp}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut w = GgufWriter::new_v3().with_alignment(src.alignment());
+    for (k, v) in &src.metadata {
+        // Skip existing GSV provenance keys we'll replace
+        if k.starts_with("gsv.assemble.") {
+            continue;
+        }
+        w.add_kv(k.clone(), v.clone());
+    }
+    for (k, v) in add_kv {
+        w.add_kv(k.clone(), Value::Str(v.clone()));
+    }
+    w.add_kv(
+        "gsv.assemble.schema",
+        Value::Str("gasv.assemble-copy.v1".into()),
+    );
+    w.add_kv("gsv.assemble.source", Value::Str(inp.to_string()));
+    w.add_kv(
+        "gsv.assemble.mode",
+        Value::Str("direct-copy-raw-bytes".into()),
+    );
+
+    let mut tensor_rows: Vec<serde_json::Value> = Vec::new();
+    for t in &src.tensors {
+        let numel: usize = t.dims.iter().product();
+        let byte_len = match rusty_engine::quant::bytes_for_numel(t.ggml_type, numel) {
+            Some(n) => n,
+            None => {
+                eprintln!(
+                    "rusty assemble-copy: cannot size tensor {} type {} dims {:?}",
+                    t.name, t.ggml_type, t.dims
+                );
+                std::process::exit(1);
+            }
+        };
+        tensor_rows.push(serde_json::json!({
+            "name": t.name,
+            "dims": t.dims,
+            "ggml_type": t.ggml_type,
+            "numel": numel,
+            "bytes": byte_len,
+        }));
+        // data field ignored by write_to_file_streaming, but fill with empty placeholder
+        w.add_tensor(TensorWrite {
+            name: t.name.clone(),
+            dims: t.dims.clone(),
+            ggml_type: t.ggml_type,
+            data: TensorData::Raw(Vec::new()),
+        });
+    }
+    let out_p = std::path::Path::new(out_path);
+    let inp_p2 = inp_p.to_path_buf();
+    let src2 = src.clone();
+    let res =
+        w.write_to_file_streaming(out_p, move |tw| read_tensor_bytes(&inp_p2, &src2, &tw.name));
+    match res {
+        Ok(wr) => {
+            let out_sha = rusty_engine::patch::sha256_hex_file(out_p).unwrap_or_default();
+            let report = serde_json::json!({
+                "schema": "gasv.assemble-copy-report.v1",
+                "input": inp,
+                "output": out_path,
+                "n_tensors": wr.n_tensors,
+                "n_kv": wr.n_kv,
+                "bytes_written": wr.bytes_written,
+                "sha256": out_sha,
+                "tensors": tensor_rows,
+            });
+            if let Some(rp) = report_path {
+                if let Err(e) = std::fs::write(
+                    rp,
+                    serde_json::to_string_pretty(&report).unwrap_or_default(),
+                ) {
+                    eprintln!("rusty assemble-copy: write report {rp}: {e}");
+                    std::process::exit(1);
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+            );
+        }
+        Err(e) => {
+            eprintln!("rusty assemble-copy: write {out_path}: {e}");
             std::process::exit(1);
         }
     }

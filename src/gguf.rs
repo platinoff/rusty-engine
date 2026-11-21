@@ -623,6 +623,117 @@ impl GgufWriter {
         std::fs::write(path, bytes)?;
         Ok(report)
     }
+
+    /// Stream tensor data one-at-a-time to avoid holding the full GGUF in memory.
+    /// `read_tensor` returns the raw bytes for each tensor in order. The tensor's
+    /// `data` field in self.tensors is ignored; metadata/dims/type come from TensorWrite.
+    pub fn write_to_file_streaming<F>(
+        &self,
+        path: &Path,
+        mut read_tensor: F,
+    ) -> io::Result<WriteReport>
+    where
+        F: FnMut(&TensorWrite) -> io::Result<Vec<u8>>,
+    {
+        if !(2..=3).contains(&self.version) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported GGUF write version {}", self.version),
+            ));
+        }
+        let align = self.effective_alignment();
+        // Build header + kv + tensor infos in memory (small).
+        let mut header: Vec<u8> = Vec::new();
+        header.extend_from_slice(GGUF_MAGIC);
+        header.extend_from_slice(&self.version.to_le_bytes());
+        if self.version >= 3 {
+            header.extend_from_slice(&(self.tensors.len() as u64).to_le_bytes());
+            header.extend_from_slice(&(self.metadata.len() as u64).to_le_bytes());
+        } else {
+            header.extend_from_slice(&(self.tensors.len() as u32).to_le_bytes());
+            header.extend_from_slice(&(self.metadata.len() as u32).to_le_bytes());
+        }
+        for (k, v) in &self.metadata {
+            write_string(&mut header, k);
+            write_value(&mut header, v)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        }
+        // Precompute offsets by reading tensor sizes. We must know byte sizes before writing infos.
+        // Compute sizes from ggml_type+dims (no data read needed for offsets).
+        let mut sizes: Vec<usize> = Vec::with_capacity(self.tensors.len());
+        let mut rel: u64 = 0;
+        let mut offsets: Vec<u64> = Vec::with_capacity(self.tensors.len());
+        for t in &self.tensors {
+            let expected = crate::quant::bytes_for_numel(t.ggml_type, t.dims.iter().product());
+            let sz = expected.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "tensor {}: cannot compute size for type {} dims {:?}",
+                        t.name, t.ggml_type, t.dims
+                    ),
+                )
+            })?;
+            offsets.push(rel);
+            rel = rel.checked_add(sz as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "tensor offset overflow")
+            })?;
+            rel = align_up(rel, align);
+            sizes.push(sz);
+        }
+        for (t, off) in self.tensors.iter().zip(offsets.iter()) {
+            write_string(&mut header, &t.name);
+            header.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
+            for d in &t.dims {
+                header.extend_from_slice(&(*d as u64).to_le_bytes());
+            }
+            header.extend_from_slice(&t.ggml_type.to_le_bytes());
+            header.extend_from_slice(&off.to_le_bytes());
+        }
+        let data_start = align_up(header.len() as u64, align) as usize;
+        let pad = data_start - header.len();
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        use std::io::Write;
+        f.write_all(&header)?;
+        f.write_all(&vec![0u8; pad])?;
+        let mut written = data_start;
+        for (i, t) in self.tensors.iter().enumerate() {
+            let want = data_start as u64 + offsets[i];
+            if want as usize > written {
+                let fill = vec![0u8; want as usize - written];
+                f.write_all(&fill)?;
+                written = want as usize;
+            }
+            let bytes = read_tensor(t)?;
+            if bytes.len() != sizes[i] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "tensor {} byte size mismatch: expected {}, got {}",
+                        t.name,
+                        sizes[i],
+                        bytes.len()
+                    ),
+                ));
+            }
+            f.write_all(&bytes)?;
+            written += bytes.len();
+            if i + 1 < self.tensors.len() {
+                let next = data_start as u64 + offsets[i + 1];
+                if next as usize > written {
+                    let fill = vec![0u8; next as usize - written];
+                    f.write_all(&fill)?;
+                    written = next as usize;
+                }
+            }
+        }
+        f.flush()?;
+        Ok(WriteReport {
+            bytes_written: written,
+            n_tensors: self.tensors.len(),
+            n_kv: self.metadata.len(),
+        })
+    }
 }
 
 fn align_up(v: u64, align: u64) -> u64 {
