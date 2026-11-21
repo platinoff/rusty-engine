@@ -17,6 +17,7 @@ fn main() {
             println!("  --version, -V   print crate version");
             println!("  --help, -h      print this banner");
             println!("  inspect <file> [N]        GGUF metadata summary      (PH-107)");
+            println!("  manifest <file> [--sha256] GGUF JSON manifest (read-only, GASV)");
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  dump-f32 <file> <name> <out.bin>  raw LE f32 bytes of one tensor   (MC-2)");
             println!("  config <file>             read model hyperparameters (PH-305c)");
@@ -43,6 +44,27 @@ fn main() {
                 std::process::exit(2);
             }
         },
+        Some("manifest") => {
+            let mut path: Option<String> = None;
+            let mut sha256 = false;
+            for a in args.by_ref() {
+                match a.as_str() {
+                    "--sha256" => sha256 = true,
+                    p if path.is_none() => path = Some(p.to_string()),
+                    _ => {
+                        eprintln!("usage: rusty manifest <model.gguf> [--sha256]");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            match path {
+                Some(p) => manifest(&p, sha256),
+                None => {
+                    eprintln!("usage: rusty manifest <model.gguf> [--sha256]");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("dump-f32") => match (args.next(), args.next(), args.next()) {
             (Some(path), Some(name), Some(out)) => dump_f32(&path, &name, &out),
             _ => {
@@ -173,6 +195,68 @@ fn inspect(path: &str, show_n: Option<&str>) {
         }
         Err(e) => {
             eprintln!("rusty inspect {path}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn manifest(path: &str, with_sha256: bool) {
+    let p = Path::new(path);
+    let file_size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let sha256 = if with_sha256 {
+        match rusty_engine::patch::sha256_hex_file(p) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("rusty manifest: sha256 failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    match rusty_engine::gguf::parse_file(p, rusty_engine::gguf::INSPECT_WINDOW) {
+        Ok(f) => {
+            let tensors: Vec<serde_json::Value> = f
+                .tensors
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "dims": t.dims,
+                        "ggml_type": t.ggml_type,
+                        "dtype": t.dtype.map(|d| format!("{d:?}")),
+                        "offset": t.offset,
+                        "nbytes": t.nbytes(),
+                        "numel": t.numel(),
+                    })
+                })
+                .collect();
+            let metadata: Vec<serde_json::Value> = f
+                .metadata
+                .iter()
+                .map(|(k, v)| serde_json::json!({"key": k, "value": kv_summary(v)}))
+                .collect();
+            let out = serde_json::json!({
+                "schema": "gasv.gguf-manifest.v1",
+                "file": path,
+                "file_size_bytes": file_size,
+                "sha256": sha256,
+                "gguf_version": f.version,
+                "n_tensors": f.n_tensors,
+                "n_kv": f.n_kv(),
+                "alignment": f.alignment(),
+                "data_offset": f.data_offset,
+                "architecture": f.get("general.architecture").and_then(|v| match v { rusty_engine::gguf::Value::Str(s) => Some(s.as_str()), _ => None }),
+                "metadata": metadata,
+                "tensors": tensors,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
+            );
+        }
+        Err(e) => {
+            eprintln!("rusty manifest {path}: {e}");
             std::process::exit(1);
         }
     }

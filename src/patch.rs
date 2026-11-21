@@ -122,6 +122,111 @@ pub fn sha256_hex(data: &[u8]) -> String {
     s
 }
 
+/// Streaming SHA-256 of a file (read-only). Used for GASV inventory manifests.
+pub fn sha256_hex_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut total_len: u64 = 0;
+    let mut buf = [0u8; 64 * 1024];
+    let mut pending: Vec<u8> = Vec::with_capacity(64);
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total_len = total_len.wrapping_add(n as u64);
+        let mut data = &buf[..n];
+        if !pending.is_empty() {
+            let need = 64 - pending.len();
+            if data.len() < need {
+                pending.extend_from_slice(data);
+                continue;
+            }
+            pending.extend_from_slice(&data[..need]);
+            let block: [u8; 64] = pending.as_slice().try_into().unwrap();
+            sha256_compress(&mut h, &block);
+            pending.clear();
+            data = &data[need..];
+        }
+        for chunk in data.chunks_exact(64) {
+            let block: [u8; 64] = chunk.try_into().unwrap();
+            sha256_compress(&mut h, &block);
+        }
+        let rem = data.chunks_exact(64).remainder();
+        if !rem.is_empty() {
+            pending.extend_from_slice(rem);
+        }
+    }
+    let bit_len = total_len.wrapping_mul(8);
+    pending.push(0x80);
+    while pending.len() % 64 != 56 {
+        pending.push(0);
+    }
+    pending.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in pending.chunks_exact(64) {
+        let block: [u8; 64] = chunk.try_into().unwrap();
+        sha256_compress(&mut h, &block);
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    let mut s = String::with_capacity(64);
+    for byte in out {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    Ok(s)
+}
+
+fn sha256_compress(h: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for (i, word) in block.chunks_exact(4).enumerate() {
+        w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+    let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+        (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+    for i in 0..64 {
+        let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let t1 = hh
+            .wrapping_add(big_s1)
+            .wrapping_add(ch)
+            .wrapping_add(SHA256_K[i])
+            .wrapping_add(w[i]);
+        let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = big_s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(hh);
+}
+
 // ─────────────────────────── Patch wire types ───────────────────────────
 
 /// One staged replacement region inside the raw model file (byte range + new bytes).
