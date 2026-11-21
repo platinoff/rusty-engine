@@ -189,6 +189,45 @@ pub fn quantize_q8_0(src: &[f32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Quantize f32 slice to Q4_0 blocks (GASV-D3 stepping stone; parity-gated by tests).
+/// Length must be a multiple of 32.
+pub fn quantize_q4_0(src: &[f32]) -> Result<Vec<u8>> {
+    if src.len() % 32 != 0 {
+        return Err(EngineError {
+            message: format!("q4_0 quantize: len {} not multiple of 32", src.len()),
+        });
+    }
+    let mut out = Vec::with_capacity(src.len() / 32 * 18);
+    for blk in src.chunks_exact(32) {
+        let mut amax = 0.0f32;
+        for &x in blk {
+            let ax = x.abs();
+            if ax > amax {
+                amax = ax;
+            }
+        }
+        let d = amax / 7.0;
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+        out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        let mut qs = [0u8; 16];
+        for j in 0..16 {
+            let q0 = if d == 0.0 {
+                8i32
+            } else {
+                (blk[j] * id).round().clamp(-8.0, 7.0) as i32 + 8
+            } as u8;
+            let q1 = if d == 0.0 {
+                8i32
+            } else {
+                (blk[j + 16] * id).round().clamp(-8.0, 7.0) as i32 + 8
+            } as u8;
+            qs[j] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
+        }
+        out.extend_from_slice(&qs);
+    }
+    Ok(out)
+}
+
 /// 6-bit scale/min extraction shared by Q4_K and Q5_K (llama.cpp `get_scale_min_k4`).
 /// `q` is the 12-byte super-block scale array; returns `(scale, min)` for sub-block `j`.
 pub(crate) fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
@@ -678,6 +717,22 @@ mod tests {
             let blk = &src[(i / 32) * 32..(i / 32 + 1) * 32];
             let amax = blk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             let d = amax / 127.0;
+            let tol = d * 0.75 + 1e-6;
+            assert!((a - b).abs() <= tol, "i={i} a={a} b={b} tol={tol} d={d}");
+        }
+    }
+
+    #[test]
+    fn quantize_q4_0_round_trip_parity() {
+        let src: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 9.0).collect();
+        let q = quantize_q4_0(&src).expect("quant");
+        assert_eq!(q.len(), 2 * 18);
+        let back = dequant_q4_0(&q);
+        assert_eq!(back.len(), src.len());
+        for (i, (a, b)) in src.iter().zip(back.iter()).enumerate() {
+            let blk = &src[(i / 32) * 32..(i / 32 + 1) * 32];
+            let amax = blk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let d = amax / 7.0;
             let tol = d * 0.75 + 1e-6;
             assert!((a - b).abs() <= tol, "i={i} a={a} b={b} tol={tol} d={d}");
         }
