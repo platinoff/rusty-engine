@@ -228,6 +228,23 @@ pub fn quantize_q4_0(src: &[f32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Quantize f32 to a supported GGUF quant type (GASV-D3 export path).
+/// Supported now: Q8_0 (8), Q4_0 (2). Q4_K_M/Q6_K require parity-gated encoder.
+pub fn quantize(ggml_type: u32, src: &[f32]) -> Result<Vec<u8>> {
+    match ggml_type {
+        8 => quantize_q8_0(src),
+        2 => quantize_q4_0(src),
+        12 | 13 | 14 => Err(EngineError {
+            message: format!(
+                "quantize ggml_type {ggml_type}: Q4_K/Q5_K/Q6_K encoder not implemented; use Q4_0/Q8_0 or dequant/quant parity-gated path"
+            ),
+        }),
+        _ => Err(EngineError {
+            message: format!("quantize ggml_type {ggml_type}: unsupported"),
+        }),
+    }
+}
+
 /// 6-bit scale/min extraction shared by Q4_K and Q5_K (llama.cpp `get_scale_min_k4`).
 /// `q` is the 12-byte super-block scale array; returns `(scale, min)` for sub-block `j`.
 pub(crate) fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {

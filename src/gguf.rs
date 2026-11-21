@@ -823,6 +823,95 @@ pub fn build_skeleton(spec: &SkeletonSpec) -> GgufResult<(Vec<u8>, WriteReport)>
     w.write_to_vec()
 }
 
+// ───────────────────── GASV-D3 export provenance ─────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GasvExportProvenance {
+    pub schema: String,
+    pub artifact: String,
+    pub source_gguf: Option<String>,
+    pub source_manifest: Option<String>,
+    pub arch: Option<String>,
+    pub context_length: Option<u32>,
+    pub quant: String,
+    pub tensor_count: usize,
+    pub seed: Option<u64>,
+    pub gguf_sha256: Option<String>,
+    pub bytes: usize,
+}
+
+impl GasvExportProvenance {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema": self.schema,
+            "artifact": self.artifact,
+            "source_gguf": self.source_gguf,
+            "source_manifest": self.source_manifest,
+            "arch": self.arch,
+            "context_length": self.context_length,
+            "quant": self.quant,
+            "tensor_count": self.tensor_count,
+            "seed": self.seed,
+            "gguf_sha256": self.gguf_sha256,
+            "bytes": self.bytes,
+        })
+    }
+}
+
+/// Quantize F32 TensorWrite data to target ggml type (supported Q4_0/Q8_0).
+/// Returns new TensorWrite; no silent coercion on unsupported types.
+pub fn quantize_tensor_write(tw: &TensorWrite, target_ggml_type: u32) -> GgufResult<TensorWrite> {
+    let f32s = match &tw.data {
+        TensorData::F32(v) => v.clone(),
+        TensorData::Raw(bytes) if tw.ggml_type == 0 => {
+            let mut v = Vec::with_capacity(bytes.len() / 4);
+            for c in bytes.chunks_exact(4) {
+                v.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+            v
+        }
+        _ => {
+            return Err(ParseError {
+                message: format!(
+                    "tensor {}: quantize export requires F32 source, got ggml_type {}",
+                    tw.name, tw.ggml_type
+                ),
+                offset: 0,
+            })
+        }
+    };
+    let data = crate::quant::quantize(target_ggml_type, &f32s).map_err(|e| ParseError {
+        message: format!("tensor {}: {}", tw.name, e.message),
+        offset: 0,
+    })?;
+    let expected =
+        crate::quant::bytes_for_numel(target_ggml_type, f32s.len()).ok_or_else(|| ParseError {
+            message: format!(
+                "tensor {}: cannot size ggml_type {target_ggml_type} for numel {}",
+                tw.name,
+                f32s.len()
+            ),
+            offset: 0,
+        })?;
+    if data.len() != expected {
+        return Err(ParseError {
+            message: format!(
+                "tensor {}: quantized bytes {} != expected {}",
+                tw.name,
+                data.len(),
+                expected
+            ),
+            offset: 0,
+        });
+    }
+    Ok(TensorWrite {
+        name: tw.name.clone(),
+        dims: tw.dims.clone(),
+        ggml_type: target_ggml_type,
+        data: TensorData::Raw(data),
+    })
+}
+
 // ───────────────────── GASV-D1 transplant (read-only source) ─────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1373,5 +1462,45 @@ mod tests {
             ..base
         };
         assert!(enforce_transplant_policy(&ex, true).is_err());
+    }
+
+    #[test]
+    fn gasv_d3_quantize_export_q4_0_and_provenance() {
+        let src = TensorWrite {
+            name: "w".into(),
+            dims: vec![32],
+            ggml_type: 0,
+            data: TensorData::F32((0..32).map(|i| (i as f32 - 16.0) / 8.0).collect()),
+        };
+        let q = quantize_tensor_write(&src, 2).expect("q4_0");
+        assert_eq!(q.ggml_type, 2);
+        assert_eq!(q.data.byte_len(), 18);
+        let w = GgufWriter::new_v3()
+            .push_kv("general.architecture", Value::Str("gasvtest".into()))
+            .push_kv("gasv.skeleton.seed", Value::U64(7))
+            .push_kv("gasv.export.quant", Value::Str("Q4_0".into()))
+            .push_tensor(q);
+        let (bytes, report) = w.write_to_vec().expect("write");
+        let prov = GasvExportProvenance {
+            schema: "gasv.export-provenance.v1".into(),
+            artifact: "gasv-versus-ai.gguf".into(),
+            source_gguf: Some("source.gguf".into()),
+            source_manifest: Some("gasv.transplant-manifest.v1".into()),
+            arch: Some("gasvtest".into()),
+            context_length: Some(4096),
+            quant: "Q4_0".into(),
+            tensor_count: report.n_tensors,
+            seed: Some(7),
+            gguf_sha256: Some(crate::patch::sha256_hex(&bytes)),
+            bytes: report.bytes_written,
+        };
+        let j = prov.to_json();
+        assert_eq!(j["schema"], "gasv.export-provenance.v1");
+        assert_eq!(j["quant"], "Q4_0");
+        assert_eq!(j["tensor_count"], 1);
+        assert!(j["gguf_sha256"].as_str().unwrap().len() == 64);
+        // round-trip parse
+        let f = parse(&bytes).expect("parse");
+        assert_eq!(f.tensors[0].ggml_type, 2);
     }
 }
