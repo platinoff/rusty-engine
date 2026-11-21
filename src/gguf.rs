@@ -852,6 +852,38 @@ pub struct TransplantReport {
     pub sha256: String,
 }
 
+/// GASV-D2 policy gate. No silent coercion.
+/// - DirectCopy/ConvertSafe: allowed by this gate (handler must still validate).
+/// - ProjectedResearch: only with explicit owner-gated flag.
+/// - Incompatible/Excluded: always rejected.
+pub fn enforce_transplant_policy(
+    entry: &TransplantEntry,
+    allow_projected_research: bool,
+) -> GgufResult<()> {
+    match entry.class {
+        TransplantClass::DirectCopy | TransplantClass::ConvertSafe => Ok(()),
+        TransplantClass::ProjectedResearch if allow_projected_research => Ok(()),
+        TransplantClass::ProjectedResearch => Err(ParseError {
+            message: format!(
+                "tensor {}: ProjectedResearch requires explicit owner gate",
+                entry.target_tensor
+            ),
+            offset: 0,
+        }),
+        TransplantClass::Incompatible => Err(ParseError {
+            message: format!(
+                "tensor {}: Incompatible tensor rejected",
+                entry.target_tensor
+            ),
+            offset: 0,
+        }),
+        TransplantClass::Excluded => Err(ParseError {
+            message: format!("tensor {}: Excluded tensor rejected", entry.target_tensor),
+            offset: 0,
+        }),
+    }
+}
+
 /// Validate and extract a direct-copy tensor from a source GGUF.
 /// Rejects any class other than DirectCopy; verifies dims/type/sha256 when provided.
 pub fn transplant_direct_copy(
@@ -1307,5 +1339,39 @@ mod tests {
         };
         assert!(transplant_direct_copy(src_path, &src_header, &bad).is_err());
         let _ = std::fs::remove_file(src_path);
+    }
+
+    #[test]
+    fn transplant_policy_rejects_incompatible_and_gates_research() {
+        let base = TransplantEntry {
+            target_tensor: "t".into(),
+            class: TransplantClass::DirectCopy,
+            source_tensor: "s".into(),
+            expected_ggml_type: None,
+            expected_dims: None,
+            expected_sha256: None,
+        };
+        assert!(enforce_transplant_policy(&base, false).is_ok());
+        let conv = TransplantEntry {
+            class: TransplantClass::ConvertSafe,
+            ..base.clone()
+        };
+        assert!(enforce_transplant_policy(&conv, false).is_ok());
+        let research = TransplantEntry {
+            class: TransplantClass::ProjectedResearch,
+            ..base.clone()
+        };
+        assert!(enforce_transplant_policy(&research, false).is_err());
+        assert!(enforce_transplant_policy(&research, true).is_ok());
+        let bad = TransplantEntry {
+            class: TransplantClass::Incompatible,
+            ..base.clone()
+        };
+        assert!(enforce_transplant_policy(&bad, true).is_err());
+        let ex = TransplantEntry {
+            class: TransplantClass::Excluded,
+            ..base
+        };
+        assert!(enforce_transplant_policy(&ex, true).is_err());
     }
 }
