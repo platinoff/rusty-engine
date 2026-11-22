@@ -66,6 +66,11 @@ pub mod textgen;
 pub mod tokenizer;
 pub mod worker;
 
+/// `nanojev` — Rust-native port of the open NanoJev decision model (see `src/nanojev/mod.rs`).
+pub mod nanojev;
+
+pub use nanojev::model::{nanojev_predict, nanojev_predict_with_limit, NativeRequest};
+
 /// Crate name as reported by `rusty --version` / `banner()`.
 pub const CRATE_NAME: &str = "rusty-engine";
 

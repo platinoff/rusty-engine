@@ -20,6 +20,10 @@ categories = ["science", "command-line-utilities"]
 name = "rusty"
 path = "src/bin/rusty.rs"
 
+[[bin]]
+name = "nanojev"
+path = "src/bin/nanojev.rs"
+
 [[bench]]
 name = "quant"
 path = "benches/quant.rs"
@@ -47,6 +51,9 @@ neon = []
 # (tokio/axum/half/bollard) land band-by-band so `cargo build` stays offline-green.
 [dependencies]
 memmap2 = "0.9.11"
+# JSON parsing for the nanojev port (checkpoint metadata, request schema, predictions
+# replay). Pure Rust, no transitive native deps — GSV main crate already pins 1.x.
+serde_json = "1.0"
 
 [profile.release]
 opt-level = 3
