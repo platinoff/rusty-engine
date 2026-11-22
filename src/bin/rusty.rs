@@ -22,6 +22,7 @@ fn main() {
             println!("  transplant-mirror <skeleton.gguf> <tensors.json> <chunks_dir> <out.gguf>  direct-copy mirror tensors into skeleton (GASV-D1)");
             println!("  quantize-export <in.gguf> <out.gguf> <q4_0|q8_0|q4_k|q4_k_m> [--report <path>]  quantize F32 GGUF (GASV-D3/F2/G6; q4_k_m=no-imatrix fallback)");
             println!("  assemble-copy <src.gguf> <out.gguf> [--report <path>] [--kv k=v]...  stream-copy all tensors + metadata (GASV-G9 Strategy C)");
+            println!("  artifact-chunks <src.gguf> <tensor> [--max N]  emit artifact-source chunk manifest (key/offset/len, GASV-G20)");
             println!("  artifact-report <file.gguf> [--kind K] [--runnable true|false] [--source S] [--coverage C] [--transplant-report-sha256 H]  GASV artifact contract (F1)");
             println!("  tensor <file> <name>      mmap + dequant one tensor  (PH-305a)");
             println!("  dump-f32 <file> <name> <out.bin>  raw LE f32 bytes of one tensor   (MC-2)");
@@ -86,6 +87,26 @@ fn main() {
                 std::process::exit(2);
             }
         },
+        Some("artifact-chunks") => {
+            let inp = args.next();
+            let tensor = args.next();
+            let mut max = 4usize * 1024 * 1024;
+            while let Some(a) = args.next() {
+                if a == "--max" {
+                    max = args
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(4 * 1024 * 1024);
+                }
+            }
+            match (inp, tensor) {
+                (Some(i), Some(t)) => artifact_chunks(&i, &t, max),
+                _ => {
+                    eprintln!("usage: rusty artifact-chunks <src.gguf> <tensor> [--max N]");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("quantize-export") => {
             let inp = args.next();
             let out = args.next();
@@ -1759,6 +1780,78 @@ fn quantize_export(inp: &str, out_path: &str, quant: &str, report_path: Option<&
             std::process::exit(1);
         }
     }
+}
+
+/// `rusty artifact-chunks` — GASV-G20: emit a content-addressed artifact-source
+/// manifest for one GGUF tensor: slice its raw bytes into <=max pieces, hash
+/// each piece with SHA-256 to form the chunk key, and report (key, offset, len)
+/// so GSV can range-serve chunks from the artifact without duplicating them.
+fn artifact_chunks(inp: &str, tensor_name: &str, max: usize) {
+    use rusty_engine::gguf::{parse_file, INSPECT_WINDOW};
+    use std::io::{Read, Seek, SeekFrom};
+    let inp_p = std::path::Path::new(inp);
+    let header = match parse_file(inp_p, INSPECT_WINDOW) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("rusty artifact-chunks: open {inp}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let (start, end) = match header.tensor_data_range(tensor_name) {
+        Some(r) => r,
+        None => {
+            eprintln!("rusty artifact-chunks: tensor `{tensor_name}` not found / unsized");
+            std::process::exit(1);
+        }
+    };
+    let entry = header
+        .tensors
+        .iter()
+        .find(|t| t.name == tensor_name)
+        .expect("entry exists");
+    let total = end - start;
+    let max = max.max(1);
+    let mut f = match std::fs::File::open(inp_p) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("rusty artifact-chunks: read {inp}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut chunks = Vec::new();
+    let mut off = start;
+    while off < end {
+        let len = max.min(end - off);
+        let mut buf = vec![0u8; len];
+        if let Err(e) = f
+            .seek(SeekFrom::Start(off as u64))
+            .and_then(|_| f.read_exact(&mut buf))
+        {
+            eprintln!(
+                "rusty artifact-chunks: range read {off}..{}: {e}",
+                off + len
+            );
+            std::process::exit(1);
+        }
+        let key = rusty_engine::patch::sha256_hex(&buf);
+        chunks.push(serde_json::json!({
+            "key": key,
+            "offset": off as u64,
+            "len": len as u64,
+        }));
+        off += len;
+    }
+    let out = serde_json::json!({
+        "schema": "gasv.artifact-chunks.v1",
+        "artifact": inp,
+        "tensor": tensor_name,
+        "dims": entry.dims,
+        "ggml_type": entry.ggml_type,
+        "bytes": total,
+        "max_chunk_bytes": max,
+        "chunks": chunks,
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
 }
 
 fn assemble_copy(
