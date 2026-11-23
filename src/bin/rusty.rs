@@ -1638,14 +1638,32 @@ fn quantize_export(inp: &str, out_path: &str, quant: &str, report_path: Option<&
             }
         };
         total_src_bytes += raw.len();
-        if t.ggml_type != 0 {
-            eprintln!("rusty quantize-export: tensor {} is ggml_type {} (only F32 source supported in F2)", t.name, t.ggml_type);
+        let numel: usize = t.dims.iter().product::<usize>();
+        // GASV-G32: projector/vision GGUFs store weights as F16 (1) or BF16 (30),
+        // not F32. `quant::dequant` already widens both losslessly to f32, so
+        // accept them here instead of refusing to produce a 4-bit vision block.
+        if !matches!(t.ggml_type, 0 | 1 | 30) {
+            eprintln!(
+                "rusty quantize-export: tensor {} is ggml_type {} (supported sources: F32=0, F16=1, BF16=30)",
+                t.name, t.ggml_type
+            );
             std::process::exit(1);
         }
-        let numel: usize = t.dims.iter().product::<usize>();
-        let mut f32s: Vec<f32> = Vec::with_capacity(numel);
-        for c in raw.chunks_exact(4) {
-            f32s.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        let f32s = match dequant(t.ggml_type, &raw) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("rusty quantize-export: dequant {}: {}", t.name, e.message);
+                std::process::exit(1);
+            }
+        };
+        if f32s.len() != numel {
+            eprintln!(
+                "rusty quantize-export: tensor {} dequant gave {} values, expected {}",
+                t.name,
+                f32s.len(),
+                numel
+            );
+            std::process::exit(1);
         }
         // Q4_K super-block is 256; small tensors fall back to Q8_0 (or keep F32).
         let (actual_type, qbytes) = if target_type == 12 && numel % 256 != 0 {
