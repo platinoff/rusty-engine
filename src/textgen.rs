@@ -63,6 +63,38 @@ impl Completes for TextRunner35 {
     }
 }
 
+/// Read a `gsv.vision-prefix.v1` raw LE f32 file into K vectors of `d_model`.
+pub fn load_vision_prefix(path: &str, d_model: usize) -> Result<Vec<Vec<f32>>> {
+    if d_model == 0 {
+        return Err(EngineError {
+            message: "vision prefix: d_model must be > 0".to_string(),
+        });
+    }
+    let bytes = std::fs::read(path).map_err(|e| EngineError {
+        message: format!("vision prefix read {path}: {e}"),
+    })?;
+    if bytes.is_empty() || bytes.len() % (4 * d_model) != 0 {
+        return Err(EngineError {
+            message: format!(
+                "vision prefix: {} bytes is not a multiple of {} (d_model={d_model})",
+                bytes.len(),
+                4 * d_model
+            ),
+        });
+    }
+    let mut out = Vec::new();
+    for chunk in bytes.as_chunks::<4>().0.chunks(d_model) {
+        let v: Vec<f32> = chunk.iter().map(|b| f32::from_le_bytes(*b)).collect();
+        if !v.iter().all(|x| x.is_finite()) {
+            return Err(EngineError {
+                message: "vision prefix: non-finite value".to_string(),
+            });
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
 impl TextRunner {
     /// Build from a mapped GGUF: parse config + tokenizer metadata, validate geometry,
     /// load weights, and wire the BPE codec.
@@ -144,6 +176,9 @@ pub struct TextRunner35 {
     /// their GDN/KV state from a snapshot file and skip the prefill. Sync — safe
     /// under the thread-per-connection staging lane.
     pub state_cache: Option<crate::statecache::StateCache>,
+    /// PH-1204: precomputed vision-prefix embeddings (len = d_model each), fed
+    /// before the text prompt. Empty = bit-exact text-only path.
+    pub vision_prefix: Vec<Vec<f32>>,
 }
 
 impl TextRunner35 {
@@ -169,7 +204,24 @@ impl TextRunner35 {
             runner,
             bpe,
             state_cache: crate::statecache::StateCache::open_default(),
+            vision_prefix: Vec::new(),
         })
+    }
+
+    /// PH-1204: attach K precomputed vision vectors. Width must match d_model.
+    pub fn set_vision_prefix(&mut self, vs: Vec<Vec<f32>>) -> Result<()> {
+        for v in &vs {
+            if v.len() != self.runner.d_model || !v.iter().all(|x| x.is_finite()) {
+                return Err(EngineError {
+                    message: format!(
+                        "textgen35: vision prefix vector width/finite check failed (want {})",
+                        self.runner.d_model
+                    ),
+                });
+            }
+        }
+        self.vision_prefix = vs;
+        Ok(())
     }
 
     /// `ActivationAudit` capture (ECO-9.2 phase 9.3a): per-(token, layer) stats
@@ -191,26 +243,34 @@ impl TextRunner35 {
     /// Misses at the restore step rebuild a virgin decoder so a corrupt snapshot can
     /// never poison a prefill; stores are best-effort (a busy disk stays a miss).
     fn generate_cached(&self, ids: &[u32], max_new: usize) -> Result<String> {
-        let cache = self.state_cache.as_ref();
-        let key = cache.map(|_| crate::statecache::prompt_key(ids));
         let mut dec = Q35Decoder::new(&self.runner);
-        let (logits, hit) = match key.and_then(|k| cache.unwrap().load(k)) {
-            Some(snap) => match dec.restore_from(&snap) {
-                Ok(()) => (snap.logits, true),
-                Err(_) => {
-                    // Torn/foreign file: virgin decoder, ordinary prefill.
-                    dec = Q35Decoder::new(&self.runner);
-                    (dec.prefill(ids), false)
+        let logits = if !self.vision_prefix.is_empty() {
+            // PH-1204: the text-only SSD cache is keyed by token ids, so a
+            // cache hit would silently drop the image prefix. Bypass it and
+            // prefill vision embeddings first, then the ordinary text prompt.
+            dec.prefill_embeddings(&self.vision_prefix)?;
+            dec.prefill(ids)
+        } else {
+            let cache = self.state_cache.as_ref();
+            let key = cache.map(|_| crate::statecache::prompt_key(ids));
+            let (logits, hit) = match key.and_then(|k| cache.unwrap().load(k)) {
+                Some(snap) => match dec.restore_from(&snap) {
+                    Ok(()) => (snap.logits, true),
+                    Err(_) => {
+                        dec = Q35Decoder::new(&self.runner);
+                        (dec.prefill(ids), false)
+                    }
+                },
+                None => (dec.prefill(ids), false),
+            };
+            if !hit {
+                if let (Some(c), Some(k)) = (cache, key) {
+                    let snap = dec.capture(&logits);
+                    c.store(k, &snap).ok();
                 }
-            },
-            None => (dec.prefill(ids), false),
-        };
-        if !hit {
-            if let (Some(c), Some(k)) = (cache, key) {
-                let snap = dec.capture(&logits);
-                c.store(k, &snap).ok();
             }
-        }
+            logits
+        };
         let out = dec.generate_after(ids, logits, max_new);
         let new = &out[ids.len().min(out.len())..];
         Ok(self.bpe.decode(new))
@@ -427,6 +487,22 @@ fn escape_json_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vision_prefix_file_chunks_and_validates() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vision_prefix_test.f32");
+        let vals: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let vs = load_vision_prefix(path.to_str().unwrap(), 3).unwrap();
+        assert_eq!(vs.len(), 2);
+        assert_eq!(vs[0], vec![1.0, 2.0, 3.0]);
+        assert_eq!(vs[1], vec![4.0, 5.0, 6.0]);
+        assert!(load_vision_prefix(path.to_str().unwrap(), 4).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn extract_single_content() {

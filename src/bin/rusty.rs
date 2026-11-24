@@ -30,6 +30,7 @@ fn main() {
             println!("  validate <file>           check tensor names/dims vs config (PH-305e)");
             println!("  tokenize -m <f> -p <txt>  BPE token ids, no weights      (PH-1305)");
             println!("  run -m <model> -p <text>  BPE text generation        (PH-306b)");
+            println!("  run|serve --vision-prefix <f32>  prepend GSV Q4 vision vectors (PH-1204)");
             println!("  run -m <model> -t <ids>   numeric-token greedy       (PH-306)");
             println!("  audit -m <model> -p <txt> ActivationAudit stats (json) (ECO-9.2 9.3a)");
             println!("  pack-mint -m <model> -t <tensor> -b <idx>|--all [--zero]  WSP pack lines (stdout) (ECO-9.2 9.3b)");
@@ -962,9 +963,11 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
     let mut prompt: Option<String> = None;
     let mut max_new = 8usize;
     let mut top_k = 0usize;
+    let mut vision_prefix: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-m" | "--model" => model_path = args.next(),
+            "--vision-prefix" => vision_prefix = args.next(),
             "-p" | "--prompt" => prompt = args.next(),
             "-t" | "--tokens" => {
                 if let Some(spec) = args.next() {
@@ -1022,17 +1025,30 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
     // Text pipeline (PH-306b): needs tokenizer.ggml.* meta. PH-1304: `qwen35` arches
     // route to the hybrid runner (delta-state GDN + gated full attention).
     if let Some(text) = prompt {
-        let q35 = rusty_engine::model::ModelConfig::from_file(model.header())
-            .map(|c| c.arch == "qwen35")
-            .unwrap_or(false);
+        let cfg = rusty_engine::model::ModelConfig::from_file(model.header()).ok();
+        let q35 = cfg.as_ref().map(|c| c.arch == "qwen35").unwrap_or(false);
         if q35 {
-            let tr = match rusty_engine::textgen::TextRunner35::from_model(&model) {
+            let mut tr = match rusty_engine::textgen::TextRunner35::from_model(&model) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("rusty run {path}: {e}");
                     std::process::exit(1);
                 }
             };
+            if let Some(vp) = vision_prefix.as_deref() {
+                let d_model = cfg.as_ref().map(|c| c.d_model).unwrap_or(0);
+                let vs = match rusty_engine::textgen::load_vision_prefix(vp, d_model) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("rusty run {path}: {e}");
+                        std::process::exit(2);
+                    }
+                };
+                if let Err(e) = tr.set_vision_prefix(vs) {
+                    eprintln!("rusty run {path}: {e}");
+                    std::process::exit(2);
+                }
+            }
             if top_k > 0 {
                 let steps = match tr.trace_text(&text, max_new, top_k) {
                     Ok(v) => v,
@@ -1179,6 +1195,7 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
     let mut host = "0.0.0.0".to_string();
     let mut model_path: Option<String> = None;
     let mut patch_file: Option<String> = None;
+    let mut vision_prefix: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" | "-p" => {
@@ -1192,6 +1209,7 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
             "--host" => host = args.next().unwrap_or_else(|| "0.0.0.0".to_string()),
             "--model" | "-m" => model_path = args.next(),
             "--patch" => patch_file = args.next(),
+            "--vision-prefix" => vision_prefix = args.next(),
             other => {
                 eprintln!("rusty serve: unknown arg '{other}'");
                 std::process::exit(2);
@@ -1227,12 +1245,30 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
     let result = match &model_path {
         Some(p) => match unsafe { rusty_engine::loader::MmapModel::open(Path::new(p)) } {
             Ok(m) => {
-                let hybrid = rusty_engine::model::ModelConfig::from_file(m.header())
-                    .map(|c| c.arch == "qwen35")
-                    .unwrap_or(false);
+                let cfg = rusty_engine::model::ModelConfig::from_file(m.header()).ok();
+                let hybrid = cfg.as_ref().map(|c| c.arch == "qwen35").unwrap_or(false);
                 if hybrid {
                     match rusty_engine::textgen::TextRunner35::from_model(&m) {
-                        Ok(tr) => {
+                        Ok(mut tr) => {
+                            if let Some(vp) = vision_prefix.as_deref() {
+                                let d_model = cfg.as_ref().map(|c| c.d_model).unwrap_or(0);
+                                let vs =
+                                    match rusty_engine::textgen::load_vision_prefix(vp, d_model) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            eprintln!("rusty serve: {e}");
+                                            std::process::exit(2);
+                                        }
+                                    };
+                                if let Err(e) = tr.set_vision_prefix(vs) {
+                                    eprintln!("rusty serve: {e}");
+                                    std::process::exit(2);
+                                }
+                                rusty_engine::log::log_line(
+                                    "model",
+                                    &format!("vision prefix loaded: {vp}"),
+                                );
+                            }
                             rusty_engine::log::log_line(
                                 "model",
                                 &format!("{p} qwen35 hybrid {} layers", tr.runner.n_layers),

@@ -481,14 +481,44 @@ impl<'a> Q35Decoder<'a> {
 
     /// Feed one token, get its next-token logits.
     pub fn step(&mut self, tok: u32) -> Vec<f32> {
+        self.step_hidden(self.runner.embed_row(tok).to_vec())
+    }
+
+    /// Feed a precomputed hidden vector (PH-1204 image-prefix hook). The token
+    /// embedding lookup is bypassed, but positions / GDN / KV state advance
+    /// exactly as in [`Self::step`].
+    pub fn step_hidden(&mut self, hidden: Vec<f32>) -> Vec<f32> {
         let pos = self.seq_len;
-        let mut hidden = self.runner.embed_row(tok).to_vec();
+        let mut hidden = hidden;
         for i in 0..self.runner.n_layers {
             hidden = self.runner.block_row(i, &hidden, pos, self);
         }
         self.seq_len += 1;
         let normed = rmsnorm(&hidden, &self.runner.output_norm, self.runner.eps);
         self.runner.output.matvec(&normed)
+    }
+
+    /// Feed one vision embedding vector; rejects wrong width before touching state.
+    pub fn step_embedding(&mut self, v: &[f32]) -> Result<Vec<f32>> {
+        if v.len() != self.runner.d_model {
+            return Err(EngineError {
+                message: format!(
+                    "runner35: vision embedding width {} != d_model {}",
+                    v.len(),
+                    self.runner.d_model
+                ),
+            });
+        }
+        Ok(self.step_hidden(v.to_vec()))
+    }
+
+    /// Prefill K precomputed embedding vectors before the text prompt.
+    pub fn prefill_embeddings(&mut self, vs: &[Vec<f32>]) -> Result<Vec<f32>> {
+        let mut logits = Vec::new();
+        for v in vs {
+            logits = self.step_embedding(v)?;
+        }
+        Ok(logits)
     }
 
     /// Same math as [`Self::step`] but also records one [`AuditEntry`] per
