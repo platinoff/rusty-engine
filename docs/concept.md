@@ -115,6 +115,8 @@ KV-reuse), KTransformers (CPU/GPU expert offload), MixtureServe / MoE-Exchange
    як продуктові моделі). Qwen2.5-0.5B лишається **внутрішнім числовим оракулом**
    (dev-фікстура, golden `PH-405`, llama-rs-оракул — інструмент, не продукт).
 3. Віжен-шлях реалізується у Rust: `src/vit.rs` (vision tower) + 4×/16× visual-token
-   compressor + projector + image-prefix у prefill — бенд **B12** у `docs/roadmap.md`.
+   compressor + projector + image-prefix у prefill — бенд **B12** у `docs/roadmap.md`
+   (станом 2026-11-24: PH-1204 plumbing влито — готові GSV-вектори через
+   `runner35::prefill_embeddings` / `--vision-prefix`; сам ViT/projector у Rust ще в роботі).
 4. Чисельний оракул для vision-фіксайтів — `llama.cpp-omni` (mtmd) CLI як
    вимірювальний інструмент; до продукту не входить.

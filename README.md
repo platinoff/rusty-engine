@@ -42,9 +42,9 @@ This tree is safe to publish because it does not carry hub credentials.
 Someone else using the GSV ecosystem creates those on their own hub and
 exports them in the environment. Do not commit them.
 
-## Status (verified 2026-10-22, PH-203r)
+## Status (verified 2026-11-24, HEAD `61bb0ba` — PH-1204 plumbing; PH-1305 parity ✅ 2026-11-11)
 
-**103 commits · 224 tests (+5 ignored parity) · clippy `-D` clean · Rust ratio 98.9 % (14605 LOC).**
+**160 commits · ~316 `#[test]` (`cargo xtask check` green at `61bb0ba`) · clippy `-D` clean · Rust ratio ≥99 % (25 794 LOC) · 107 tracked files.** PH-1204 vision-prefix hook landed (`--vision-prefix <f32>`, `runner35::prefill_embeddings`, state-cache bypass).
 End-to-end plumbing works: `ModelConfig → validate → GGUF dequant (Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K)
 → embed → `moe_layer_forward`/`block_forward` → sampler → byte-level BPE`. A **real**
 Qwen2.5-0.5B GGUF is parsed and run (24 layers, greedy output byte-identical to the llama-rs
@@ -71,6 +71,6 @@ live in `benches/kquant.rs` / `benches/quant.rs`. Golden fingerprint
 `tests/data/qwen25_golden.txt` has not moved through the whole PH-203j…r series — every slice
 stayed bit-identical on the greedy output.
 
-Remaining: `PH-203s` (attention 13.9 %, exp-bound — needs a new golden to move), NEON, then
+Remaining: **PH-1204 full image→answer pipeline / PH-1205 multimodal serve / G13 GDN-perf** (PH-1204 plumbing landed in `61bb0ba`; GSV still producing the full-depth 1024-dim vision vector — no quality claim). `PH-203s`/`PH-203t` were measured and rejected 2026-10-24; then NEON, then
 `B6` build-matrix, `B7` docker, `B8` supervisor, `B9` dist-MoE, `B10` UI, `B11` distributions. See [`docs/STATUS.md`](docs/STATUS.md), [`docs/NEXT_SESSION_PROMPT.md`](docs/NEXT_SESSION_PROMPT.md)
 and `S:/rust/GSV/docs/gsv/PRODUCTS.md` (row `rusty-engine`).

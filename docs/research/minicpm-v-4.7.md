@@ -93,7 +93,9 @@ ViT-матмоди йдуть поверх існуючих f32-ядер піс�
    text-шляху проти `llama.cpp-omni` CLI (golden-ораккул, як llama-rs для qwen2).
 2. **B12 (vision, mmproj)** — переформульовано під реальний layout: PH-1202 ViT 27×
    (attn 16 heads + GELU MLP, BF16-dequant), PH-1203 **vit_merger + mm MLP**
-   (scale_factor 4, slice-nums 9, wa_layer 6), PH-1204 image-prefix чекає B13-core.
+   (scale_factor 4, slice-nums 9, wa_layer 6); PH-1204 image-prefix plumbing landed
+   2026-11-24 (`61bb0ba`) via GSV-exported Q4_K projector + `vision_prefix_1024.f32`;
+   full-depth vector/quality work open.
 3. Перф-профіль 1B: 24 шари × 1024 ≈ половина qwen2-0.5B на повноувагових шарах,
    18 GDN-шарів — рекурентний стан 16 груп × 128×128 → декод лінійний, prefill
    паралельний — rusty-ядра (QMat/matmul/AVX2) покривають обидві форми.

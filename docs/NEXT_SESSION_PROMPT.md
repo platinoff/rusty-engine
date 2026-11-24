@@ -1,10 +1,10 @@
 # NEXT_SESSION_PROMPT — rusty-engine
 
-## Сталий стан (2026-10-27) — почати звідси
+## Сталий стан (2026-11-24) — почати звідси
 
 - **Owner product pick: `rusty-engine`** (не автоматично: Step 0 питає продукт; тут — вже обраний).
-- **PH-1305 WIP у дереві:** `rusty tokenize` + gate pin-пара правки (`gdn`/`q35`/`runner35`/`textgen`) + `tests/qwen35_parity.rs` + `tests/data/qwen35_oracle/` (5 fixture pairs). Unit/fixture green; 3 `#[ignore]` parity/fingerprint чекають real MiniCPM-V GGUF у release. Keep-live **rusty heartbeat down** на хабі — підняти serve перед Omni. Гейт fmt/clippy-0 / lib+tests green.
-- HEAD = previous `7afad27` + this commit (PH-203s/PH-203t rejections + **PH-1201 spike + PH-1301..1304**, §research/minicpm-v-4.7.md; код forward/ядра = PH-203r).
+- **PH-1305 ✅ ЗАКРИТО 2026-11-11** (`docs/research/qwen35-parity.md`: tokenizer 5/5, greedy 36/36, golden 5/5, worst 0.677 nat) — НЕ WIP. Поточний стан: **PH-1204 plumbing landed `61bb0ba`** (parent `386c0b2` quantize-export F16/BF16 → 4-bit vision blocks); `cargo xtask check` green; open: PH-1204 full pipeline / PH-1205 / G13. Keep-live rusty heartbeat policy-down — не піднімати без owner.
+- HEAD = **`61bb0ba`** (PH-1204 plumbing: vision-prefix → qwen35 prefill), parent **`386c0b2`** (quantize-export F16/BF16 GGUF → 4-bit vision blocks), pushed; код forward/ядра = PH-203r.
 - Перф-серія prefill: 961 tok **190.9 s → 5.3–6.4 s** (розкид = фонове навантаження боксу); matmul 4.1–4.7 s (77 %), attention 0.74–0.78 s (13.9 %), down `896×4864` **64–69 GMAC/s** (було 36–42), gate/up **81–92**, swiglu 122–132 ms, rope 32–35 ms, other **2.4–3 %** (див. `docs/STATUS.md`).
 - **`PH-203s` закрито виміром (2026-10-24):** онлайн-softmax блоками по KV + exp-таблиця
   реалізовані й прогнані в `benches/attn.rs` (min-of-5, один процес): **+8–15 % проти
@@ -43,10 +43,16 @@
   QK-RMSNorm до rope, `attn_q`=q+gate (`o·σ(gate)`), partial NeoX 64/256 — zyxt =
   M-RoPE слоти (text-дегенерація точна; PR #29416), prefill==steps bit-identical,
   shape-guard). **`PH-1304` готовий** (`src/runner35.rs` + `TextRunner35` + CLI-wire;
-  real model runs). **Наступний зріз — `PH-1305`**: pin-пара проти `llama.cpp-omni`
-  CLI (gate-конвенції swish/σ, pre-split, softplus-плато) + golden-файкстури
-  `tests/data/qwen35_*.txt` + perf (batched-prefill на пулі). Далі 1306 serve. B12: 1202/1203 (vit/merger) паралельно, 1204 image-prefix
-  чекає B13; 1205/1206 далі.
+  real model runs). **`PH-1305` закрито 2026-11-11** (pin-пари запінено, golden 5/5).
+  **PH-1204 plumbing влито 2026-11-24 (`61bb0ba`)**: `--vision-prefix <f32>` для
+  `rusty run|serve`, `load_vision_prefix()`, `TextRunner35.vision_prefix`/
+  `set_vision_prefix`, `runner35::{step_hidden,step_embedding,prefill_embeddings}`,
+  state-cache bypass; GSV експортує `vision_prefix_1024.f32` + manifest з
+  `minicpm1b-vision-q4k.gguf` (Q4_K, 308 955 964 B, `L:/gsv_mirror`). Чесно:
+  хук механічно змінює генерацію (нульовий вектор зв'язний, 1-блоковий вироджений);
+  повний 1024-dim vision-вектор ще виробляє GSV (checkpoint 18/27, automation);
+  жодного image→answer/quality-твердження. Open: PH-1204 (повний пайплайн) /
+  PH-1205 (serve) / G13; 1202/1203/1206 далі.
 - Диск-дисципліна замірів: тайл/блок-свіпи міряти **в одному процесі** (`benches/kquant.rs`, `benches/quant.rs`), бо end-to-end wall на цьому боксі дрейфує ±25 %.
 - Заміри: лише на свіжому процесі, LAN-проба (`192.168.56.1:8090`), 3–4 прогони; `taskkill //IM rusty.exe //F` перед `cargo build --release`.
 

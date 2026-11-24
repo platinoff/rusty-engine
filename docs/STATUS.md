@@ -1,6 +1,6 @@
 # rusty-engine — PROJECT STATUS
 
-**Snapshot:** 2026-10-24 (останнє: **`PH-1201` spike ✅ + `PH-1301` ✅** — MiniCPM-V 4.7-1B у `data/models/`,
+**Snapshot:** 2026-11-24 (останнє: **`PH-1204` plumbing landed ✅ `61bb0ba`** — parent `386c0b2` quantize-export F16/BF16 → 4-bit vision blocks; `PH-1305` parity ✅ 2026-11-11; MiniCPM-V 4.7-1B + `minicpm1b-vision-q4k.gguf` (308 955 964 B, `L:/gsv_mirror`); повний image→answer ще не заявлено). Історичне: **`PH-1201` spike ✅ + `PH-1301` ✅** — MiniCPM-V 4.7-1B у `data/models/`,
 `rusty inspect` прокачано (KV-дамп+histogram+`[N]`); text-core = **`qwen35`-гібрид**
 (18 GDN + 6 full-attn, QK-norm, zyxt-rope, vocab 248 094) → **новий бенд B13**; vision =
 clip-548M **BF16(30)** (+фікс dtype-таблиці й dequant). **`PH-1301` того ж дня:** `model.rs`
@@ -56,15 +56,15 @@ live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; �
 | Метрика | Значення |
 |---------|----------|
 | `git status` | **clean** (0 drift) |
-| Коміти | **111** усього (`git rev-list --count HEAD`); **52** у drain-серії B0→PH-1304 (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3 + PH-203r two weight rows + PH-203s measured-rejection bench/hooks + PH-203t measured-rejection wrows4/interleaved (docs+bench) + model-policy B12 docs + PH-1201 MiniCPM-V spike (inspect KV/histogram, BF16-fix); **pushed 2026-10-24**) |
-| Тести | **244** (222 lib + 5 dense-gen + 3 runner35-gen + 4 scaffold + 5 serve + 5 text-gen; +7 ignored parity, включно real-MiniCPM runner35 smoke), 0 failed |
+| Коміти | **160** усього (`git rev-list --count HEAD`), HEAD **`61bb0ba`** (PH-1204 plumbing), parent **`386c0b2`** (quantize-export F16/BF16), pushed; **111** historical @ 2026-10-24; **52** у drain-серії B0→PH-1304 (B0→B5 serve/heartbeat + PH-405b + PH-507 + B2 SIMD bench + PH-505 RAM + PH-203d FMA + PH-203e parallel + PH-203f pool + PH-203g RoPE + PH-203h head-parallel attn + PH-203i f16/q8-int + PH-203j/K prefill matmul + PH-203l row accumulator + PH-203m stage profiler + PH-203n row/cache blocking + PH-203o attention x4/axpy + PH-203p «other» split + PH-203q K-tile/L3 + PH-203r two weight rows + PH-203s measured-rejection bench/hooks + PH-203t measured-rejection wrows4/interleaved (docs+bench) + model-policy B12 docs + PH-1201 MiniCPM-V spike (inspect KV/histogram, BF16-fix); **pushed 2026-10-24**) |
+| Тести | ~**316** `#[test]` (read-only count 2026-11-24; authoritative — `cargo xtask check` green at `61bb0ba`), incl. новий unit `textgen::vision_prefix_file_chunks_and_validates`; 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | **0** (чисто) |
 | `cargo fmt --check` | **ok** |
-| Rust LOC | **17426** (`src` 14177 + `tests` 1780 + `xtask` 319 + `benches` 1150; `wc -l`) |
+| Rust LOC | **25794** (read-only 2026-11-24; `find src tests xtask benches -name '*.rs' | xargs wc -l`) |
 | UI LOC (glue) | **157** (html+css+js) |
 | **Rust ratio** | **99.0%** (ціль 95–100 ✓) |
-| Docs LOC | 2781 (`git ls-files docs \| xargs wc -l`) |
-| Tracked files | 73 |
+| Docs LOC | 3433 (`git ls-files docs \| xargs wc -l`, 2026-11-24) |
+| Tracked files | 107 |
 | Реальна модель | `data/models/qwen2.5-0.5b-q4_k_m.gguf` (491 400 032 B, **gitignored**, sha256 `74a4da8c…`) — **лише внутрішній числовий оракул**; цільова модель = **MiniCPM-V 4.7** (B12, owner 2026-10-24) |
 | Трекінг `data/` | лише `.gitkeep` (модель не в репо ✓) |
 | Live `:8090` (12 потоків, 961-tok prefill, `RUSTY_PROFILE=1`) | **5.3–6.4 s** (бокс дрейфує ±20 % на однаковій роботі; міряти лише свіжим процесом) · matmul **4.1–4.7 s** (~77 %) · attention **0.74–0.78 s** (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42; 1.46–1.56 s) · gate/up **81–92** · attention QK 84–92 · swiglu 122–132 ms · rope 32–35 ms · **other 2.4–3 %** · decode 10.4–27.6 tok/s (сильно залежить від фонового навантаження боксу) |
@@ -81,7 +81,7 @@ live prefill **8.49 → 6.90–7.84 s**, «other» 11.9 % → **3.4–3.8 %**; �
 | **B4** MoE-core | 🟡 | `PH-401..403` (router softmax/sigmoid/group, SwiGLU, shared) + `PH-406a` `moe_layer_forward` + **`PH-404` expert-cache LRU** (`src/cache.rs`, budgeted + pin + prefetch); parity/run/bench (405/406/407) open |
 | **B5** serve | 🟡 | PH-501a/b (std HTTP + real TextRunner), PH-502 (SSE), PH-503 (slot-cache), PH-504 (heartbeat), PH-505 (**metrics + per-process RAM**), PH-506 (serve integration tests ✅); **PH-507 hub provider-row E2E ✅ (`rusty-serve` через хаб, JSON+SSE)** |
 | B6 build-matrix(exe/bin/apk) / B7 docker / B8 supervisor / B9 dist-MoE / B10 UI / B11 distribs | ☐ | заплановано (бенди в роадмепі) |
-| **B12** vision (MiniCPM-V 4.7) | 🟡 | **`PH-1201` spike ✅ 2026-10-24** (`rusty inspect` KV+histogram, ваги у data/models/,research-дока); PH-1202/1203 (ViT-1152/27× + vit_merger, BF16) — далі; image-prefix (1204) **чекає B13** |
+| **B12** vision (MiniCPM-V 4.7) | 🟡 | **`PH-1201` spike ✅ 2026-10-24** + **`PH-1204` plumbing ✅ 2026-11-24 (`61bb0ba`)**: `runner35::{step_hidden,step_embedding,prefill_embeddings}`, `TextRunner35.vision_prefix` + `set_vision_prefix`, CLI `rusty run\|serve --vision-prefix <f32>`, `load_vision_prefix()` + unit; state-cache bypass при наявності prefix; GSV Q4_K проектор `minicpm1b-vision-q4k.gguf` (308 955 964 B, `L:/gsv_mirror`) + `vision_prefix_1024.f32`. Чесно: хук механічно працює, повний 1024-dim вектор ще виробляє GSV (checkpoint 18/27); PH-1202/1203 + PH-1205 open, image→answer/quality не заявляється |
 | **B13** text-core qwen35 (гібрид GDN+full) | 🟡 | **`PH-1301..1304` ✅ 2026-10-24**: `LayerKind`+config/validate (real `rusty validate` = OK), `src/gdn.rs` (delta-rule, prefill==steps bit-identical, 1 MiB/блок), `src/q35.rs` (QK-norm, q-gate σ, partial NeoX — zyxt=M-RoPE за PR #29416), `src/runner35.rs`+`TextRunner35`+CLI — **реальний MiniCPM-V-4.7-1B генерує** (2.4 s / 7 ток., ignored-smoke ok; семантика — під 1305); далі 1305 parity → 1306 serve |
 
 **Між конекцій:** від токена до logits стек повний — `config → validate → dequant → embed →
@@ -120,9 +120,5 @@ vLLM v0.28 / SGLang v0.5.19 (RadixArk) / TensorRT-LLM v1.2.1 / llama.cpp / ktran
 full-attn + `src/runner35.rs`/`TextRunner35`/CLI: prefill==steps скрізь біт-у-біт,
 **реальний MiniCPM-V-4.7-1B генерує детерміновано**; gate/swish + pre-split
 конвенції — під `PH-1305`).
-Наступний зріз — **`PH-1305`**: `llama.cpp-omni` CLI як оракул — pin-пара greedy-рядків
-+ golden-файкстури `tests/data/qwen35_*.txt` + batched-prefill perf; далі
-1306 serve. B12 vision
-(1202/1203, `PH-1201` spike готовий — `docs/research/minicpm-v-4.7.md`; `PH-1301`
-config/validate теж готовий) — паралельно; image-prefix (1204) чекає B13. Готові
+**`PH-1305` ✅ ЗАКРИТО 2026-11-11** (`docs/research/qwen35-parity.md`: tokenizer 5/5, greedy 36/36, golden 5/5, worst 0.677 nat). Наступні зрізи — **`PH-1204` (plumbing landed, повний пайплайн open) / PH-1205 (multimodal serve) / G13 (GDN-perf)**. B12 vision (1202/1203 open, `PH-1201` spike готовий — `docs/research/minicpm-v-4.7.md`); image-prefix plumbing влито `61bb0ba` через GSV-експортовані 1024-dim вектори — жодного image→answer/quality-твердження. Готові
 green-зрізи далі: NEON arm64 (`PH-203`) · `PH-501` (axum serve) · важкі/інфра-бенди (B6/B7).

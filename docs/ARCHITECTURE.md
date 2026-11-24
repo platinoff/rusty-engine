@@ -27,7 +27,7 @@ need their own feature gates.
 | `serve` | OpenAI-compat HTTP (`/v1/models`, `/v1/chat/completions`), SSE stream | B5 |
 | `node` | slave/worker runtime over local Wi-Fi/LAN | B7/B8 |
 | `hub` | GSV-native master supervisor («Rust k8s-lite»): registry, heartbeat, placement | B8 |
-| `vit` | **Vision tower (MiniCPM-V 4.7)**: patch-embed + ViT blocks + GELU MLP + 4×/16× visual-token compressor + projector → image-prefix into prefill; kernels reused from `qmat`/`kernel` | B12 |
+| `vit` | **Vision tower (MiniCPM-V 4.7)**: patch-embed + ViT blocks + GELU MLP + 4×/16× visual-token compressor + projector → image-prefix into prefill; kernels reused from `qmat`/`kernel`. **PH-1204 (`61bb0ba`) hook уже в `runner35`/`textgen`**: `step_hidden`/`step_embedding`/`prefill_embeddings`, `TextRunner35.vision_prefix`, `load_vision_prefix()`, `--vision-prefix`; поки що споживає GSV-експортовані 1024-dim вектори | B12 |
 
 ```
 GGUF file

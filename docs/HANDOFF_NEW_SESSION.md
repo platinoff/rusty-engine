@@ -3,13 +3,13 @@
 **Продукт:** `rusty-engine` · Сесійна мова: «концепція → роадмеп → тікети → drain».
 **Host:** GSV hub (`S:/rust/GSV`, `:9999`) = master; це — portable plugin.
 
-## Сталий стан (2026-10-24, перевірено в репо)
+## Сталий стан (2026-11-24, перевірено в репо)
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | PH-1304 `src/runner35.rs` (див. §Продовження 26–32 і `git log -1`), `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` (gitignored) |
-| Гейт | fmt ok · clippy `-D` **0** · **244** тести (222 lib + 22 integration) + 7 `#[ignore]` parity (incl. real MiniCPM-V runner35 smokes), усі зелені |
-| Код | Rust **17426** LOC (src 14177 / tests 1780 / xtask 319 / benches 1150), UI 157 → ratio **99.0 %** · 73 tracked files · docs 2781+ LOC |
+| HEAD / origin | **`61bb0ba`** — PH-1204 plumbing (див. §Продовження 34), parent **`386c0b2`** — quantize-export F16/BF16 → 4-bit vision blocks; pushed, `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` + `minicpm1b-vision-q4k.gguf` (Q4_K, 308 955 964 B, `L:/gsv_mirror`) |
+| Гейт | **`cargo xtask check` green** (fmt + clippy -D 0 + test) на `61bb0ba`; ~316 `#[test]` (read-only count), incl. новий unit `vision_prefix_file_chunks_and_validates`; 0 failed |
+| Код | Rust **25794** LOC (read-only 2026-11-24), UI 157 → ratio ≥99 % · **107** tracked files · docs **3433** LOC |
 | Prefill (live `:8090`, 12 потоків, 961 tok) | **5.3–6.4 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 4.1–4.7 s (~77 %) · attention 0.74–0.78 s (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42) · gate/up **81–92** · swiglu 122–132 ms · rope 32–35 ms · other **2.4–3 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |
 | Числова політика | golden-fingerprint `tests/data/qwen25_golden.txt` не зрушив усю серію PH-203j…r; recapture PH-203s збігся з ним байт-у-байт і не застосовувався (зріз відкату) |
@@ -1121,5 +1121,12 @@ fingerprint + `moe_parity` (3) + `dense_runner_loads_real_qwen` **ok** (greedy-�
   --ignored --test-threads=1 --nocapture` (16.9 s) і `perf_slice_prefill_decode_12t`
   (52 s) — окремо, свіжим процесом.
 - **Далі:** **`PH-1306`** — serve на qwen35-core (text-only provider row
-  `rusty-mcp-v47` у GSV-каталозі) → розблоковує B12 `PH-1204` image-prefix.
+  `rusty-mcp-v47` у GSV-каталозі) → розблоковує B12 `PH-1204` image-prefix (plumbing влито — див. §34).
   Наступний perf-бенд: пул-розклад GDN-скану по (layer, group).
+
+### Продовження 34 — 2026-11-24: PH-1204 plumbing + quantize-export (`386c0b2`, `61bb0ba`)
+
+- `386c0b2` quantize-export: GGUF F16/BF16 як джерела для 4-bit vision blocks; GSV отримав `minicpm1b-vision-q4k.gguf` (Q4_K projector, 308 955 964 B) у `L:/gsv_mirror`.
+- `61bb0ba` PH-1204 plumbing: `runner35::{step_hidden,step_embedding,prefill_embeddings}` (embedding lookup bypass, позиції/GDN/KV state як у `step`), `TextRunner35.vision_prefix` + `set_vision_prefix` (width/finite guard), CLI `rusty run|serve --vision-prefix <f32>`, `textgen::load_vision_prefix()` (`gsv.vision-prefix.v1` LE f32, unit `vision_prefix_file_chunks_and_validates`), state-cache bypass коли prefix присутній.
+- GSV експортує `vision_prefix_1024.f32` + manifest; **чесно:** механізм працює (prefix змінює генерацію; zero-вектор зв'язний, 1-блоковий вироджений), повний 1024-dim vision-вектор ще в GSV (checkpoint 18/27, automation `aut_20e65ced2001Kt1aKXZ0aZaSpk`); **жодного image→answer/quality-твердження**.
+- Гейт: `cargo xtask check` green. Open: PH-1204 (повний пайплайн), PH-1205 (multimodal serve), G13 (GDN-perf).
