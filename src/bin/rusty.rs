@@ -30,7 +30,7 @@ fn main() {
             println!("  validate <file>           check tensor names/dims vs config (PH-305e)");
             println!("  tokenize -m <f> -p <txt>  BPE token ids, no weights      (PH-1305)");
             println!("  run -m <model> -p <text>  BPE text generation        (PH-306b)");
-            println!("  run|serve --vision-prefix <f32>  prepend GSV Q4 vision vectors (PH-1204)");
+            println!("  run|serve --vision-prefix <f32> [--vision-at N]  inject GSV Q4 vision vectors after N prompt tokens (PH-1204)");
             println!("  run -m <model> -t <ids>   numeric-token greedy       (PH-306)");
             println!("  audit -m <model> -p <txt> ActivationAudit stats (json) (ECO-9.2 9.3a)");
             println!("  pack-mint -m <model> -t <tensor> -b <idx>|--all [--zero]  WSP pack lines (stdout) (ECO-9.2 9.3b)");
@@ -964,10 +964,18 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
     let mut max_new = 8usize;
     let mut top_k = 0usize;
     let mut vision_prefix: Option<String> = None;
+    let mut vision_at: Option<usize> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-m" | "--model" => model_path = args.next(),
             "--vision-prefix" => vision_prefix = args.next(),
+            "--vision-at" => {
+                vision_at = args.next().and_then(|v| v.parse::<usize>().ok());
+                if vision_at.is_none() {
+                    eprintln!("rusty run: bad --vision-at");
+                    std::process::exit(2);
+                }
+            }
             "-p" | "--prompt" => prompt = args.next(),
             "-t" | "--tokens" => {
                 if let Some(spec) = args.next() {
@@ -1047,6 +1055,9 @@ fn run<A: Iterator<Item = String>>(mut args: A) -> ! {
                 if let Err(e) = tr.set_vision_prefix(vs) {
                     eprintln!("rusty run {path}: {e}");
                     std::process::exit(2);
+                }
+                if let Some(at) = vision_at {
+                    tr.set_vision_at(at);
                 }
             }
             if top_k > 0 {
@@ -1196,6 +1207,7 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
     let mut model_path: Option<String> = None;
     let mut patch_file: Option<String> = None;
     let mut vision_prefix: Option<String> = None;
+    let mut vision_at: Option<usize> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" | "-p" => {
@@ -1210,6 +1222,13 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
             "--model" | "-m" => model_path = args.next(),
             "--patch" => patch_file = args.next(),
             "--vision-prefix" => vision_prefix = args.next(),
+            "--vision-at" => {
+                vision_at = args.next().and_then(|v| v.parse::<usize>().ok());
+                if vision_at.is_none() {
+                    eprintln!("rusty serve: bad --vision-at");
+                    std::process::exit(2);
+                }
+            }
             other => {
                 eprintln!("rusty serve: unknown arg '{other}'");
                 std::process::exit(2);
@@ -1263,6 +1282,9 @@ fn serve_cmd<A: Iterator<Item = String>>(mut args: A) -> ! {
                                 if let Err(e) = tr.set_vision_prefix(vs) {
                                     eprintln!("rusty serve: {e}");
                                     std::process::exit(2);
+                                }
+                                if let Some(at) = vision_at {
+                                    tr.set_vision_at(at);
                                 }
                                 rusty_engine::log::log_line(
                                     "model",

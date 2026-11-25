@@ -176,9 +176,17 @@ pub struct TextRunner35 {
     /// their GDN/KV state from a snapshot file and skip the prefill. Sync — safe
     /// under the thread-per-connection staging lane.
     pub state_cache: Option<crate::statecache::StateCache>,
-    /// PH-1204: precomputed vision-prefix embeddings (len = d_model each), fed
-    /// before the text prompt. Empty = bit-exact text-only path.
+    /// PH-1204: precomputed vision-prefix embeddings (len = d_model each).
+    /// Empty = bit-exact text-only path.
     pub vision_prefix: Vec<Vec<f32>>,
+    /// PH-1204: insert the vision vectors after this many prompt tokens
+    /// (ChatML image placeholder), not necessarily at position 0.
+    pub vision_at: Option<usize>,
+}
+
+/// Clamp an insertion index into a prompt of `len` tokens.
+pub fn vision_split_at(len: usize, at: usize) -> usize {
+    at.min(len)
 }
 
 impl TextRunner35 {
@@ -205,6 +213,7 @@ impl TextRunner35 {
             bpe,
             state_cache: crate::statecache::StateCache::open_default(),
             vision_prefix: Vec::new(),
+            vision_at: None,
         })
     }
 
@@ -222,6 +231,11 @@ impl TextRunner35 {
         }
         self.vision_prefix = vs;
         Ok(())
+    }
+
+    /// PH-1204: insert image embeddings after `at` prompt tokens (clamped).
+    pub fn set_vision_at(&mut self, at: usize) {
+        self.vision_at = Some(at);
     }
 
     /// `ActivationAudit` capture (ECO-9.2 phase 9.3a): per-(token, layer) stats
@@ -246,10 +260,18 @@ impl TextRunner35 {
         let mut dec = Q35Decoder::new(&self.runner);
         let logits = if !self.vision_prefix.is_empty() {
             // PH-1204: the text-only SSD cache is keyed by token ids, so a
-            // cache hit would silently drop the image prefix. Bypass it and
-            // prefill vision embeddings first, then the ordinary text prompt.
-            dec.prefill_embeddings(&self.vision_prefix)?;
-            dec.prefill(ids)
+            // cache hit would silently drop the image prefix. Bypass it;
+            // prefill text up to the placeholder, inject K image embeddings,
+            // then prefill the rest of the prompt.
+            let at = vision_split_at(ids.len(), self.vision_at.unwrap_or(0));
+            let mut logits = dec.prefill(&ids[..at]);
+            logits = dec.prefill_embeddings(&self.vision_prefix)?;
+            let tail = dec.prefill(&ids[at..]);
+            if tail.is_empty() {
+                logits
+            } else {
+                tail
+            }
         } else {
             let cache = self.state_cache.as_ref();
             let key = cache.map(|_| crate::statecache::prompt_key(ids));
@@ -487,6 +509,13 @@ fn escape_json_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vision_at_clamps_to_prompt_length() {
+        assert_eq!(vision_split_at(10, 3), 3);
+        assert_eq!(vision_split_at(10, 99), 10);
+        assert_eq!(vision_split_at(0, 5), 0);
+    }
 
     #[test]
     fn vision_prefix_file_chunks_and_validates() {
