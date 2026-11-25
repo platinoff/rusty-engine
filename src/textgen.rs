@@ -29,6 +29,17 @@ pub trait Completes: Sync {
     /// One chat completion: extract `messages[].content`, encode, greedy-generate
     /// (`max_new`), decode only the **new** tokens back to text.
     fn complete(&self, messages_json: &str, max_new: usize) -> Result<String>;
+    /// PH-1205: per-request multimodal prefix (raw little-endian f32 bytes,
+    /// K vectors of d_model). Engines without vision ignore it; text-only
+    /// behaviour stays bit-identical.
+    fn complete_with_vision(
+        &self,
+        messages_json: &str,
+        max_new: usize,
+        _prefix_bytes: &[u8],
+    ) -> Result<String> {
+        self.complete(messages_json, max_new)
+    }
     /// BPE token count used for the `usage` block (0 encodes as max(1) upstairs).
     fn token_len(&self, text: &str) -> usize;
 }
@@ -44,19 +55,16 @@ impl Completes for TextRunner {
 
 impl Completes for TextRunner35 {
     fn complete(&self, messages_json: &str, max_new: usize) -> Result<String> {
-        let prompt = chat_prompt(messages_json).prompt;
-        if prompt.trim().is_empty() {
-            return Err(EngineError {
-                message: "textgen35: prompt has no message content".to_string(),
-            });
-        }
-        let ids = self.bpe.encode(&prompt)?;
-        if ids.is_empty() {
-            return Err(EngineError {
-                message: "textgen35: prompt tokens empty".to_string(),
-            });
-        }
-        self.generate_cached(&ids, max_new)
+        self.complete_impl(messages_json, max_new, None)
+    }
+    fn complete_with_vision(
+        &self,
+        messages_json: &str,
+        max_new: usize,
+        prefix_bytes: &[u8],
+    ) -> Result<String> {
+        let vs = decode_vision_prefix_bytes(prefix_bytes, self.runner.d_model)?;
+        self.complete_impl(messages_json, max_new, Some(&vs))
     }
     fn token_len(&self, text: &str) -> usize {
         self.bpe.encode(text).map(|v| v.len()).unwrap_or(0)
@@ -74,6 +82,30 @@ pub fn load_vision_prefix(path: &str, d_model: usize) -> Result<Vec<Vec<f32>>> {
         message: format!("vision prefix read {path}: {e}"),
     })?;
     if bytes.is_empty() || bytes.len() % (4 * d_model) != 0 {
+        return Err(EngineError {
+            message: format!(
+                "vision prefix: {} bytes is not a multiple of {} (d_model={d_model})",
+                bytes.len(),
+                4 * d_model
+            ),
+        });
+    }
+    let mut out = Vec::new();
+    for chunk in bytes.as_chunks::<4>().0.chunks(d_model) {
+        let v: Vec<f32> = chunk.iter().map(|b| f32::from_le_bytes(*b)).collect();
+        if !v.iter().all(|x| x.is_finite()) {
+            return Err(EngineError {
+                message: "vision prefix: non-finite value".to_string(),
+            });
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// Decode raw little-endian f32 bytes into K vectors of `d_model`.
+pub fn decode_vision_prefix_bytes(bytes: &[u8], d_model: usize) -> Result<Vec<Vec<f32>>> {
+    if d_model == 0 || bytes.is_empty() || bytes.len() % (4 * d_model) != 0 {
         return Err(EngineError {
             message: format!(
                 "vision prefix: {} bytes is not a multiple of {} (d_model={d_model})",
@@ -238,6 +270,29 @@ impl TextRunner35 {
         self.vision_at = Some(at);
     }
 
+    /// Shared completion path; an explicit per-request prefix overrides the
+    /// server-level static one without mutating the runner (Sync + &self).
+    fn complete_impl(
+        &self,
+        messages_json: &str,
+        max_new: usize,
+        prefix_override: Option<&[Vec<f32>]>,
+    ) -> Result<String> {
+        let prompt = chat_prompt(messages_json).prompt;
+        if prompt.trim().is_empty() {
+            return Err(EngineError {
+                message: "textgen35: prompt has no message content".to_string(),
+            });
+        }
+        let ids = self.bpe.encode(&prompt)?;
+        if ids.is_empty() {
+            return Err(EngineError {
+                message: "textgen35: prompt tokens empty".to_string(),
+            });
+        }
+        self.generate_cached(&ids, max_new, prefix_override)
+    }
+
     /// `ActivationAudit` capture (ECO-9.2 phase 9.3a): per-(token, layer) stats
     /// over the prompt's prefill. Returns one [`crate::runner35::AuditEntry`]
     /// per (prompt token, layer). No state persisted; the decoder is fresh.
@@ -256,16 +311,22 @@ impl TextRunner35 {
     /// Shared `EN-7b` path: load-or-prefill the prompt state, then greedy-generate.
     /// Misses at the restore step rebuild a virgin decoder so a corrupt snapshot can
     /// never poison a prefill; stores are best-effort (a busy disk stays a miss).
-    fn generate_cached(&self, ids: &[u32], max_new: usize) -> Result<String> {
+    fn generate_cached(
+        &self,
+        ids: &[u32],
+        max_new: usize,
+        prefix_override: Option<&[Vec<f32>]>,
+    ) -> Result<String> {
         let mut dec = Q35Decoder::new(&self.runner);
-        let logits = if !self.vision_prefix.is_empty() {
-            // PH-1204: the text-only SSD cache is keyed by token ids, so a
+        let vision = prefix_override.unwrap_or(&self.vision_prefix);
+        let logits = if !vision.is_empty() {
+            // PH-1204/1205: the text-only SSD cache is keyed by token ids, so a
             // cache hit would silently drop the image prefix. Bypass it;
             // prefill text up to the placeholder, inject K image embeddings,
             // then prefill the rest of the prompt.
             let at = vision_split_at(ids.len(), self.vision_at.unwrap_or(0));
-            let mut logits = dec.prefill(&ids[..at]);
-            logits = dec.prefill_embeddings(&self.vision_prefix)?;
+            let _ = dec.prefill(&ids[..at]);
+            let mut logits = dec.prefill_embeddings(vision)?;
             let tail = dec.prefill(&ids[at..]);
             if tail.is_empty() {
                 logits
@@ -307,7 +368,7 @@ impl TextRunner35 {
                 message: "textgen35: prompt tokenized to empty".to_string(),
             });
         }
-        self.generate_cached(&ids, max_new)
+        self.generate_cached(&ids, max_new, None)
     }
 
     /// Encode + echo token ids.
@@ -423,8 +484,32 @@ pub struct ChatOutcome {
 /// returns the full OpenAI-shaped HTTP response for POST /v1/chat/completions plus the
 /// decode stats (PH-505).
 pub fn chat_response(runner: &dyn Completes, json_body: &str, max_new: usize) -> ChatOutcome {
+    chat_response_impl(runner, json_body, max_new, None)
+}
+
+/// PH-1205: same HTTP chat shape, but with a per-request vision prefix
+/// (raw LE f32 bytes, K x d_model) injected at the placeholder position.
+pub fn chat_response_with_vision(
+    runner: &dyn Completes,
+    json_body: &str,
+    max_new: usize,
+    prefix_bytes: &[u8],
+) -> ChatOutcome {
+    chat_response_impl(runner, json_body, max_new, Some(prefix_bytes))
+}
+
+fn chat_response_impl(
+    runner: &dyn Completes,
+    json_body: &str,
+    max_new: usize,
+    prefix_bytes: Option<&[u8]>,
+) -> ChatOutcome {
     let started = std::time::Instant::now();
-    match runner.complete(json_body, max_new) {
+    let completed = match prefix_bytes {
+        Some(bytes) => runner.complete_with_vision(json_body, max_new, bytes),
+        None => runner.complete(json_body, max_new),
+    };
+    match completed {
         Ok(text) => {
             let decode_secs = started.elapsed().as_secs_f64();
             let escaped = escape_json_text(&text);

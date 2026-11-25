@@ -20,6 +20,48 @@ const DEFAULT_MAX_NEW: usize = 8;
 /// Hard ceiling on `max_tokens` accepted from a client (guards a runaway request).
 const MAX_NEW_CAP: usize = 512;
 
+/// Minimal standard base64 decoder (PH-1205 multimodal wire, no new dependency).
+fn decode_b64(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() % 4 != 0 || bytes.len() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for quad in bytes.chunks_exact(4) {
+        let a = val(quad[0])? as u32;
+        let b = val(quad[1])? as u32;
+        let c = if quad[2] == b'=' {
+            0
+        } else {
+            val(quad[2])? as u32
+        };
+        let d = if quad[3] == b'=' {
+            0
+        } else {
+            val(quad[3])? as u32
+        };
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        out.push((n >> 16) as u8);
+        if quad[2] != b'=' {
+            out.push((n >> 8) as u8);
+        }
+        if quad[3] != b'=' {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Accept, serve and close exactly one connection — the unit `serve` loops over. `metrics`
 /// accumulates across the process lifetime (PH-505 counters); `model` wires real generation.
 /// PH-1306: any [`crate::textgen::Completes`] engine (dense or qwen35 hybrid) fits the slot.
@@ -78,7 +120,20 @@ pub fn handle_conn(
             let max_new = crate::http::max_tokens_of(body)
                 .unwrap_or(DEFAULT_MAX_NEW)
                 .clamp(1, MAX_NEW_CAP);
-            let r = if crate::http::wants_stream(&text) {
+            // PH-1205: multimodal wire — a base64 LE-f32 vision prefix
+            // (K x d_model) can accompany one chat request. Text-only requests
+            // keep the exact PH-501b response path.
+            let vision_bytes: Vec<u8> = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| {
+                    v.get("vision_prefix_b64")
+                        .and_then(|x| x.as_str())
+                        .and_then(decode_b64)
+                })
+                .unwrap_or_default();
+            let r = if !vision_bytes.is_empty() {
+                crate::textgen::chat_response_with_vision(tr, body, max_new, &vision_bytes)
+            } else if crate::http::wants_stream(&text) {
                 crate::textgen::chat_stream_response(tr, body, max_new)
             } else {
                 crate::textgen::chat_response(tr, body, max_new)
@@ -290,5 +345,17 @@ mod tests {
             "{resp}"
         );
         th.join().expect("server thread");
+    }
+
+    #[test]
+    fn vision_prefix_b64_decodes_raw_f32_bytes() {
+        let bytes: Vec<u8> = [1.0f32, 2.0f32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let encoded = "AACAPwAAAEA="; // base64 of 1.0f32 + 2.0f32 LE
+        assert_eq!(super::decode_b64(encoded), Some(bytes));
+        assert_eq!(super::decode_b64("bad!"), None);
+        assert_eq!(super::decode_b64("YWJjZA=="), Some(b"abcd".to_vec()));
     }
 }
