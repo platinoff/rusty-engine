@@ -1,6 +1,9 @@
 # NEXT_SESSION_PROMPT — rusty-engine
 
-## Сталий стан (2026-11-24) — почати звідси
+## Сталий стан (2026-11-26) — почати звідси
+
+- **HEAD `62550df`** (PH-1205 multimodal wire: `vision_prefix_b64` у `/v1/chat/completions`, std-only base64 decoder, `chat_response_with_vision()`), GSV `904eda9`. Обидва репо чисті, pushed.
+- PH-1204: `--vision-at N` ін'єкція K vision-векторів за placeholder-токеном; GSV виробив повний 27-блоковий 4-токенний префікс, але він дає вироджений текст — потрібне навчене вирівнювання. Open: PH-1204 alignment / G13. `cargo xtask check` green.
 
 - **Owner product pick: `rusty-engine`** (не автоматично: Step 0 питає продукт; тут — вже обраний).
 - **PH-1305 ✅ ЗАКРИТО 2026-11-11** (`docs/research/qwen35-parity.md`: tokenizer 5/5, greedy 36/36, golden 5/5, worst 0.677 nat) — НЕ WIP. Поточний стан: **PH-1204 plumbing landed `61bb0ba`** (parent `386c0b2` quantize-export F16/BF16 → 4-bit vision blocks); `cargo xtask check` green; open: PH-1204 full pipeline / PH-1205 / G13. Keep-live rusty heartbeat policy-down — не піднімати без owner.

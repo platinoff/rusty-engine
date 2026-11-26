@@ -3,7 +3,9 @@
 **Продукт:** `rusty-engine` · Сесійна мова: «концепція → роадмеп → тікети → drain».
 **Host:** GSV hub (`S:/rust/GSV`, `:9999`) = master; це — portable plugin.
 
-## Сталий стан (2026-11-24, перевірено в репо)
+## Сталий стан (2026-11-26, перевірено в репо)
+
+| **PH-1204/1205 (2026-11-25/26)** | `--vision-at N` (ін'єкція після N промпт-токенів, `vision_split_at()`, unit) + PH-1205 wire `vision_prefix_b64` у `/v1/chat/completions` (std-only base64 decoder, `decode_vision_prefix_bytes()`, `chat_response_with_vision()`, `Completes::complete_with_vision()`). Текстові запити без поля йдуть незмінним PH-501b шляхом. `cargo xtask check` green. GSV виробив повний 27/27 4-токенний префікс (`vision_prefix_1024_mt4_full.f32`), але він вироджує текст — навчене вирівнювання не зроблено; жодного image→answer/quality-claim. |
 
 | Що | Значення |
 |----|----------|
