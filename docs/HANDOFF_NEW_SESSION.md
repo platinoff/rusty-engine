@@ -103,8 +103,12 @@ group-score + top_k_group restrict); `expert_ffn` = `down(swiglu(gate,up))` (`si
 `combine` shared-expert merge; **`moe_layer_forward` = повний цикл шару** (router→top-k experts
 weighted-sum→+shared) з детермінованим інтеграційним тестом; **`PH-404` expert-cache LRU**
 (`ExpertCache::get_or_load/put/prefetch/set_pinned` — byte-budget + pinned-skipped eviction,
-oversized→uncached, 7 unit). Лишилось: `PH-405` llama/HF-parity (оракул) + `PH-406` real
-MoE GGUF run + `PH-407` bench. **95 тестів**, clippy `-D` 0.
+oversized→uncached). **PH-404a** (`468a6f2`) додав next-use/Belady eviction
+(`next_use_distance(s)`, `evict_next_use`, `get_or_load_with_hints`) — 10/10 cache tests.
+Лишилось лише `PH-406` real MoE GGUF run (owner-gated виділений вузол).
+**`PH-405`/`PH-407` закрито superseded 2026-11-27** за рішенням власника: живий
+oraкул не запускався, покриття = PH-405b + numeric golden + PH-405c (`6ed0cc0`,
+model-free perplexity, 5 TDD) + synthetic bench `4082a98`. clippy `-D` 0.
 Фактаж — `docs/research/moe-router.md`.
 
 **B3 — Dense forward (частково):** `[~]` — **PH-301/302/303/304 done** (`src/infer.rs`, pure-f32):

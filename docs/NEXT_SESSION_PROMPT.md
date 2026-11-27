@@ -1,6 +1,12 @@
 # NEXT_SESSION_PROMPT — rusty-engine
 
-## Сталий стан (2026-11-26) — почати звідси
+## Сталий стан (2026-11-27) — почати звідси
+
+- **HEAD `6ed0cc0`** (`PH-405c` model-free perplexity helper), previous `468a6f2` (PH-404a next-use/Belady eviction) and `25b1d4e` (GASV-F1 hardened artifact contract). Clean/pushed. `cargo fmt/clippy -D warnings/full test` green.
+- **`PH-405`/`PH-407` закрито superseded** за рішенням власника 2026-11-27 («пійшли іншим шляхом далеко, можна прибрати»): живого oracle не запускали, модель Qwen2.5-0.5B на дисках відсутня. Покриття: PH-405b + numeric golden + PH-405c + synthetic bench. Не воскрешати без окремого go + наданої моделі.
+- Далі в rusty-engine лишається **PH-406** (реальний GGUF-біндинг ExpertCache + NVMe offload) — owner-gated виділений вузол; BENCH-2 не робиться (немає двох телефонів).
+
+## Історичний стан (2026-11-26) — для контексту
 
 - **HEAD `62550df`** (PH-1205 multimodal wire: `vision_prefix_b64` у `/v1/chat/completions`, std-only base64 decoder, `chat_response_with_vision()`), GSV `904eda9`. Обидва репо чисті, pushed.
 - PH-1204: `--vision-at N` ін'єкція K vision-векторів за placeholder-токеном; GSV виробив повний 27-блоковий 4-токенний префікс, але він дає вироджений текст — потрібне навчене вирівнювання. Open: PH-1204 alignment / G13. `cargo xtask check` green.
