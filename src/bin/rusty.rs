@@ -1629,7 +1629,46 @@ fn artifact_report(
     for t in &g.tensors {
         dtypes.insert(format!("{}", t.ggml_type));
     }
-    let report = serde_json::json!({
+    let report = build_artifact_report(
+        path,
+        kind,
+        runnable,
+        arch,
+        seed,
+        ctx,
+        g.tensors.len(),
+        bytes,
+        &sha256,
+        dtypes.into_iter().collect::<Vec<_>>(),
+        source,
+        coverage,
+        transplant_sha,
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+    );
+}
+
+/// GASV-F1: pure artifact-contract builder. Kept separate from file I/O so
+/// the schema (especially the honesty fields) can be unit-tested.
+#[allow(clippy::too_many_arguments)]
+fn build_artifact_report(
+    path: &str,
+    kind: &str,
+    runnable: bool,
+    arch: &str,
+    seed: u64,
+    ctx: u32,
+    tensor_count: usize,
+    bytes: u64,
+    sha256: &str,
+    ggml_types: Vec<String>,
+    source: &str,
+    coverage: &str,
+    transplant_sha: &str,
+) -> serde_json::Value {
+    serde_json::json!({
         "schema": "gasv.artifact-manifest.v1",
         "kind": kind,
         "runnable": runnable,
@@ -1637,20 +1676,16 @@ fn artifact_report(
         "arch": arch,
         "seed": seed,
         "context_length": ctx,
-        "tensor_count": g.tensors.len(),
+        "tensor_count": tensor_count,
         "bytes": bytes,
         "sha256": sha256,
-        "ggml_types": dtypes.into_iter().collect::<Vec<_>>(),
+        "ggml_types": ggml_types,
         "source": source,
         "coverage": coverage,
         "transplant_report_sha256": transplant_sha,
         "nanojev_role": "eval-oracle-only",
         "no_quality_parity_claim": true,
-    });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
-    );
+    })
 }
 
 fn quantize_export(inp: &str, out_path: &str, quant: &str, report_path: Option<&str>) {
@@ -2053,4 +2088,66 @@ fn heartbeat_cmd() -> ! {
         }
     }
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_artifact_report;
+
+    /// GASV-F1: the partial shexp transplant contract must always carry the
+    /// honesty fields — never a quality-parity claim.
+    #[test]
+    fn artifact_contract_is_partial_not_runnable() {
+        let r = build_artifact_report(
+            "partial-shexp.gguf",
+            "partial-shexp-pack",
+            false,
+            "gsv",
+            17,
+            512,
+            121,
+            4096,
+            "abc123",
+            vec!["f32".into()],
+            "tensors.json+chunks",
+            "blk.0..4 shexp-only",
+            "deadbeef",
+        );
+        assert_eq!(r["schema"], "gasv.artifact-manifest.v1");
+        assert_eq!(r["kind"], "partial-shexp-pack");
+        assert_eq!(r["runnable"], false);
+        assert_eq!(r["arch"], "gsv");
+        assert_eq!(r["seed"], 17);
+        assert_eq!(r["tensor_count"], 121);
+        assert_eq!(r["bytes"], 4096);
+        assert_eq!(r["sha256"], "abc123");
+        assert_eq!(r["coverage"], "blk.0..4 shexp-only");
+        assert_eq!(r["transplant_report_sha256"], "deadbeef");
+        assert_eq!(r["nanojev_role"], "eval-oracle-only");
+        assert_eq!(r["no_quality_parity_claim"], true);
+    }
+
+    /// The builder can describe a full artifact too, but the honesty fields
+    /// stay contract constants.
+    #[test]
+    fn artifact_contract_honesty_fields_are_constants() {
+        let r = build_artifact_report(
+            "full.gguf",
+            "full",
+            true,
+            "gsv",
+            0,
+            0,
+            1,
+            1,
+            "x",
+            vec![],
+            "",
+            "",
+            "",
+        );
+        assert_eq!(r["runnable"], true);
+        assert_eq!(r["nanojev_role"], "eval-oracle-only");
+        assert_eq!(r["no_quality_parity_claim"], true);
+    }
 }
