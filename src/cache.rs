@@ -32,6 +32,24 @@ pub fn expert_bytes(w: &ExpertWeights) -> usize {
     (w.gate.len() + w.up.len() + w.down.len()) * std::mem::size_of::<f32>()
 }
 
+/// First future index of `key` in a router lookahead; `usize::MAX` when the
+/// key is not selected again in the window (i.e. evict it first).
+///
+/// PH-404a: pure policy helper — no model, no I/O, no timers.
+pub fn next_use_distance(window: &[ExpertKey], key: &ExpertKey) -> usize {
+    window.iter().position(|k| k == key).unwrap_or(usize::MAX)
+}
+
+/// Next-use distances for every distinct expert in a lookahead window.
+/// Keeps the *first* occurrence, which is the next time each expert is needed.
+pub fn next_use_distances(window: &[ExpertKey]) -> HashMap<ExpertKey, usize> {
+    let mut out = HashMap::new();
+    for (i, k) in window.iter().enumerate() {
+        out.entry(*k).or_insert(i);
+    }
+    out
+}
+
 /// Cumulative cache behavior, for metrics (`PH-505`) and tests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -194,6 +212,65 @@ impl ExpertCache {
         }
     }
 
+    /// Drop unpinned entries until `used <= ceiling`, evicting the expert
+    /// whose next use is furthest away (Belady). Entries absent from the
+    /// lookahead map have distance `usize::MAX` and go first. Falls back to
+    /// no eviction when everything is pinned — over budget, but safe.
+    pub fn evict_next_use(&mut self, ceiling: usize, dist: &HashMap<ExpertKey, usize>) {
+        while self.used > ceiling {
+            let victim = self
+                .order
+                .iter()
+                .copied()
+                .filter(|k| self.map.get(k).map(|e| !e.pinned).unwrap_or(false))
+                .max_by_key(|k| dist.get(k).copied().unwrap_or(usize::MAX));
+            match victim {
+                Some(v) => {
+                    if let Some(e) = self.map.remove(&v) {
+                        self.used -= e.bytes;
+                        self.order.retain(|k| *k != v);
+                        self.stats.evictions += 1;
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Like [`Self::get_or_load`], but uses next-use hints for eviction rather
+    /// than plain LRU. Resident hits still bump `hits` and are not reloaded.
+    pub fn get_or_load_with_hints<L>(
+        &mut self,
+        key: ExpertKey,
+        load: L,
+        dist: &HashMap<ExpertKey, usize>,
+    ) -> Rc<ExpertWeights>
+    where
+        L: FnOnce(ExpertKey) -> ExpertWeights,
+    {
+        if let Some(w) = self.get(&key) {
+            return w;
+        }
+        self.stats.loads += 1;
+        let weights = Rc::new(load(key));
+        let bytes = expert_bytes(&weights);
+        if bytes > self.budget {
+            return weights; // too big to cache, same as the LRU path
+        }
+        self.evict_next_use(self.budget - bytes, dist);
+        self.used += bytes;
+        self.map.insert(
+            key,
+            Entry {
+                weights: Rc::clone(&weights),
+                bytes,
+                pinned: false,
+            },
+        );
+        self.order.push_front(key);
+        weights
+    }
+
     /// Move `key` to the MRU position.
     fn touch(&mut self, key: &ExpertKey) {
         self.order.retain(|k| k != key);
@@ -295,5 +372,59 @@ mod tests {
         let w = c.get(&ExpertKey::new(0, 0)).expect("present");
         assert_eq!(w.gate[0], 9.0);
         assert_eq!(c.bytes_used(), E); // replaced, not doubled
+    }
+
+    // ---- PH-404a: next-use / Belady eviction -----------------------------
+
+    #[test]
+    fn next_use_helpers_keep_first_occurrence() {
+        let a = ExpertKey::new(0, 0);
+        let b = ExpertKey::new(0, 1);
+        let c = ExpertKey::new(0, 2);
+        let window = [a, b, a, c];
+        assert_eq!(next_use_distance(&window, &a), 0);
+        assert_eq!(next_use_distance(&window, &b), 1);
+        assert_eq!(next_use_distance(&window, &c), 3);
+        assert_eq!(next_use_distances(&window).len(), 3);
+        assert_eq!(next_use_distances(&window)[&a], 0);
+        // absent experts are evict-first
+        assert_eq!(
+            next_use_distance(&window, &ExpertKey::new(9, 9)),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn belady_evicts_furthest_next_use_not_plain_lru() {
+        let a = ExpertKey::new(0, 0);
+        let b = ExpertKey::new(0, 1);
+        let c = ExpertKey::new(0, 2);
+        let mut cache = ExpertCache::new(2 * E);
+        cache.put(a, tiny(1.0));
+        cache.put(b, tiny(2.0)); // MRU = b, LRU = a
+                                 // a is needed next, b later → Belady must evict b, unlike LRU.
+        let dist = next_use_distances(&[a, b, a, c]);
+        let loaded = cache.get_or_load_with_hints(c, |_| tiny(3.0), &dist);
+        assert_eq!(loaded.gate[0], 3.0);
+        assert!(cache.get(&a).is_some(), "a is used next — must stay");
+        assert!(cache.get(&b).is_none(), "b is used later — must be evicted");
+        assert_eq!(cache.stats().evictions, 1);
+    }
+
+    #[test]
+    fn belady_never_evicts_pinned_experts() {
+        let a = ExpertKey::new(0, 0);
+        let b = ExpertKey::new(0, 1);
+        let c = ExpertKey::new(0, 2);
+        let mut cache = ExpertCache::new(2 * E);
+        cache.put(a, tiny(1.0));
+        cache.put(b, tiny(2.0));
+        cache.set_pinned(&b, true);
+        // a is absent from the lookahead (distance MAX) and would go first —
+        // pinning b must still let a be the victim.
+        let dist = next_use_distances(&[b, c]);
+        cache.get_or_load_with_hints(c, |_| tiny(3.0), &dist);
+        assert!(cache.get(&b).is_some(), "pinned expert retained");
+        assert!(cache.get(&a).is_none(), "unpinned expert evicted");
     }
 }
