@@ -6,6 +6,7 @@
 //! to `exe` (Windows), `bin` (Linux amd64/arm64) and `apk` (Android arm64).
 //!
 //! Module map (see `docs/ARCHITECTURE.md`):
+//! - [`eval`]  — model-free perplexity/log-softmax smoke primitives (`PH-405c`)
 //! - [`core`]  — dtypes, tensor descriptors, error/result types
 //! - [`gguf`]  — GGUF v3 header + tensor-info parsing (B1)
 //! - [`loader`] — mmap + staged disk→RAM loaders with progress (PH-103, first non-std dep)
@@ -37,6 +38,7 @@ pub mod backend;
 pub mod cache;
 pub mod chatml;
 pub mod core;
+pub mod eval;
 pub mod forward;
 pub mod gdn;
 pub mod gguf;
