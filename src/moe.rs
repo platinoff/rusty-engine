@@ -520,6 +520,55 @@ mod tests {
         }
     }
 
+    /// PH-405 strengthened: cached == resident across several hidden vectors,
+    /// both gate styles and top_k=2, with a cache budget smaller than the
+    /// selected experts (forces eviction/reload). Bit-level parity, synthetic
+    /// F32 only — no real GGUF binding (PH-406 stays open).
+    #[test]
+    fn ph405_parity_multi_seed_topk2_with_eviction() {
+        let (router_w, experts, dmodel, inter, _) = cached_forward_fixtures();
+        for (seed, gate) in [
+            (1u64, Gate::Softmax),
+            (2, Gate::Sigmoid),
+            (3, Gate::Sigmoid),
+        ] {
+            let hidden: Vec<f32> = (0..dmodel)
+                .map(|i| {
+                    let x = (seed.wrapping_mul(6364136223846793005))
+                        .wrapping_add((i as u64 + 1) * 1442695040888963407);
+                    ((x >> 40) as f32 / (u32::MAX as f32)) - 0.5
+                })
+                .collect();
+            let cfg = RouterConfig { gate, top_k: 2 };
+            let want = moe_layer_forward(
+                &hidden,
+                &router_w,
+                experts.len(),
+                &experts,
+                None,
+                inter,
+                cfg,
+            );
+            // Budget fits exactly one expert -> any top-2 selection evicts between pulls.
+            let mut cache = ExpertCache::new(expert_bytes(&experts[0]));
+            let got = moe_layer_forward_cached(
+                &hidden,
+                &router_w,
+                experts.len(),
+                seed as usize,
+                &mut cache,
+                None,
+                inter,
+                cfg,
+                |id| experts[id].clone(),
+            );
+            assert_eq!(got.len(), want.len());
+            for (a, b) in got.iter().zip(&want) {
+                assert!((a - b).abs() < 1e-6, "seed={seed} cached={a} resident={b}");
+            }
+        }
+    }
+
     #[test]
     fn cached_forward_reuses_resident_expert() {
         let (router_w, experts, _dmodel, inter, cfg) = cached_forward_fixtures();

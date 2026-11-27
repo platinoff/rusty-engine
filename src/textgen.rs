@@ -90,9 +90,18 @@ pub fn load_vision_prefix(path: &str, d_model: usize) -> Result<Vec<Vec<f32>>> {
             ),
         });
     }
+    decode_f32_rows_msrv(&bytes, d_model)
+}
+
+/// MSRV-1.85-safe f32 row decoder (replaces `[u8]::as_chunks`, stable only
+/// since 1.88). Same byte layout: rows of `d_model` little-endian f32 words.
+fn decode_f32_rows_msrv(bytes: &[u8], d_model: usize) -> Result<Vec<Vec<f32>>> {
     let mut out = Vec::new();
-    for chunk in bytes.as_chunks::<4>().0.chunks(d_model) {
-        let v: Vec<f32> = chunk.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    for row in bytes.chunks_exact(4 * d_model) {
+        let v: Vec<f32> = row
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
         if !v.iter().all(|x| x.is_finite()) {
             return Err(EngineError {
                 message: "vision prefix: non-finite value".to_string(),
@@ -114,17 +123,7 @@ pub fn decode_vision_prefix_bytes(bytes: &[u8], d_model: usize) -> Result<Vec<Ve
             ),
         });
     }
-    let mut out = Vec::new();
-    for chunk in bytes.as_chunks::<4>().0.chunks(d_model) {
-        let v: Vec<f32> = chunk.iter().map(|b| f32::from_le_bytes(*b)).collect();
-        if !v.iter().all(|x| x.is_finite()) {
-            return Err(EngineError {
-                message: "vision prefix: non-finite value".to_string(),
-            });
-        }
-        out.push(v);
-    }
-    Ok(out)
+    decode_f32_rows_msrv(bytes, d_model)
 }
 
 impl TextRunner {
@@ -326,7 +325,7 @@ impl TextRunner35 {
             // then prefill the rest of the prompt.
             let at = vision_split_at(ids.len(), self.vision_at.unwrap_or(0));
             let _ = dec.prefill(&ids[..at]);
-            let mut logits = dec.prefill_embeddings(vision)?;
+            let logits = dec.prefill_embeddings(vision)?;
             let tail = dec.prefill(&ids[at..]);
             if tail.is_empty() {
                 logits

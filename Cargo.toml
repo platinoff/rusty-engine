@@ -10,7 +10,6 @@ rust-version = "1.85"
 license = "MIT"
 authors = ["platinoff"]
 repository = "https://github.com/platinoff/rusty-engine"
-homepage = "https://github.com/platinoff/rusty-engine"
 description = "Pure-Rust Mixture-of-Experts inference engine (GGUF-first), orchestrated by a GSV-native master/slave supervisor; cross-compiled to exe/bin/apk."
 readme = "README.md"
 keywords = ["moe", "llm", "gguf", "inference", "rust"]
@@ -37,6 +36,11 @@ harness = false
 [[bench]]
 name = "attn"
 path = "benches/attn.rs"
+harness = false
+
+[[bench]]
+name = "moe"
+path = "benches/moe.rs"
 harness = false
 
 [features]
