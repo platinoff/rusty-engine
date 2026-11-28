@@ -15,6 +15,8 @@
 //!   + Q4_K/Q6_K dequant into `ExpertWeights` (pure half of `PH-406`, no node)
 //! - [`q35moe_topology`] — A2: residual/RMSNorm + dense/full/GDN attention
 //!   state + routed/shared FFN composition (pure prep for `PH-1206`)
+//! - [`vit`] — PH-1202: patch-embed, LayerNorm, GELU MLP, non-causal ViT
+//!   attention + 2D position interpolation (structural gate, no golden yet)
 //! - [`cache`] — byte-budgeted LRU expert cache + prefetch (B4 `PH-404`)
 //! - [`quant`] — block sizes + scalar dequant oracle (B1/B2)
 //! - [`patch`] — WSP apply lane: block-bitmap patch-at-dequant (ECO-9.2, 9.3b)
@@ -72,6 +74,7 @@ pub mod slot;
 pub mod statecache;
 pub mod textgen;
 pub mod tokenizer;
+pub mod vit;
 pub mod worker;
 
 /// `nanojev` — Rust-native port of the open NanoJev decision model (see `src/nanojev/mod.rs`).
