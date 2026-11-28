@@ -139,6 +139,78 @@ fn layer_norm_rows(x: &[f32], w: &[f32], b: &[f32], eps: f32) -> Vec<f32> {
     out
 }
 
+/// Average-pool a `grid × grid` token map into `(grid/factor)²` tokens,
+/// preserving channel order. `factor=2` is the 4× compressor, `factor=4`
+/// is the 16× compressor used by MiniCPM-V's visual merger.
+pub fn visual_pool(tokens: &[f32], grid: usize, dim: usize, factor: usize) -> Vec<f32> {
+    assert!(
+        factor > 0 && grid > 0 && dim > 0,
+        "visual_pool: bad geometry"
+    );
+    assert!(
+        grid % factor == 0,
+        "visual_pool: grid not divisible by factor"
+    );
+    assert_eq!(tokens.len(), grid * grid * dim, "visual_pool: token width");
+    let out_grid = grid / factor;
+    let mut out = Vec::with_capacity(out_grid * out_grid * dim);
+    for by in 0..out_grid {
+        for bx in 0..out_grid {
+            for d in 0..dim {
+                let mut sum = 0.0f32;
+                for dy in 0..factor {
+                    for dx in 0..factor {
+                        let y = by * factor + dy;
+                        let x = bx * factor + dx;
+                        sum += tokens[(y * grid + x) * dim + d];
+                    }
+                }
+                out.push(sum / (factor * factor) as f32);
+            }
+        }
+    }
+    out
+}
+
+/// Linear projection into the LLM hidden size, followed by a per-token
+/// LayerNorm (`ds_ln` in the merger). Both matrices stay on `QMat::matvec`.
+#[derive(Debug, Clone)]
+pub struct VisualProjector {
+    pub project: QMat,
+    pub bias: Vec<f32>,
+    pub ln_w: Vec<f32>,
+    pub ln_b: Vec<f32>,
+}
+
+/// Pooled tokens `[n × dim]` → `[n × hidden]`, normalized per token.
+pub fn visual_project(tokens: &[f32], p: &VisualProjector, eps: f32) -> Vec<f32> {
+    assert_eq!(p.bias.len(), p.project.rows(), "visual_project: bias width");
+    assert_eq!(p.ln_w.len(), p.project.rows(), "visual_project: norm width");
+    assert_eq!(p.ln_b.len(), p.project.rows(), "visual_project: norm bias");
+    let projected = matvec_rows(&p.project, tokens);
+    let with_bias: Vec<f32> = projected
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| v + p.bias[i % p.bias.len()])
+        .collect();
+    layer_norm_rows(&with_bias, &p.ln_w, &p.ln_b, eps)
+}
+
+/// Full visual merger: spatial pooling → hidden projection → LayerNorm.
+#[derive(Debug, Clone)]
+pub struct VisualCompressor {
+    pub grid: usize,
+    pub dim: usize,
+    /// `2` = 4× token reduction, `4` = 16×.
+    pub factor: usize,
+    pub projector: VisualProjector,
+}
+
+pub fn visual_merger_forward(tokens: &[f32], c: &VisualCompressor, eps: f32) -> Vec<f32> {
+    let pooled = visual_pool(tokens, c.grid, c.dim, c.factor);
+    visual_project(&pooled, &c.projector, eps)
+}
+
 /// Apply a `rows × cols` matrix to each `cols`-wide token row.
 fn matvec_rows(w: &QMat, tokens: &[f32]) -> Vec<f32> {
     let cols = w.cols();
