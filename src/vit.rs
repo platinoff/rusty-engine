@@ -123,6 +123,12 @@ pub struct VitBlockWeights {
     pub k: QMat,
     pub v: QMat,
     pub o: QMat,
+    /// Per-output-dimension biases from the real `attn_*` tensors (empty for
+    /// synthetic fixtures that want an unbiased projection).
+    pub q_bias: Vec<f32>,
+    pub k_bias: Vec<f32>,
+    pub v_bias: Vec<f32>,
+    pub o_bias: Vec<f32>,
     pub ln2_w: Vec<f32>,
     pub ln2_b: Vec<f32>,
     pub mlp_in: QMat,
@@ -211,6 +217,18 @@ pub fn visual_merger_forward(tokens: &[f32], c: &VisualCompressor, eps: f32) -> 
     visual_project(&pooled, &c.projector, eps)
 }
 
+/// Add a `cols`-wide bias to each token row (empty bias = no-op).
+fn add_bias_rows(x: &[f32], bias: &[f32]) -> Vec<f32> {
+    if bias.is_empty() {
+        return x.to_vec();
+    }
+    assert_eq!(x.len() % bias.len(), 0, "add_bias_rows: bias width");
+    x.iter()
+        .enumerate()
+        .map(|(i, v)| v + bias[i % bias.len()])
+        .collect()
+}
+
 /// Apply a `rows × cols` matrix to each `cols`-wide token row.
 fn matvec_rows(w: &QMat, tokens: &[f32]) -> Vec<f32> {
     let cols = w.cols();
@@ -254,6 +272,9 @@ pub fn vit_attention_forward(tokens: &[f32], w: &VitBlockWeights, geom: &VitGeom
         k.extend(w.k.matvec(row));
         v.extend(w.v.matvec(row));
     }
+    let q = add_bias_rows(&q, &w.q_bias);
+    let k = add_bias_rows(&k, &w.k_bias);
+    let v = add_bias_rows(&v, &w.v_bias);
 
     let scale = 1.0 / (hd as f32).sqrt();
     let mut ctx = vec![0.0f32; n * dim];
@@ -280,7 +301,7 @@ pub fn vit_attention_forward(tokens: &[f32], w: &VitBlockWeights, geom: &VitGeom
     for row in ctx.chunks_exact(dim) {
         out.extend(w.o.matvec(row));
     }
-    out
+    add_bias_rows(&out, &w.o_bias)
 }
 
 /// `ln1 → attention → residual → ln2 → GELU MLP → residual`.

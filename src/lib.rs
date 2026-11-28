@@ -19,6 +19,8 @@
 //!   attention + 2D position interpolation (structural gate, no golden yet)
 //! - [`image_input`] — PH-1205: std-only P6 PPM / BMP decode to RGB f32 prefix
 //!   bytes for the multimodal chat wire (no trained alignment)
+//! - [`vit_real`] — PH-1202: real BF16(30) mmproj tensors → structural ViT
+//!   blocks (shape/canary only, no golden or image→answer claim)
 //! - [`cache`] — byte-budgeted LRU expert cache + prefetch (B4 `PH-404`)
 //! - [`quant`] — block sizes + scalar dequant oracle (B1/B2)
 //! - [`patch`] — WSP apply lane: block-bitmap patch-at-dequant (ECO-9.2, 9.3b)
@@ -78,6 +80,7 @@ pub mod statecache;
 pub mod textgen;
 pub mod tokenizer;
 pub mod vit;
+pub mod vit_real;
 pub mod worker;
 
 /// `nanojev` — Rust-native port of the open NanoJev decision model (see `src/nanojev/mod.rs`).

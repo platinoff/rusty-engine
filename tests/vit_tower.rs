@@ -37,6 +37,10 @@ fn zero_block(geom: &VitGeom) -> VitBlockWeights {
         k: zero_qmat(dim, dim),
         v: zero_qmat(dim, dim),
         o: zero_qmat(dim, dim),
+        q_bias: vec![0.0; dim],
+        k_bias: vec![0.0; dim],
+        v_bias: vec![0.0; dim],
+        o_bias: vec![0.0; dim],
         ln2_w: vec![1.0; dim],
         ln2_b: vec![0.0; dim],
         mlp_in: zero_qmat(geom.mlp, dim),
@@ -122,6 +126,10 @@ fn vit_attention_is_non_causal_over_all_tokens() {
         k: identity_qmat(2),
         v: identity_qmat(2),
         o: identity_qmat(2),
+        q_bias: vec![0.0; 2],
+        k_bias: vec![0.0; 2],
+        v_bias: vec![0.0; 2],
+        o_bias: vec![0.0; 2],
         ln2_w: vec![1.0; 2],
         ln2_b: vec![0.0; 2],
         mlp_in: zero_qmat(4, 2),
@@ -139,6 +147,39 @@ fn vit_attention_is_non_causal_over_all_tokens() {
     assert!(
         (out2[0] - out[0]).abs() > 1e-3,
         "attention must be non-causal"
+    );
+}
+
+#[test]
+fn vit_attention_applies_projection_biases() {
+    let geom = VitGeom {
+        dim: 2,
+        heads: 1,
+        ..tiny_geom()
+    };
+    let mut w = VitBlockWeights {
+        ln1_w: vec![1.0; 2],
+        ln1_b: vec![0.0; 2],
+        q: identity_qmat(2),
+        k: identity_qmat(2),
+        v: identity_qmat(2),
+        o: identity_qmat(2),
+        q_bias: vec![0.0; 2],
+        k_bias: vec![0.0; 2],
+        v_bias: vec![0.0; 2],
+        o_bias: vec![0.0; 2],
+        ln2_w: vec![1.0; 2],
+        ln2_b: vec![0.0; 2],
+        mlp_in: zero_qmat(4, 2),
+        mlp_out: zero_qmat(2, 4),
+    };
+    let tokens = [1.0, 0.0, 0.0, 1.0];
+    let plain = vit_attention_forward(&tokens, &w, &geom);
+    w.q_bias = vec![1.0, 0.0];
+    let biased = vit_attention_forward(&tokens, &w, &geom);
+    assert!(
+        (biased[0] - plain[0]).abs() > 1e-3,
+        "q bias must change the attention result"
     );
 }
 
