@@ -17,6 +17,8 @@
 //!   state + routed/shared FFN composition (pure prep for `PH-1206`)
 //! - [`vit`] — PH-1202: patch-embed, LayerNorm, GELU MLP, non-causal ViT
 //!   attention + 2D position interpolation (structural gate, no golden yet)
+//! - [`image_input`] — PH-1205: std-only P6 PPM / BMP decode to RGB f32 prefix
+//!   bytes for the multimodal chat wire (no trained alignment)
 //! - [`cache`] — byte-budgeted LRU expert cache + prefetch (B4 `PH-404`)
 //! - [`quant`] — block sizes + scalar dequant oracle (B1/B2)
 //! - [`patch`] — WSP apply lane: block-bitmap patch-at-dequant (ECO-9.2, 9.3b)
@@ -51,6 +53,7 @@ pub mod gguf;
 pub mod gpt2;
 pub mod http;
 pub mod hub;
+pub mod image_input;
 pub mod infer;
 pub mod kernel;
 pub mod loader;

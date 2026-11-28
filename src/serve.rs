@@ -62,6 +62,29 @@ fn decode_b64(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// PH-1205: pull `messages[].images` base64 strings out of a chat request.
+/// Bad base64 or a non-string entry is fail-closed (`Err` → HTTP 400).
+/// Requests without the field keep the text-only path byte-for-byte.
+pub fn extract_images_b64(body: &str) -> Result<Vec<Vec<u8>>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid request JSON: {e}"))?;
+    let mut out = Vec::new();
+    if let Some(messages) = value.get("messages").and_then(|v| v.as_array()) {
+        for message in messages {
+            if let Some(images) = message.get("images").and_then(|v| v.as_array()) {
+                for image in images {
+                    let encoded = image
+                        .as_str()
+                        .ok_or("images[] entries must be base64 strings")?;
+                    let bytes = decode_b64(encoded).ok_or("images[] has invalid base64")?;
+                    out.push(bytes);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Accept, serve and close exactly one connection — the unit `serve` loops over. `metrics`
 /// accumulates across the process lifetime (PH-505 counters); `model` wires real generation.
 /// PH-1306: any [`crate::textgen::Completes`] engine (dense or qwen35 hybrid) fits the slot.
@@ -131,17 +154,27 @@ pub fn handle_conn(
                         .and_then(decode_b64)
                 })
                 .unwrap_or_default();
-            let r = if !vision_bytes.is_empty() {
-                crate::textgen::chat_response_with_vision(tr, body, max_new, &vision_bytes)
-            } else if crate::http::wants_stream(&text) {
-                crate::textgen::chat_stream_response(tr, body, max_new)
-            } else {
-                crate::textgen::chat_response(tr, body, max_new)
-            };
-            // PH-505: record the real decode stats (tokens + wall clock + MoE experts);
-            // the runner is the dense path, so `active_experts` is 0 until PH-406.
-            metrics.record(r.generated_tokens, r.decode_secs, r.active_experts);
-            r.response
+            match extract_images_b64(body) {
+                Err(e) => {
+                    metrics.record(0, 0.0, 0);
+                    crate::http::Response::json(400, format!(r#"{{"error":"{}"}}"#, e))
+                }
+                Ok(images) => {
+                    let r = if !images.is_empty() {
+                        crate::textgen::chat_response_with_images(tr, body, max_new, &images)
+                    } else if !vision_bytes.is_empty() {
+                        crate::textgen::chat_response_with_vision(tr, body, max_new, &vision_bytes)
+                    } else if crate::http::wants_stream(&text) {
+                        crate::textgen::chat_stream_response(tr, body, max_new)
+                    } else {
+                        crate::textgen::chat_response(tr, body, max_new)
+                    };
+                    // PH-505: record the real decode stats (tokens + wall clock + MoE experts);
+                    // the runner is the dense path, so `active_experts` is 0 until PH-406.
+                    metrics.record(r.generated_tokens, r.decode_secs, r.active_experts);
+                    r.response
+                }
+            }
         }
         _ => {
             let r = crate::http::route_with(&buf[..filled], metrics);

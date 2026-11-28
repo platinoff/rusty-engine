@@ -40,6 +40,16 @@ pub trait Completes: Sync {
     ) -> Result<String> {
         self.complete(messages_json, max_new)
     }
+    /// PH-1205: per-request `messages[].images`, already decoded from base64.
+    /// Engines without a vision tower ignore them; text-only is unchanged.
+    fn complete_with_images(
+        &self,
+        messages_json: &str,
+        max_new: usize,
+        _images: &[Vec<u8>],
+    ) -> Result<String> {
+        self.complete(messages_json, max_new)
+    }
     /// BPE token count used for the `usage` block (0 encodes as max(1) upstairs).
     fn token_len(&self, text: &str) -> usize;
 }
@@ -483,7 +493,7 @@ pub struct ChatOutcome {
 /// returns the full OpenAI-shaped HTTP response for POST /v1/chat/completions plus the
 /// decode stats (PH-505).
 pub fn chat_response(runner: &dyn Completes, json_body: &str, max_new: usize) -> ChatOutcome {
-    chat_response_impl(runner, json_body, max_new, None)
+    chat_response_impl(runner, json_body, max_new, None, None)
 }
 
 /// PH-1205: same HTTP chat shape, but with a per-request vision prefix
@@ -494,7 +504,18 @@ pub fn chat_response_with_vision(
     max_new: usize,
     prefix_bytes: &[u8],
 ) -> ChatOutcome {
-    chat_response_impl(runner, json_body, max_new, Some(prefix_bytes))
+    chat_response_impl(runner, json_body, max_new, Some(prefix_bytes), None)
+}
+
+/// PH-1205: a chat request carrying decoded `messages[].images` bytes.
+/// Takes precedence over `vision_prefix_b64` when both are present.
+pub fn chat_response_with_images(
+    runner: &dyn Completes,
+    json_body: &str,
+    max_new: usize,
+    images: &[Vec<u8>],
+) -> ChatOutcome {
+    chat_response_impl(runner, json_body, max_new, None, Some(images))
 }
 
 fn chat_response_impl(
@@ -502,11 +523,13 @@ fn chat_response_impl(
     json_body: &str,
     max_new: usize,
     prefix_bytes: Option<&[u8]>,
+    images: Option<&[Vec<u8>]>,
 ) -> ChatOutcome {
     let started = std::time::Instant::now();
-    let completed = match prefix_bytes {
-        Some(bytes) => runner.complete_with_vision(json_body, max_new, bytes),
-        None => runner.complete(json_body, max_new),
+    let completed = match (images, prefix_bytes) {
+        (Some(imgs), _) => runner.complete_with_images(json_body, max_new, imgs),
+        (None, Some(bytes)) => runner.complete_with_vision(json_body, max_new, bytes),
+        (None, None) => runner.complete(json_body, max_new),
     };
     match completed {
         Ok(text) => {
