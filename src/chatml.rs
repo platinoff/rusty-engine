@@ -132,6 +132,28 @@ pub fn apply_chatml_template(messages_json: &str) -> Result<String, EngineError>
     Ok(out)
 }
 
+/// MiniCPM-V image placeholder emitted into a user turn. The tokenizer only
+/// treats `<|…|>` strings as atomic specials, so until the GGUF metadata maps
+/// this marker to a vision token id it stays literal text — structural only,
+/// no image-grounding claim.
+pub const MINICPM_IMAGE_PLACEHOLDER: &str = "<image>";
+
+/// ChatML framing plus `n_images` placeholders at the end of the user turn,
+/// just before the assistant marker. `n_images = 0` is plain ChatML.
+pub fn apply_minicpm_template(messages_json: &str, n_images: usize) -> Result<String, EngineError> {
+    let mut out = apply_chatml_template(messages_json)?;
+    if n_images == 0 {
+        return Ok(out);
+    }
+    let marker = "<|im_start|>assistant\n";
+    let images = MINICPM_IMAGE_PLACEHOLDER.repeat(n_images);
+    match out.rfind(marker) {
+        Some(pos) => out.insert_str(pos, &images),
+        None => out.push_str(&images),
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

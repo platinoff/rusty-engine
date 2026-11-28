@@ -259,6 +259,64 @@ impl<'a> DenseDecoder<'a> {
         logits
     }
 
+    /// Batched prefill with externally supplied image-token embeddings inserted
+    /// after `at.min(prompt.len())` prompt tokens (`PH-1204`, dense path).
+    /// An empty `vision` delegates to [`prefill`](Self::prefill), so text-only
+    /// decoding stays bit-identical. Only the embedded sequence changes; the
+    /// same cached block path, positions and logits projection are reused.
+    /// No trained alignment is implied — a non-finite or wrong-width row is
+    /// rejected, but the vectors are consumed verbatim.
+    pub fn prefill_with_vision(
+        &mut self,
+        prompt: &[u32],
+        vision: &[Vec<f32>],
+        at: usize,
+    ) -> Result<Vec<f32>> {
+        assert!(!prompt.is_empty(), "prefill_with_vision: empty prompt");
+        if vision.is_empty() {
+            return Ok(self.prefill(prompt));
+        }
+        let g = &self.runner.geom;
+        let d = g.d_model;
+        for v in vision {
+            if v.len() != d {
+                return Err(EngineError {
+                    message: format!(
+                        "prefill_with_vision: embedding width {} != d_model {d}",
+                        v.len()
+                    ),
+                });
+            }
+            if !v.iter().all(|x| x.is_finite()) {
+                return Err(EngineError {
+                    message: "prefill_with_vision: non-finite vision embedding".into(),
+                });
+            }
+        }
+
+        let at = at.min(prompt.len());
+        let mut hidden = Vec::with_capacity((prompt.len() + vision.len()) * d);
+        hidden.extend_from_slice(&self.runner.embed_batch(&prompt[..at]));
+        for v in vision {
+            hidden.extend_from_slice(v);
+        }
+        hidden.extend_from_slice(&self.runner.embed_batch(&prompt[at..]));
+
+        let pos_start = self.seq_len;
+        for (l, blk) in self.runner.blocks.iter().enumerate() {
+            hidden = block_forward_prefill_cached(&hidden, blk, g, pos_start, &mut self.caches[l]);
+        }
+        self.seq_len += prompt.len() + vision.len();
+        let last = &hidden[hidden.len() - d..];
+        let normed = rmsnorm(last, &self.runner.output_norm, g.rms_eps);
+        Ok(logits_from_hidden(
+            &normed,
+            &self.runner.output,
+            g,
+            self.runner.n_vocab,
+        ))
+    }
+
     /// Prefill the prompt, then greedily append up to `max_new` tokens (stop at EOS).
     /// `step` returns the distribution for the token *after* its input, so the last
     /// prefill step's logits already selects the first generated token — exactly the
