@@ -13,6 +13,8 @@
 //! - [`moe`]   — top-k router + expert FFN (the differentiator, B4)
 //! - [`moe_expert_loader`] — A1: `(layer, expert, role)` → GGUF/pack byte range
 //!   + Q4_K/Q6_K dequant into `ExpertWeights` (pure half of `PH-406`, no node)
+//! - [`q35moe_topology`] — A2: residual/RMSNorm + dense/full/GDN attention
+//!   state + routed/shared FFN composition (pure prep for `PH-1206`)
 //! - [`cache`] — byte-budgeted LRU expert cache + prefetch (B4 `PH-404`)
 //! - [`quant`] — block sizes + scalar dequant oracle (B1/B2)
 //! - [`patch`] — WSP apply lane: block-bitmap patch-at-dequant (ECO-9.2, 9.3b)
@@ -59,6 +61,7 @@ pub mod patch;
 pub mod pool;
 pub mod profile;
 pub mod q35;
+pub mod q35moe_topology;
 pub mod qmat;
 pub mod quant;
 pub mod repack;
