@@ -11,6 +11,8 @@ Windows/Linux hosts and Android slaves over local Wi-Fi/LAN.
 - **License:** MIT — `Copyright (c) 2026 platinoff / Madevinc`.
 - **Toolchain:** pinned `1.100.0-x86_64-pc-windows-gnu`; MSYS2 bash (never PowerShell).
 - **Ratio target:** Rust 95–100% (UI is thin glue; Rust renders the pages).
+- **Current lane (2026-11-28):** PH-1202/1203/1204/1205 vision prep is implemented without a dedicated node — ViT tower + real BF16 mmproj binding, 4×/16× visual-token compressor, dense image-token prefill and a `messages[].images` (P6 PPM/BMP) HTTP wire. The A1 expert-range loader and A2 q35moe topology are the pure halves of PH-406/1206.
+- **Honest boundary:** these are structural/numeric gates with toy or real dequantized weights — no trained image→text alignment, no mtmd golden parity, no image→answer or quality claim (G13 blocked). PH-406/1206 remain owner-gated.
 
 ## Docs
 

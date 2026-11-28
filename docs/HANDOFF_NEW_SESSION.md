@@ -3,14 +3,16 @@
 **Продукт:** `rusty-engine` · Сесійна мова: «концепція → роадмеп → тікети → drain».
 **Host:** GSV hub (`S:/rust/GSV`, `:9999`) = master; це — portable plugin.
 
-## Сталий стан (2026-11-26, перевірено в репо)
+## Сталий стан (2026-11-28, перевірено в репо)
+
+| **B12 vision + prep lanes (2026-11-28)** | Один ланцюжок без вузла й без quality-claim: A1 `3bff601` (чистий expert-range loader + Q4_K/Q6_K dequant, реальний pack-sha256 cross-check), A2 `92e539d` (q35moe topology: residual/RMSNorm + dense/full/GDN state + routed/shared FFN, PH-403b parity 1e-5), PH-1202 `ee3cae8` (ViT structural core), PH-1203 `cf22c08` (4×/16× compressor + projector), PH-1204 `889b668` (dense `prefill_with_vision` + ChatML `<image>`), PH-1205 `150e991` (std-only P6 PPM/BMP + `messages[].images` wire), PH-1202 real weights `bc236ac` (`vit_real::load_vit_weights` з mmproj BF16(30), 2 ignored canary на реальному артефакті 2/2 green). Гейти в usіх кроках: fmt `--check`, clippy `--all-targets -D warnings`, повний `cargo test` 0 failed; GSV loc-audit 99.68%, vision sync rev 516. **Межа:** PH-1202 лишається open (golden mtmd-оракула на диску немає), PH-406/1206 owner-gated, жодного image→answer/quality-claim (G13 blocked). |
 
 | **PH-1204/1205 (2026-11-25/26)** | `--vision-at N` (ін'єкція після N промпт-токенів, `vision_split_at()`, unit) + PH-1205 wire `vision_prefix_b64` у `/v1/chat/completions` (std-only base64 decoder, `decode_vision_prefix_bytes()`, `chat_response_with_vision()`, `Completes::complete_with_vision()`). Текстові запити без поля йдуть незмінним PH-501b шляхом. `cargo xtask check` green. GSV виробив повний 27/27 4-токенний префікс (`vision_prefix_1024_mt4_full.f32`), але він вироджує текст — навчене вирівнювання не зроблено; жодного image→answer/quality-claim. |
 
 | Що | Значення |
 |----|----------|
-| HEAD / origin | **`61bb0ba`** — PH-1204 plumbing (див. §Продовження 34), parent **`386c0b2`** — quantize-export F16/BF16 → 4-bit vision blocks; pushed, `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B у `data/models/` + `minicpm1b-vision-q4k.gguf` (Q4_K, 308 955 964 B, `L:/gsv_mirror`) |
-| Гейт | **`cargo xtask check` green** (fmt + clippy -D 0 + test) на `61bb0ba`; ~316 `#[test]` (read-only count), incl. новий unit `vision_prefix_file_chunks_and_validates`; 0 failed |
+| HEAD / origin | **`bc236ac`** — PH-1202 real mmproj weight binding (див. рядок вище), pushed, `origin/main` синхронний, `git status` clean; продакшн-forward = PH-203o, ядра matmul = PH-203r без змін; ваги MiniCPM-V 4.7-1B + `mmproj-model-f16.gguf` у `data/models/` (gitignored) |
+| Гейт | **`cargo fmt --all --check` + `cargo clippy --all-targets -- -D warnings` + `cargo test` green** на `bc236ac`; нові сюїти: `moe_expert_loader` 7, `q35moe_topology` 3, `vit_tower` 8, `vit_compressor` 5, `vision` 6, `vision_prefill` 5, `vit_real` 2 `#[ignore]`; 0 failed; GSV `loc-audit --stretch-96` 99.68% |
 | Код | Rust **25794** LOC (read-only 2026-11-24), UI 157 → ratio ≥99 % · **107** tracked files · docs **3433** LOC |
 | Prefill (live `:8090`, 12 потоків, 961 tok) | **5.3–6.4 s** (було 190.9 s на старті перф-серії; бокс дрейфує під фоновим Chrome/Avast — міряти лише свіжим процесом) · matmul 4.1–4.7 s (~77 %) · attention 0.74–0.78 s (13.9 %) · down `896×4864` **64–69 GMAC/s** (було 36–42) · gate/up **81–92** · swiglu 122–132 ms · rope 32–35 ms · other **2.4–3 %** |
 | Decode (live) | **10.4–27.6 tok/s** — дуже залежить від фонового навантаження; міряти на свіжому процесі |

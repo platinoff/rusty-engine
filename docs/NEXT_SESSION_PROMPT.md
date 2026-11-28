@@ -1,6 +1,14 @@
 # NEXT_SESSION_PROMPT — rusty-engine
 
-## Сталий стан (2026-11-27) — почати звідси
+## Сталий стан (2026-11-28) — почати звідси
+
+- **HEAD `bc236ac`** (`PH-1202 real mmproj weight binding`), clean/pushed, `origin/main` sync. Попередні кроки цього ж drain'у: `150e991` PH-1205 images wire · `889b668` PH-1204 dense vision prefix · `cf22c08` PH-1203 compressor · `ee3cae8` PH-1202 ViT core · `92e539d` A2 topology · `3bff601` A1 loader.
+- Гейти зелені: fmt `--check`, clippy `--all-targets -D warnings`, повний `cargo test` 0 failed; 2 `#[ignore]` real-mmproj canaries пройдені вручну (79 s); GSV loc-audit 99.68%, sync rev 516.
+- **Зроблено без вузла:** A1/A2 prep, ViT structural + реальні BF16(30) ваги з mmproj, 4×/16× compressor, image-token prefill на dense шляху, `messages[].images` (P6 PPM/BMP) у HTTP wire, heartbeat-gated `rusty-vision` row у GSV-каталозі.
+- **Все ще відкрито:** PH-1202 golden fixpoints/NU golden parity — mtmd-оракула на диску немає; RoPE-варіант; навчене 1024-dim image→text вирівнювання; PH-406/1206 owner-gated на виділений вузол (не планується). Не воскрешати PH-405/407 без окремого go.
+- Жодного image→answer або quality-claim (G13 blocked). `RUSTUP_TOOLCHAIN` не експортувати; MSYS2 bash, не PowerShell.
+
+## Історичний стан (2026-11-27)
 
 - **HEAD `6ed0cc0`** (`PH-405c` model-free perplexity helper), previous `468a6f2` (PH-404a next-use/Belady eviction) and `25b1d4e` (GASV-F1 hardened artifact contract). Clean/pushed. `cargo fmt/clippy -D warnings/full test` green.
 - **`PH-405`/`PH-407` закрито superseded** за рішенням власника 2026-11-27 («пійшли іншим шляхом далеко, можна прибрати»): живого oracle не запускали, модель Qwen2.5-0.5B на дисках відсутня. Покриття: PH-405b + numeric golden + PH-405c + synthetic bench. Не воскрешати без окремого go + наданої моделі.

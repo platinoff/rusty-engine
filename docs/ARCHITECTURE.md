@@ -27,7 +27,12 @@ need their own feature gates.
 | `serve` | OpenAI-compat HTTP (`/v1/models`, `/v1/chat/completions`), SSE stream | B5 |
 | `node` | slave/worker runtime over local Wi-Fi/LAN | B7/B8 |
 | `hub` | GSV-native master supervisor («Rust k8s-lite»): registry, heartbeat, placement | B8 |
-| `vit` | **Vision tower (MiniCPM-V 4.7)**: patch-embed + ViT blocks + GELU MLP + 4×/16× visual-token compressor + projector → image-prefix into prefill; kernels reused from `qmat`/`kernel`. **PH-1204 (`61bb0ba`) hook уже в `runner35`/`textgen`**: `step_hidden`/`step_embedding`/`prefill_embeddings`, `TextRunner35.vision_prefix`, `load_vision_prefix()`, `--vision-prefix`; поки що споживає GSV-експортовані 1024-dim вектори | B12 |
+| `vit` | **Vision tower (MiniCPM-V 4.7)**: patch-embed + ViT blocks (з q/k/v/o biases) + GELU MLP + 2D pos interpolation + 4×/16× visual-token compressor + projector; all on `QMat`/`matvec` | B12 |
+| `vit_real` | Real BF16(30) mmproj binding: `load_vit_weights()` maps 460 tensors, shapes 0..=27 `v.blk`, transposes `v.patch_embd`, loads `v.position_embd`/`v.post_ln`. Shape/finite canary only, no golden | B12 |
+| `image_input` | std-only P6 PPM + 24/32-bpp BMP → RGB f32 prefix bytes for `messages[].images`; no `image` crate, no Python | B12 |
+| `moe_expert_loader` | A1: `(layer,expert,role)` → GGUF/pack byte range + Q4_K/Q6_K dequant into `ExpertWeights`; fail-closed on bad pack manifest | PH-406 prep |
+| `q35moe_topology` | A2: residual/RMSNorm + dense/full/GDN attention state + routed/shared FFN composition (pure prep) | PH-1206 prep |
+| `runner`/`chatml` | Dense `prefill_with_vision` (merged embeddings, text-only bit-identical) + MiniCPM `<image>` placeholders before the assistant turn | B12 |
 
 ```
 GGUF file
