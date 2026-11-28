@@ -11,6 +11,8 @@
 //! - [`gguf`]  — GGUF v3 header + tensor-info parsing (B1)
 //! - [`loader`] — mmap + staged disk→RAM loaders with progress (PH-103, first non-std dep)
 //! - [`moe`]   — top-k router + expert FFN (the differentiator, B4)
+//! - [`moe_expert_loader`] — A1: `(layer, expert, role)` → GGUF/pack byte range
+//!   + Q4_K/Q6_K dequant into `ExpertWeights` (pure half of `PH-406`, no node)
 //! - [`cache`] — byte-budgeted LRU expert cache + prefetch (B4 `PH-404`)
 //! - [`quant`] — block sizes + scalar dequant oracle (B1/B2)
 //! - [`patch`] — WSP apply lane: block-bitmap patch-at-dequant (ECO-9.2, 9.3b)
@@ -51,6 +53,7 @@ pub mod loader;
 pub mod log;
 pub mod model;
 pub mod moe;
+pub mod moe_expert_loader;
 pub mod node;
 pub mod patch;
 pub mod pool;
