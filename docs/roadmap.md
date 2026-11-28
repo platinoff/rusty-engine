@@ -158,8 +158,8 @@ No open PH-* without a band. «agi» у сесії (GSV hub) створює ті
 | PH-404b | **MoE forward через cache** (top-k experts on demand) | `[x]` | `src/moe.rs` — `moe_layer_forward_cached(...&mut ExpertCache, load)`: route→`get_or_load` per expert; == `moe_layer_forward` (deterministic loader, 1e-6) навіть при budget<resident; hit⇒loader not called (2 unit) |
 | PH-405 | **numeric regression gate** (real Qwen2.5 greedy fingerprint) | `[x]` | `tests/numeric_parity.rs` + `tests/data/qwen25_golden.txt` — детерм. greedy-відбиток 24-шарового `DenseRunner.generate` на справжній моделі (guard quant/forward/KV/sampler); `#[ignore]` release-job (~60s), CI без моделі skip. llama-rs semantic parity → окремий зріз |
 | PH-405b | **llama-rs semantic greedy-parity + HF `tokenizer.json` byte-exact** | `[x]` | `tests/moe_parity.rs` — Гейт A (vocab 151936/merges 151387/id-точки/`qwen2` pre-regex) PASS; Гейт B: наш greedy байт-у-байт із записаним оракулом (55/12/48). **Фікс:** додано q/k/v-біаси Qwen2 (`BlockWeights.{q,k,v}_bias`) + RoPE GPT-J→NeoX rotate-half. Факти — `docs/research/llama-rs-parity.md`; golden перезахоплено |
-| PH-406 | run **MiniCPM-V 4.7-35B-A3B** GGUF pure-Rust (text/MoE path; ваги через B12 spike PH-1201; Qwen3-30B/Mixtral — не цілі) | `[ ]` | `src/moe/forward.rs` |
-| PH-407 | bench tok/s vs llama-rs baseline | `[ ]` | `benches/moe.rs` |
+| PH-406 | run **MiniCPM-V 4.7-35B-A3B** GGUF pure-Rust (text/MoE path; ваги через B12 spike PH-1201; Qwen3-30B/Mixtral — не цілі) | `[ ]` owner-gated | `src/moe/forward.rs` **не існує** — точка входу: `load`-closure у `moe.rs::moe_layer_forward_cached` (`:390-431`); потрібен dedicated node/disk-gate |
+| PH-407 | bench tok/s vs llama-rs baseline | `[~]→ superseded 2026-11-27` | `benches/moe.rs` — зроблено чесний synthetic A/B (resident 25.69 ms vs cache 77.80 ms); повний tok/s baseline закрито як superseded власником («пійшли іншим шляхом далеко»), див. GSV HANDOFF |
 
 ---
 
